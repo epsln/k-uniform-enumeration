@@ -172,6 +172,13 @@ public:
         for (int free_i = 0; free_i < (int)free_edges.size(); ++free_i) {
             int i = free_edges[free_i];
             if ((st.darts[i].mirro == i) != mirrored) continue;
+            // Arc-consistency on the edge-pairing constraint: gluing first_free
+            // to i joins the polygon on the left of each dart, so both
+            // size-compat conditions must hold or check_partial will reject
+            // the candidate.  Cheap O(1) filter avoids the State copy +
+            // propagate_forced + check_partial work for doomed candidates.
+            if (st.darts[first_free].polygon_size != st.darts[st.darts[i].rneig].polygon_size) continue;
+            if (st.darts[i].polygon_size != st.darts[st.darts[first_free].rneig].polygon_size) continue;
             State cand = st;
             cand.darts[first_free].glue = i; cand.darts[i].glue = first_free;
             if (!mirrored) {
@@ -189,6 +196,12 @@ public:
                 int offset = n;
                 int limit = attach_limit(gr);
                 for (int i = offset; i < offset + limit; ++i) {
+                    int sg = i - offset;
+                    // Same edge-pairing arc-consistency as the glue branch,
+                    // evaluated against the catalog for the not-yet-created
+                    // slot (saves the extend_state copy for doomed slots).
+                    if (polygon_size_of(gr, sg) != st.darts[st.darts[first_free].rneig].polygon_size) continue;
+                    if (st.darts[first_free].polygon_size != polygon_size_of(gr, catalog::right_neighbors[gr][sg])) continue;
                     State cand = extend_state(st, gr, offset, sl);
                     if ((cand.darts[i].mirro == i) != mirrored) continue;
                     cand.darts[first_free].glue = i; cand.darts[i].glue = first_free;
