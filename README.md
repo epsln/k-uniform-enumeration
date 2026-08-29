@@ -8,3 +8,14 @@ The base algorithm is unchanged. This is basically an exhaustive combinatorial e
 
 # Deduplication
 This method does have a drawback: it produces a large amount of duplicate tiling. The computational bottleneck is here. The original pruner would use a isometric check for all pairs of solutions, which turns out to be a costly O(n^2) solution with N being the number of tilings. This check in itself is also costly, being roughly O(N^2) with N the number of nodes in the graph representation of a tiling.
+
+# Build & Run
+
+```sh
+make                                       # builds ./eusolver (C++17, requires libzstd)
+./eusolver --max-polygons 5 --workers 8 --output solutions
+./eusolver --mode disk --max-polygons 10 --workers 8 --compress-solutions
+```
+
+Run `./eusolver --help` for the full option list. See `CLAUDE.md` for the
+architecture overview and `IMPLEMENTATION.md` for implementation details.

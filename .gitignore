@@ -1,0 +1,18 @@
+# Build artifacts
+*.o
+*.obj
+eusolver
+eusolver_*
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors
+*.swp
+*.swo
+*~
+
+# Output directories
+solutions/
+solutions_*/
