@@ -10,6 +10,14 @@ make                                    # C++17, pthreads
 ./eusolver --mode disk --max-polygons 10 --workers 8  # disk mode for k >= 10
 ```
 
+## Git workflow (Gitflow)
+
+- `master` — stable releases only.
+- `dev` — integration branch; features merge here, then `dev` → `master` for releases.
+- `feature/<name>` — one branch per change, branched off `dev`, merged back into `dev` via PR/review.
+- Keep commits small, atomic, and single-purpose with descriptive messages.
+- Before merging a feature, run `scripts/compare.py` to confirm solution counts still match the Reference Counts table and to measure the partials-processed delta vs. the baseline.
+
 ## Architecture
 
 C++ sources live in `src/`.
