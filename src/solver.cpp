@@ -143,7 +143,8 @@ State EuclideanSolver::unpack_state(const PackedState& p) {
 // =============================================================================
 bool EuclideanSolver::check_partial(const State& st) {
     int n = (int)st.darts.size();
-    std::vector<uint8_t> seen(n, 0);
+    static thread_local std::vector<uint8_t> seen;
+    seen.assign(n, 0);
     for (int i = 0; i < n; ++i) {
         if (seen[i]) continue;
         int free = i, rfree = st.darts[free].rneig;
@@ -163,11 +164,10 @@ bool EuclideanSolver::check_partial(const State& st) {
 // =============================================================================
 // Cycle analysis
 // =============================================================================
-// Cycle analysis
-// =============================================================================
 std::pair<int,int> EuclideanSolver::analyze_cycles(const State& st) {
     int n = (int)st.darts.size();
-    std::vector<int> seen(n, 0);
+    static thread_local std::vector<int> seen;
+    seen.assign(n, 0);
     std::pair<int,int> tightest = {-1, 13};
     for (int start = 0; start < n; ++start) {
         if (seen[start]) continue;
@@ -209,9 +209,10 @@ bool EuclideanSolver::propagate_forced(std::vector<Dart>& darts) {
     auto M = [&](int i) { return darts[i].mirro; };
 
     bool changed = true;
+    static thread_local std::vector<int> seen;
     while (changed) {
         changed = false;
-        std::vector<int> seen(n, 0);
+        seen.assign(n, 0);
 
         for (int start = 0; start < n; ++start) {
             if (seen[start]) continue;
