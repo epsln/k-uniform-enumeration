@@ -40,6 +40,7 @@ C++ sources live in `src/`.
 - **Polygon ring walk**: `a → rneig[a] → glue[rneig[a]] → rneig[glue[rneig[a]]] → …` traces a polygon perimeter. Slack = nominal size − segment count.
 - **Extend step**: find edge with smallest slack, glue it to a matching free edge or attach a new vertex (only `attachment_limit(type)` slot positions tried).
 - **Validity**: polygon sizes along any ring must be uniform; segment count ≤ nominal size; closed rings require nominal size to divide segment count.
+- **Symmetry-reduced darts**: some vertex types represent a whole polygon with a single (self-glued) dart, e.g. `(6,6,6)S`, `(4,4,4,4)S4`, `(3,3,3,3,3,3)S6`. A size-`s` polygon can therefore be represented by any divisor of `s` darts, so global counting invariants of the form `count_s % s == 0` are **not** valid (they prune legal tilings). Sound pruning must be local (ring slack, edge-pairing size compatibility) or based on symmetry, not on dart-count divisibility.
 - **Partial dedup**: per-worker 64-bit FNV-1a fingerprint → capped bucket (8) → bit-level alias refinement isomorphism check.
 - **Pruner pipeline**: (1) canonical labeling via alias refinement, (2) 1-WL or 2-WL colour refinement with FNV hash, (3) full isomorphism on hash collisions.
 
