@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 using namespace catalog;
 
 int g_wl_dim = 1;
-int g_wl_iters = 25;
+int g_wl_iters = 0;   // 0 = auto: iterate 1-WL to convergence (cap = n darts)
 bool g_use_bfl = false;
 bool g_no_iso_check = false;
 
@@ -26,6 +26,7 @@ bool g_no_iso_check = false;
 std::atomic<int64_t> g_wl_hash_hits{0};
 std::atomic<int64_t> g_wl_collisions{0};
 std::atomic<int64_t> g_solutions_match_calls{0};
+std::atomic<int> g_wl_max_iters{0};
 bool g_compress_pruner_outputs = true;  // compress eupruned/euraw rolling outputs by default
 
 static void compress(const std::string& path) {
@@ -816,6 +817,16 @@ static inline uint64_t fnv64(uint64_t h, uint64_t x) {
     return (h ^ x) * 1099511628211ULL;
 }
 
+static int count_distinct(const std::vector<uint64_t>& v) {
+    if (v.empty()) return 0;
+    std::vector<uint64_t> s = v;
+    std::sort(s.begin(), s.end());
+    int c = 1;
+    for (size_t i = 1; i < s.size(); ++i)
+        if (s[i] != s[i - 1]) ++c;
+    return c;
+}
+
 std::string wl_hash(const State& st, int iterations) {
     int n = (int)st.darts.size();
     if (n == 0) return "";
@@ -832,10 +843,18 @@ std::string wl_hash(const State& st, int iterations) {
     for (int i = 0; i < n; ++i)
         labels[i] = fnv64(14695981039346656037ULL, (uint64_t)(uint32_t)st.darts[i].polygon_size);
 
-		if (iterations <= 0) iterations = 3;
+    // 1-WL colour refinement converges once the number of distinct colours
+    // stops growing (each round strictly refines the partition otherwise),
+    // which happens in at most n rounds.  Iterate to convergence so the hash
+    // is as discriminating as 1-WL can be — enough iterations eliminates
+    // hash collisions at large k (see collision-rate diagnostics).
+    int cap = iterations > 0 ? iterations : (g_wl_iters > 0 ? g_wl_iters : n);
+    if (cap > n) cap = n;
 
     std::vector<uint64_t> new_labels(n);
-    for (int iter = 0; iter < iterations; ++iter) {
+    int prev_distinct = count_distinct(labels);
+    int used = 0;
+    for (int iter = 0; iter < cap; ++iter) {
         for (int i = 0; i < n; ++i) {
             uint64_t typed[4] = {
                 fnv64(0x0000000000000001ULL, labels[st.darts[i].rneig]),
@@ -849,7 +868,15 @@ std::string wl_hash(const State& st, int iterations) {
             new_labels[i] = h;
         }
         std::swap(labels, new_labels);
+        ++used;
+        int distinct = count_distinct(labels);
+        if (distinct == prev_distinct) break;   // converged
+        prev_distinct = distinct;
     }
+    int u = used;
+    int cur = g_wl_max_iters.load(std::memory_order_relaxed);
+    while (u > cur && !g_wl_max_iters.compare_exchange_weak(cur, u, std::memory_order_relaxed))
+        ;
 
     // Canonical 32-byte hash of sorted multiset
     std::sort(labels.begin(), labels.end());
@@ -878,7 +905,7 @@ std::string wl_hash_partial(const State& st, int iterations) {
         if (st.darts[i].lneig < 0 || st.darts[i].lneig >= n) return "";
         if (st.darts[i].mirro < 0 || st.darts[i].mirro >= n) return "";
     }
-    if (iterations <= 0) iterations = g_wl_iters;
+    if (iterations <= 0) iterations = (g_wl_iters > 0 ? g_wl_iters : n);
 
     std::vector<uint64_t> labels(n);
     for (int i = 0; i < n; ++i)
@@ -935,6 +962,7 @@ std::string wl_hash_2(const State& st, int iterations) {
         if (st.darts[i].lneig < 0 || st.darts[i].lneig >= n) return "";
         if (st.darts[i].mirro < 0 || st.darts[i].mirro >= n) return "";
     }
+    if (iterations <= 0) iterations = 25;   // 2-WL is O(n^3)/iter: keep a fixed default
 
     std::vector<uint64_t> colours(n * n);
     for (int i = 0; i < n; ++i) {
@@ -1128,7 +1156,8 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
     } else {
         std::cerr << "  WL diag: hash_hits=" << g_wl_hash_hits.load()
                   << " collisions=" << g_wl_collisions.load()
-                  << " iso_calls=" << g_solutions_match_calls.load() << "\n";
+                  << " iso_calls=" << g_solutions_match_calls.load()
+                  << " max_iters=" << g_wl_max_iters.load() << "\n";
     }
 }
 

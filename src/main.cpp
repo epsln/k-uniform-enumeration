@@ -385,6 +385,7 @@ int main(int argc, char** argv) {
 				<< "  --output DIR       output directory (default: solutions)\n"
 				<< "  --mode memory|disk solver mode (default: memory)\n"
 				<< "  --wl-dim 1|2       WL hash dimension (default: 1)\n"
+				<< "  --wl-iters N       WL iteration cap (default: 0 = iterate to convergence)\n"
 				<< "  --pdedup local|shared  partial dedup scope (default: local)\n"
 				<< "  --dedup wl|bfl       online solver dedup mode (default: wl)\n"
 				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
