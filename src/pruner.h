@@ -100,6 +100,7 @@ bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& re
 extern int g_wl_dim;
 extern int g_wl_iters;
 extern bool g_use_bfl;
+extern bool g_no_iso_check;
 extern bool g_compress_pruner_outputs;
 std::string wl_hash  (const State& st, int iterations = 3);
 std::string wl_hash_2(const State& st, int iterations = 3);

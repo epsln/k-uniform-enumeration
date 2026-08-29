@@ -20,6 +20,12 @@ using namespace catalog;
 int g_wl_dim = 1;
 int g_wl_iters = 25;
 bool g_use_bfl = false;
+bool g_no_iso_check = false;
+
+// Diagnostic counters (WL-hash collision rate).
+std::atomic<int64_t> g_wl_hash_hits{0};
+std::atomic<int64_t> g_wl_collisions{0};
+std::atomic<int64_t> g_solutions_match_calls{0};
 bool g_compress_pruner_outputs = true;  // compress eupruned/euraw rolling outputs by default
 
 static void compress(const std::string& path) {
@@ -791,6 +797,7 @@ bool OnlineDedup::check_and_remember(const State& st) {
     if (stored_ >= cap_) { seen_wl_.clear(); stored_ = 0; }
     auto it = seen_wl_.find(h);
     if (it != seen_wl_.end()) {
+        if (g_no_iso_check) return true;   // trust the WL hash, skip isomorphism fallback
         for (const auto& kept : it->second) {
             State k = EuclideanSolver::unpack_state(kept);
             if (SolutionPruner::solutions_match(st, k).first) return true;
@@ -1118,6 +1125,10 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
     if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
     if (g_use_bfl) {
         std::cerr << "  BFL words: " << solutions_words_.size() << " unique\n";
+    } else {
+        std::cerr << "  WL diag: hash_hits=" << g_wl_hash_hits.load()
+                  << " collisions=" << g_wl_collisions.load()
+                  << " iso_calls=" << g_solutions_match_calls.load() << "\n";
     }
 }
 
@@ -1227,19 +1238,28 @@ void WLPruner::process_file_wl(const std::string& path) {
             } else {
                 auto it = solutions_by_hash_.find(r.wl_hash);
                 if (it != solutions_by_hash_.end()) {
-                    for (const auto& stored : it->second) {
-                        State stored_st = EuclideanSolver::unpack_state(stored);
-                        if (solutions_match(rec2.state, stored_st).first) {
-                            is_dup = true;
-                            break;
+                    g_wl_hash_hits++;
+                    if (g_no_iso_check) {
+                        is_dup = true;   // trust the WL hash, skip isomorphism fallback
+                    } else {
+                        for (const auto& stored : it->second) {
+                            State stored_st = EuclideanSolver::unpack_state(stored);
+                            g_solutions_match_calls++;
+                            if (solutions_match(rec2.state, stored_st).first) {
+                                is_dup = true;
+                                break;
+                            }
                         }
+                        if (!is_dup) g_wl_collisions++;
                     }
                 }
             }
             if (is_dup) continue;
 
-            if (!g_use_bfl)
-                solutions_by_hash_[r.wl_hash].push_back(EuclideanSolver::pack_state(rec2.state));
+            if (!g_use_bfl) {
+                if (g_no_iso_check) solutions_by_hash_.try_emplace(r.wl_hash);  // track key only
+                else solutions_by_hash_[r.wl_hash].push_back(EuclideanSolver::pack_state(rec2.state));
+            }
             int k = (int)rec2.state.vertype.size();
             auto kit = solutions_per_k_.find(k);
             solutions_per_k_[k] = (kit != solutions_per_k_.end() ? kit->second + 1 : 1);

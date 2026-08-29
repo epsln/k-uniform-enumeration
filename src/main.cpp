@@ -361,6 +361,7 @@ int main(int argc, char** argv) {
 			if (v == "bfl") { dedup_mode = "bfl"; g_use_bfl = true; }
 			else { dedup_mode = "wl"; g_use_bfl = false; }
 		}
+		else if (arg == "--no-iso-check") { g_no_iso_check = true; }
 		else if (arg == "--propagate") { g_propagate = true; }
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
@@ -386,6 +387,7 @@ int main(int argc, char** argv) {
 				<< "  --wl-dim 1|2       WL hash dimension (default: 1)\n"
 				<< "  --pdedup local|shared  partial dedup scope (default: local)\n"
 				<< "  --dedup wl|bfl       online solver dedup mode (default: wl)\n"
+				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
 				<< "  --fanout N         BFS fan-out target (0=auto, default: 40000)\n"
 				<< "  --spill N          disk spill threshold (0=auto, default: 50000)\n"
 				<< "  --chunks N         number of frontier chunks (0=auto, default: workers*32)\n"
