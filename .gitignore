@@ -1,6 +1,7 @@
 # Build artifacts
 *.o
 *.obj
+*.d
 eusolver
 eusolver_*
 
