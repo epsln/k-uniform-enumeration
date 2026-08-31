@@ -106,7 +106,12 @@ inline std::unique_ptr<std::istream> open_solution_istream(const std::string& pa
     return std::unique_ptr<std::istream>(std::move(f));
 }
 
-// Compress `path` into `path.zst` (overwriting) and remove the plain source.
+// Compress `path` into `path.zst` (appending) and remove the plain source.
+// Appending (rather than truncating) is essential: in disk mode the worker
+// outputs for a combo are merged into X.bin.zst first, while the BFS fan-out's
+// "early solutions" for that same combo are written straight to X.bin.  A
+// truncate here would overwrite the worker frame and lose those solutions.
+// zstd frames concatenate, so appending yields the full record.
 // Aborts on failure (e.g. disk full) rather than silently losing data.
 inline void compress_to_zst(const std::string& path) {
     if (has_zst_suffix(path)) return;
@@ -115,7 +120,7 @@ inline void compress_to_zst(const std::string& path) {
     if (!in) return;
 
     std::string zst = path + ".zst";
-    std::ofstream out(zst, std::ios::binary | std::ios::trunc);
+    std::ofstream out(zst, std::ios::binary | std::ios::app);
     if (!out) {
         std::cerr << "FATAL: cannot open " << zst << " for writing.\n";
         std::abort();
