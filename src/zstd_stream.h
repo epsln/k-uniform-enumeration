@@ -7,6 +7,7 @@
 #include <istream>
 #include <memory>
 #include <streambuf>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <zstd.h>
@@ -43,7 +44,11 @@ protected:
 
         for (;;) {
             if (in_len_ == 0) {
-                if (in_.eof()) return traits_type::eof();
+                if (in_.eof()) {
+                    if (frame_incomplete_)
+                        throw std::runtime_error("truncated zstd stream: " + path_);
+                    return traits_type::eof();
+                }
                 in_.read(in_buf_.data(), (std::streamsize)in_buf_.size());
                 in_len_ = (size_t)in_.gcount();
                 in_pos_ = 0;
@@ -55,7 +60,10 @@ protected:
             size_t rc = ZSTD_decompressStream(dctx_, &zout, &zin);
             in_pos_ += zin.pos;
             in_len_ -= zin.pos;
-            if (ZSTD_isError(rc)) return traits_type::eof();
+            if (ZSTD_isError(rc))
+                throw std::runtime_error("invalid zstd stream " + path_ + ": "
+                                         + ZSTD_getErrorName(rc));
+            frame_incomplete_ = rc != 0;
 
             if (zout.pos > 0) {
                 setg(out_buf_.data(), out_buf_.data(), out_buf_.data() + zout.pos);
@@ -81,6 +89,7 @@ private:
     size_t in_pos_ = 0;
     size_t in_len_ = 0;
     std::vector<char> out_buf_;
+    bool frame_incomplete_ = false;
 };
 
 class ZstdInputFile : public std::istream {

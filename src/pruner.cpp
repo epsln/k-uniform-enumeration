@@ -446,7 +446,7 @@ State SolutionPruner::decode_solution(const std::string& vertex_line,
 
 // ---------------------------------------------------------------------------
 // read_next_solution — streaming parser, reads one solution from file
-// Returns true if a solution was read, false on EOF or parse error.
+// Returns true if a solution was read and false only on clean EOF.
 // ---------------------------------------------------------------------------
 bool read_next_solution(std::istream& in, SolutionPruner::SolutionRecord& rec) {
     std::string line;
@@ -455,22 +455,27 @@ bool read_next_solution(std::istream& in, SolutionPruner::SolutionRecord& rec) {
     while (std::getline(in, line)) {
         if (line.rfind("Number of polygons:", 0) == 0) break;
     }
-    if (in.eof() || in.fail()) return false;
+    if (in.bad()) throw std::runtime_error("failed while reading text solution stream");
+    if (in.eof()) return false;
+    if (in.fail()) throw std::runtime_error("failed while scanning text solution stream");
 
     // Read the 4 fixed header lines
-    if (!std::getline(in, rec.vertex_line))    return false;
-    if (!std::getline(in, rec.signature_line)) return false;
-    if (!std::getline(in, rec.tes_line))       return false;
-    if (!std::getline(in, rec.conway_line))    return false;
+    if (!std::getline(in, rec.vertex_line)
+            || !std::getline(in, rec.signature_line)
+            || !std::getline(in, rec.tes_line)
+            || !std::getline(in, rec.conway_line))
+        throw std::runtime_error("truncated text solution header");
 
     // Skip cycle description lines until "---"
     while (std::getline(in, line)) {
         if (!line.empty() && line[0] == '-' && line == "---") break;
     }
+    if (line != "---") throw std::runtime_error("truncated text solution cycles");
 
     // Skip assembled conway and blank line
-    if (!std::getline(in, line)) return false; // assembled conway
-    if (!std::getline(in, line)) return false; // blank line (or next header)
+    if (!std::getline(in, line)) throw std::runtime_error("missing assembled Conway symbol");
+    if (!std::getline(in, line) && !in.eof())
+        throw std::runtime_error("failed after text solution record");
 
     rec.state = SolutionPruner::decode_solution(rec.vertex_line, rec.conway_line);
 
@@ -507,28 +512,32 @@ bool read_next_solution(std::istream& in, SolutionPruner::SolutionRecord& rec) {
 // ---------------------------------------------------------------------------
 bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& rec,
                              int& sol_idx) {
-    if (!in.good() || in.peek() == EOF) return false;
+    if (in.peek() == EOF) {
+        if (in.bad()) throw std::runtime_error("failed while reading binary solution stream");
+        return false;
+    }
 
     uint8_t nv; in.read((char*)&nv, 1);
     uint8_t ne; in.read((char*)&ne, 1);
-    if (in.fail() || nv == 0 || ne == 0) return false;
+    if (in.fail() || nv == 0 || ne == 0)
+        throw std::runtime_error("invalid binary solution header");
 
     std::vector<int> vertype(nv);
     for (int i = 0; i < nv; ++i) {
         uint8_t v; in.read((char*)&v, 1);
-        if (in.fail()) return false;
+        if (in.fail()) throw std::runtime_error("truncated binary vertex types");
         vertype[i] = (int)v;
     }
 
     std::vector<int> glue(ne);
     for (int i = 0; i < ne; ++i) {
         int16_t g; in.read((char*)&g, 2);
-        if (in.fail()) return false;
+        if (in.fail()) throw std::runtime_error("truncated binary glue data");
         glue[i] = (int)g;
     }
 
     State st = EuclideanSolver::rebuild_from_vertype_glue(vertype, glue);
-    if (st.darts.empty()) return false;
+    if (st.darts.empty()) throw std::runtime_error("invalid packed solution state");
 
     rec.state = std::move(st);
     rec.vertex_line    = verbal_vertices(rec.state.vertype);
@@ -1152,7 +1161,8 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
     for (const auto& path : listfile_paths) {
         std::error_code ec;
         fs::remove(path, ec);
-        if (ec) throw std::runtime_error("remove pruned input " + path + ": " + ec.message());
+        if (ec) std::cerr << "  warning: could not remove pruned input " << path
+                          << ": " << ec.message() << "\n";
     }
     if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
     if (g_use_bfl) {
