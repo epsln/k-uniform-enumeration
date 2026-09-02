@@ -34,6 +34,7 @@ public:
         std::string conway_line;
         State state;
         std::string count_signature;
+        int solution_index = 0;
     };
 
 protected:

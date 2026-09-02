@@ -103,6 +103,36 @@ static char count_digit(int x) {
     return (char)('0' + x);
 }
 
+static std::string make_count_signature(const State& st) {
+    std::map<std::string, int> base_counts;
+    for (int t : st.vertype) {
+        const std::string& sym = symbols[t];
+        ++base_counts[sym.substr(0, sym.find(')') + 1)];
+    }
+
+    std::string result = std::to_string(base_counts.size());
+    std::vector<int> multiplicities;
+    for (const auto& [symbol, count] : base_counts) multiplicities.push_back(count);
+    std::sort(multiplicities.begin(), multiplicities.end(), std::greater<int>());
+    if (std::any_of(multiplicities.begin(), multiplicities.end(), [](int n) { return n > 1; })) {
+        result += " (";
+        for (int n : multiplicities) result += count_digit(n);
+        result += ")";
+    }
+    return result;
+}
+
+static void materialize_output_fields(SolutionPruner::SolutionRecord& rec) {
+    if (rec.vertex_line.empty()) {
+        rec.vertex_line = verbal_vertices(rec.state.vertype);
+        rec.signature_line = signature(rec.state.vertype);
+        rec.conway_line = write_conway(rec.state);
+        rec.tes_line = "eu raw " + file_signature(rec.state.vertype) + " "
+                     + std::to_string(rec.solution_index) + ".tes";
+    }
+    rec.count_signature = make_count_signature(rec.state);
+}
+
 // =============================================================================
 // Conway parsing  (ConwayParser)
 // =============================================================================
@@ -480,30 +510,6 @@ bool read_next_solution(std::istream& in, SolutionPruner::SolutionRecord& rec) {
 
     rec.state = SolutionPruner::decode_solution(rec.vertex_line, rec.conway_line);
 
-    // Compute count_signature
-    {
-        std::vector<int> vt = rec.state.vertype;
-        std::map<std::string, int> base_counts;
-        for (int t : vt) {
-            const std::string& sym = symbols[t];
-            std::string base = sym.substr(0, sym.find(')') + 1);
-            ++base_counts[base];
-        }
-        std::string cs = std::to_string(base_counts.size());
-        std::vector<int> mults;
-        for (const auto& [s, c] : base_counts)
-            mults.push_back(c);
-        std::sort(mults.begin(), mults.end(), std::greater<int>());
-        bool any_gt_1 = false;
-        for (int m : mults) if (m > 1) any_gt_1 = true;
-        if (any_gt_1) {
-            cs += " (";
-            for (int m : mults) cs += count_digit(m);
-            cs += ")";
-        }
-        rec.count_signature = cs;
-    }
-
     return true;
 }
 
@@ -541,37 +547,7 @@ bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& re
     if (st.darts.empty()) throw std::runtime_error("invalid packed solution state");
 
     rec.state = std::move(st);
-    rec.vertex_line    = verbal_vertices(rec.state.vertype);
-    rec.signature_line = signature(rec.state.vertype);
-    rec.conway_line    = write_conway(rec.state);
-
-    std::string filesig = file_signature(rec.state.vertype);
-    ++sol_idx;
-    rec.tes_line = "eu raw " + filesig + " " + std::to_string(sol_idx) + ".tes";
-
-    // count_signature
-    {
-        std::vector<int> vt = rec.state.vertype;
-        std::map<std::string, int> base_counts;
-        for (int t : vt) {
-            const std::string& sym = symbols[t];
-            std::string base = sym.substr(0, sym.find(')') + 1);
-            ++base_counts[base];
-        }
-        std::string cs = std::to_string(base_counts.size());
-        std::vector<int> mults;
-        for (const auto& [s, c] : base_counts)
-            mults.push_back(c);
-        std::sort(mults.begin(), mults.end(), std::greater<int>());
-        bool any_gt_1 = false;
-        for (int m : mults) if (m > 1) any_gt_1 = true;
-        if (any_gt_1) {
-            cs += " (";
-            for (int m : mults) cs += count_digit(m);
-            cs += ")";
-        }
-        rec.count_signature = cs;
-    }
+    rec.solution_index = ++sol_idx;
 
     return true;
 }
@@ -1320,6 +1296,8 @@ void WLPruner::process_file_wl(const std::string& path) {
             int k = (int)rec2.state.vertype.size();
             auto kit = solutions_per_k_.find(k);
             solutions_per_k_[k] = (kit != solutions_per_k_.end() ? kit->second + 1 : 1);
+
+            materialize_output_fields(rec2);
 
             std::string tes_line_raw = rec2.tes_line;
             size_t eu_pos = tes_line_raw.find("eu");
