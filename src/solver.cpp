@@ -42,6 +42,84 @@ int EuclideanSolver::neighbors_len(int gr) { return (int)left_neighbors[gr].size
 int EuclideanSolver::attach_limit(int gr) { return attachment_limit(gr); }
 int EuclideanSolver::polygon_size_of(int gr, int slot) { return polygon_sizes[gr][slot]; }
 
+bool EuclideanSolver::seam_compatible(int a, int b, const std::vector<Dart>& darts) {
+    return (darts[a].mirro == a) == (darts[b].mirro == b) &&
+           darts[a].polygon_size == darts[darts[b].rneig].polygon_size &&
+           darts[b].polygon_size == darts[darts[a].rneig].polygon_size;
+}
+
+const std::vector<EuclideanSolver::AttachmentSlot>&
+EuclideanSolver::compatible_attachment_slots(int source,
+                                              const std::vector<Dart>& darts) {
+    constexpr int MAX_POLYGON_SIZE = 12;
+    using Buckets = std::array<std::array<std::array<std::vector<AttachmentSlot>, 2>,
+                                            MAX_POLYGON_SIZE + 1>,
+                               MAX_POLYGON_SIZE + 1>;
+    static const Buckets buckets = [] {
+        Buckets result;
+        for (int gr = 0; gr < NUM_VERTEX_TYPES; ++gr) {
+            int limit = attachment_limit(gr);
+            for (int slot = 0; slot < limit; ++slot) {
+                int left = polygon_sizes[gr][slot];
+                int right = polygon_sizes[gr][right_neighbors[gr][slot]];
+                int self_mirror = mirrors[gr][slot] == slot;
+                result[left][right][self_mirror].push_back({gr, slot});
+            }
+        }
+        return result;
+    }();
+
+    int left = darts[source].polygon_size;
+    int right = darts[darts[source].rneig].polygon_size;
+    int self_mirror = darts[source].mirro == source;
+    if (left > MAX_POLYGON_SIZE || right > MAX_POLYGON_SIZE) {
+        static const std::vector<AttachmentSlot> empty;
+        return empty;
+    }
+    return buckets[right][left][self_mirror];
+}
+
+bool EuclideanSolver::propagate_unique_partners(State& st, int max_polygons) {
+    if ((int)st.vertype.size() < max_polygons) return true;
+
+    while (true) {
+        bool changed = false;
+        for (int source = 0; source < (int)st.darts.size(); ++source) {
+            if (st.darts[source].glue != -1)
+                continue;
+
+            int only_target = -1;
+            int candidates = 0;
+            for (int target = 0; target < (int)st.darts.size(); ++target) {
+                if (st.darts[target].glue == -1 && seam_compatible(source, target, st.darts)) {
+                    only_target = target;
+                    if (++candidates > 1) break;
+                }
+            }
+            if (candidates == 0) return false;
+            if (candidates != 1) continue;
+
+            int mirror_source = st.darts[source].mirro;
+            int mirror_target = st.darts[only_target].mirro;
+            st.darts[source].glue = only_target;
+            st.darts[only_target].glue = source;
+            if (mirror_source != source) {
+                if ((st.darts[mirror_source].glue != -1 && st.darts[mirror_source].glue != mirror_target) ||
+                    (st.darts[mirror_target].glue != -1 && st.darts[mirror_target].glue != mirror_source))
+                    return false;
+                st.darts[mirror_source].glue = mirror_target;
+                st.darts[mirror_target].glue = mirror_source;
+            }
+            if (!check_partial(st)) return false;
+            if (g_propagate && !propagate_forced(st.darts)) return false;
+            if (!check_partial(st)) return false;
+            changed = true;
+            break;
+        }
+        if (!changed) return true;
+    }
+}
+
 static void fill_neighbors(State& s, int gr, int offset, int sl) {
     for (int sg = 0; sg < sl; ++sg) {
         Dart d;
@@ -57,6 +135,8 @@ static void fill_neighbors(State& s, int gr, int offset, int sl) {
 
 State EuclideanSolver::extend_state(const State& base, int gr, int offset, int sl) {
     State s;
+    s.darts.reserve(base.darts.size() + sl);
+    s.vertype.reserve(base.vertype.size() + 1);
     s.darts = base.darts;
     s.vertype = base.vertype;
     fill_neighbors(s, gr, offset, sl);

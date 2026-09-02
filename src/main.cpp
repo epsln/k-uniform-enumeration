@@ -42,7 +42,7 @@ struct SharedQueue {
 	int active = 0;
 	bool stop = false;
 
-	static constexpr int BATCH = 64;
+	static constexpr int BATCH = 16;
 
 	int pop_batch(std::vector<State>& out) {
 		out.clear();
@@ -59,22 +59,11 @@ struct SharedQueue {
 		return n;
 	}
 
-	void push_batch(std::vector<State>& batch) {
-		if (batch.empty()) return;
+	void finish_batch(int completed, std::vector<State>& successors) {
 		std::lock_guard<std::mutex> lk(mu);
-		for (auto& s : batch) q.push_back(EuclideanSolver::pack_state(s));
-		cv.notify_all();
-	}
-
-	void push_one(State&& s) {
-		std::lock_guard<std::mutex> lk(mu);
-		q.push_back(EuclideanSolver::pack_state(s));
-		cv.notify_one();
-	}
-
-	void done_one(int n = 1) {
-		std::lock_guard<std::mutex> lk(mu);
-		active -= n;
+		for (auto& s : successors) q.push_back(EuclideanSolver::pack_state(s));
+		active -= completed;
+		if (q.empty() && active == 0) stop = true;
 		cv.notify_all();
 	}
 
@@ -784,7 +773,7 @@ int main(int argc, char** argv) {
 				std::vector<State> init_batch;
 				for (int vt = 0; vt < NUM_VERTEX_TYPES; ++vt)
 					init_batch.push_back(EuclideanSolver::make_initial(vt));
-				sq.push_batch(init_batch);
+				sq.finish_batch(0, init_batch);
 			}
 
 			// Each worker writes to its own directory for thread safety
@@ -845,8 +834,7 @@ int main(int argc, char** argv) {
 								}
 								}, max_polygons);
 						}
-						sq.done_one(nb);
-						sq.push_batch(local_batch);
+						sq.finish_batch(nb, local_batch);
 						total_solutions.fetch_add(sol_accepted);
 						total_sol_deduped.fetch_add(solutions - sol_accepted);
 						total_deduped.fetch_add(pd_deduped);
