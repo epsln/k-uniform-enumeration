@@ -11,6 +11,7 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 
@@ -1127,7 +1128,7 @@ bool DiskWordIndex::contains(const std::vector<int>& w) {
 // =============================================================================
 WLPruner::WLPruner(const std::string& output_dir, int num_workers)
     : SolutionPruner(output_dir), solutions_words_(output_dir + "/words.bin"),
-      tes_store_(output_dir + "/tilings.sqlite3"),
+      tes_store_(output_dir + "/tilings.sqlite3.tmp"),
       num_workers_(num_workers) {}
 
 void WLPruner::run(const std::vector<std::string>& listfile_paths) {
@@ -1147,6 +1148,12 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
         process_file_wl(listfile_paths[i]);
     }
     tes_store_.finish();
+    fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
+    for (const auto& path : listfile_paths) {
+        std::error_code ec;
+        fs::remove(path, ec);
+        if (ec) throw std::runtime_error("remove pruned input " + path + ": " + ec.message());
+    }
     if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
     if (g_use_bfl) {
         std::cerr << "  BFL words: " << solutions_words_.size() << " unique\n";
@@ -1317,5 +1324,4 @@ void WLPruner::process_file_wl(const std::string& path) {
         pruned_out.maybe_compress();
     }
 		tes_store_.checkpoint();
-		std::remove(path.c_str());
 }

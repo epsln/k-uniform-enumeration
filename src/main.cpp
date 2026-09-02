@@ -306,10 +306,10 @@ static std::map<int,int> run_pruner(const std::string& output_dir, int num_worke
 	std::map<int,int> counts;
 	{
 		std::string pruned_dir = output_dir + "/wl";
-		fs::remove(pruned_dir + "/tilings.sqlite3");
-		fs::remove(pruned_dir + "/tilings.sqlite3-journal");
-		fs::remove(pruned_dir + "/tilings.sqlite3-wal");
-		fs::remove(pruned_dir + "/tilings.sqlite3-shm");
+		fs::remove(pruned_dir + "/tilings.sqlite3.tmp");
+		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-journal");
+		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-wal");
+		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-shm");
 		WLPruner pruner(pruned_dir, num_workers);
 		pruner.run(solution_files);
 		int total = 0;

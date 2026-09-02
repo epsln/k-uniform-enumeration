@@ -27,9 +27,9 @@ Extract all documents when individual files are needed:
 ./eusolver --extract-tes solutions/wl/tilings.sqlite3 --extract-output one --tes-id 42
 ```
 
-Extraction refuses to overwrite existing files. Starting a new pruner run in
-an existing output directory replaces the previous `tilings.sqlite3`; it does
-not resume an interrupted prune.
+Extraction refuses to overwrite existing files. A pruner run builds a temporary
+database and atomically replaces the previous `tilings.sqlite3` only after all
+inputs succeed. It does not resume an interrupted prune.
 
 Run `./eusolver --help` for the full option list. See `CLAUDE.md` for the
 architecture overview and `IMPLEMENTATION.md` for implementation details.

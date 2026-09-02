@@ -174,6 +174,8 @@ void TesStore::finish() {
     if (finished_) return;
     flush();
     exec(db_, "PRAGMA optimize;");
+    check_sqlite(sqlite3_close(db_), db_, "close TES database");
+    db_ = nullptr;
     finished_ = true;
 }
 
@@ -243,12 +245,19 @@ int64_t extract_tes_database(const std::string& database_path,
             if (fs::weakly_canonical(parent).parent_path() != output_root)
                 throw std::runtime_error("TES entry path escapes extraction directory");
             fs::path path = parent / filename;
-            if (fs::exists(path)) {
+            std::error_code status_error;
+            fs::file_status path_status = fs::symlink_status(path, status_error);
+            if (status_error && status_error != std::errc::no_such_file_or_directory)
+                throw std::runtime_error("inspect extracted TES path: " + status_error.message());
+            if (fs::is_symlink(path_status))
+                throw std::runtime_error("extracted TES path is a symlink: " + path.string());
+            if (fs::exists(path_status)) {
                 if (!written_paths.count(path.string()))
                     throw std::runtime_error("extracted TES file already exists: " + path.string());
                 path = parent / (path.stem().string() + " [" + std::to_string(entry_id)
                                  + "]" + path.extension().string());
-                if (fs::exists(path))
+                path_status = fs::symlink_status(path, status_error);
+                if (fs::is_symlink(path_status) || fs::exists(path_status))
                     throw std::runtime_error("extracted TES file already exists: " + path.string());
             }
             std::ofstream out(path, std::ios::binary | std::ios::trunc);

@@ -188,17 +188,21 @@ database has three tables:
 - `entries`: stable numeric ID, byte range, combo, signature, and legacy name.
 
 Chunks target 8 MiB of uncompressed text. A transaction is committed after
-each merged solver input file, before that input is deleted. This bounds data
-at risk without requiring a transaction or zstd frame per tiny document. A
-document larger than the target is stored as its own chunk.
+each merged solver input file. Input files are retained until the complete
+database has been published, then removed together. This bounds data at risk
+and permits a failed prune to be retried without requiring a transaction or
+zstd frame per tiny document. A document larger than the target is stored as
+its own chunk.
 
 `--extract-tes DB --extract-output DIR` recreates the combo-directory layout.
 `--tes-id N` limits extraction to one entry. Extraction validates stored path
 components, zstd sizes, and byte ranges, and refuses to overwrite files.
 
 The database is a final-output container, not a pruner checkpoint. A fresh
-pruner run replaces an existing `tilings.sqlite3`; global deduplication state
-still lives in memory and cannot currently be resumed safely.
+pruner run writes `tilings.sqlite3.tmp` and atomically publishes it only after
+all inputs succeed, preserving a prior completed database on failure. Global
+deduplication state still lives in memory and cannot currently be resumed
+safely.
 
 ### Binary serialization (disk_solver.cpp)
 
