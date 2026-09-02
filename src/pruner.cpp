@@ -639,124 +639,44 @@ std::pair<bool, std::string> SolutionPruner::is_canonical_labeling(const State& 
 std::pair<bool, std::string> SolutionPruner::solutions_match(const State& a, const State& b) {
     int n = (int)a.darts.size();
     if ((int)b.darts.size() != n) return {false, ""};
+    if (n == 0) return {true, ""};
 
-    int total = 2 * n;
-    int nw = (total + 63) / 64;
+    static thread_local std::vector<int> map_ab, map_ba, queue;
+    map_ab.resize(n);
+    map_ba.resize(n);
+    queue.resize(n);
 
-    // Flat bit-set alias: alias[i*nw + w] = bits [w*64, w*64+64) of alias[i].
-    // This is O(total^2 / 64) memory instead of O(total^2) heap nodes for
-    // std::set — the old version allocated ~2n^2 set nodes per call, which
-    // exploded the heap at high k.
-    std::vector<uint64_t> alias((size_t)total * nw, 0);
-
-    auto set_bit   = [&](int i, int j) { alias[(size_t)i * nw + (j >> 6)] |=  (1ULL << (j & 63)); };
-    auto get_bit   = [&](int i, int j) -> bool { return (alias[(size_t)i * nw + (j >> 6)] >> (j & 63)) & 1ULL; };
-    auto clear_bit = [&](int i, int j) { alias[(size_t)i * nw + (j >> 6)] &= ~(1ULL << (j & 63)); };
-    auto count_bits = [&](int i) -> int {
-        int c = 0;
-        for (int w = 0; w < nw; ++w) c += __builtin_popcountll(alias[(size_t)i * nw + w]);
-        return c;
+    auto assign = [&](int ai, int bi, int& tail) {
+        if (map_ab[ai] != -1 || map_ba[bi] != -1)
+            return map_ab[ai] == bi && map_ba[bi] == ai;
+        if (a.darts[ai].polygon_size != b.darts[bi].polygon_size) return false;
+        map_ab[ai] = bi;
+        map_ba[bi] = ai;
+        queue[tail++] = ai;
+        return true;
     };
 
-    // alias[i] for i in 0..n-1: {i} ∪ {n .. 2n-1}
-    // alias[i] for i in n..2n-1: {i} ∪ {0 .. n-1}
-    for (int i = 0; i < n; ++i) {
-        set_bit(i, i);
-        for (int j = n; j < total; ++j) set_bit(i, j);
-    }
-    for (int i = n; i < total; ++i) {
-        set_bit(i, i);
-        for (int j = 0; j < n; ++j) set_bit(i, j);
-    }
+    for (int root_b = 0; root_b < n; ++root_b) {
+        if (a.darts[0].polygon_size != b.darts[root_b].polygon_size) continue;
+        std::fill(map_ab.begin(), map_ab.end(), -1);
+        std::fill(map_ba.begin(), map_ba.end(), -1);
+        int head = 0, tail = 0;
+        if (!assign(0, root_b, tail)) continue;
 
-    // Build combined arrays
-    std::vector<int> rneig(total), lneig(total), poly(total), mirro(total), glue(total);
-    for (int i = 0; i < n; ++i) {
-        rneig[i] = a.darts[i].rneig;
-        lneig[i] = a.darts[i].lneig;
-        poly[i]  = a.darts[i].polygon_size;
-        mirro[i] = a.darts[i].mirro;
-        glue[i]  = a.darts[i].glue;
-    }
-    for (int i = 0; i < n; ++i) {
-        rneig[n+i] = n + b.darts[i].rneig;
-        lneig[n+i] = n + b.darts[i].lneig;
-        poly[n+i]  = b.darts[i].polygon_size;
-        mirro[n+i] = n + b.darts[i].mirro;
-        glue[n+i]  = n + b.darts[i].glue;
-    }
-    auto label_of = [&](int i) -> std::string {
-        if (i < n) return rebuild_label(i, a.vertype);
-        return rebuild_label(i - n, b.vertype);
-    };
-
-    std::vector<bool> unique(total, false);
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (int i = 0; i < total; ++i) {
-            for (int w = 0; w < nw; ++w) {
-                uint64_t word = alias[(size_t)i * nw + w];
-                while (word) {
-                    int bit = __builtin_ctzll(word);
-                    int j = w * 64 + bit;
-                    word &= word - 1;
-                    if (j >= total) continue;
-                    if (poly[i] != poly[j]
-                        || !get_bit(j, i)
-                        || !get_bit(mirro[i], mirro[j])
-                        || !get_bit(glue[i], glue[j])
-                        || !get_bit(rneig[i], rneig[j])
-                        || !get_bit(lneig[i], lneig[j]))
-                    {
-                        clear_bit(i, j);
-                        changed = true;
-                    }
-                }
-            }
-            if (count_bits(i) == 1)
-                unique[i] = true;
+        bool valid = true;
+        while (head < tail && valid) {
+            int ai = queue[head++];
+            int bi = map_ab[ai];
+            const Dart& ad = a.darts[ai];
+            const Dart& bd = b.darts[bi];
+            valid = assign(ad.rneig, bd.rneig, tail)
+                 && assign(ad.lneig, bd.lneig, tail)
+                 && assign(ad.mirro, bd.mirro, tail)
+                 && assign(ad.glue, bd.glue, tail);
         }
+        if (valid && tail == n) return {true, ""};
     }
-
-    bool all_unique = true;
-    for (int i = 0; i < total; ++i)
-        if (!unique[i]) { all_unique = false; break; }
-
-    // _solutions_match returns True when NOT all unique (= isomorphic)
-    bool is_isomorphic = !all_unique;
-
-    std::string log;
-    if (is_isomorphic) {
-        std::vector<char> seen(total, 0);
-        std::vector<std::string> groups;
-        for (int i = 0; i < total; ++i) {
-            if (seen[i] || count_bits(i) <= 1) continue;
-            std::string g = "[";
-            bool first = true;
-            for (int w = 0; w < nw; ++w) {
-                uint64_t word = alias[(size_t)i * nw + w];
-                while (word) {
-                    int bit = __builtin_ctzll(word);
-                    int j = w * 64 + bit;
-                    word &= word - 1;
-                    if (j >= total) continue;
-                    if (!first) g += "=";
-                    g += label_of(j);
-                    first = false;
-                    seen[j] = 1;
-                }
-            }
-            g += "]";
-            groups.push_back(g);
-        }
-        for (size_t k = 0; k < groups.size(); ++k) {
-            if (k) log += " ";
-            log += groups[k];
-        }
-        log += "\n";
-    }
-    return {is_isomorphic, log};
+    return {false, ""};
 }
 
 // ---------------------------------------------------------------------------
