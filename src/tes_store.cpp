@@ -4,6 +4,7 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <sqlite3.h>
 #include <zstd.h>
 
@@ -197,9 +198,9 @@ int64_t extract_tes_database(const std::string& database_path,
             throw std::runtime_error("unsupported TES database schema");
 
         const char* sql = id == 0
-            ? "SELECT c.id, e.combo, e.legacy_filename, e.byte_offset, e.byte_length, c.data, c.uncompressed_size"
+            ? "SELECT c.id, e.id, e.combo, e.legacy_filename, e.byte_offset, e.byte_length, c.data, c.uncompressed_size"
               " FROM entries e JOIN chunks c ON c.id=e.chunk_id ORDER BY e.id;"
-            : "SELECT c.id, e.combo, e.legacy_filename, e.byte_offset, e.byte_length, c.data, c.uncompressed_size"
+            : "SELECT c.id, e.id, e.combo, e.legacy_filename, e.byte_offset, e.byte_length, c.data, c.uncompressed_size"
               " FROM entries e JOIN chunks c ON c.id=e.chunk_id WHERE e.id=?;";
         Statement rows(db, sql);
         if (id != 0)
@@ -209,12 +210,14 @@ int64_t extract_tes_database(const std::string& database_path,
         fs::path output_root = fs::weakly_canonical(output_dir);
         sqlite3_int64 loaded_chunk = -1;
         std::vector<char> decompressed;
+        std::unordered_set<std::string> written_paths;
         int64_t count = 0;
         while ((rc = sqlite3_step(rows.get())) == SQLITE_ROW) {
             sqlite3_int64 chunk_id = sqlite3_column_int64(rows.get(), 0);
-            const void* blob = sqlite3_column_blob(rows.get(), 5);
-            int blob_size = sqlite3_column_bytes(rows.get(), 5);
-            int64_t raw_size = sqlite3_column_int64(rows.get(), 6);
+            sqlite3_int64 entry_id = sqlite3_column_int64(rows.get(), 1);
+            const void* blob = sqlite3_column_blob(rows.get(), 6);
+            int blob_size = sqlite3_column_bytes(rows.get(), 6);
+            int64_t raw_size = sqlite3_column_int64(rows.get(), 7);
             if (raw_size < 0 || static_cast<uint64_t>(raw_size) > std::numeric_limits<size_t>::max())
                 throw std::runtime_error("invalid TES chunk size");
             if (chunk_id != loaded_chunk) {
@@ -224,13 +227,13 @@ int64_t extract_tes_database(const std::string& database_path,
                     throw std::runtime_error("invalid compressed TES chunk");
                 loaded_chunk = chunk_id;
             }
-            int64_t offset = sqlite3_column_int64(rows.get(), 3);
-            int64_t length = sqlite3_column_int64(rows.get(), 4);
+            int64_t offset = sqlite3_column_int64(rows.get(), 4);
+            int64_t length = sqlite3_column_int64(rows.get(), 5);
             if (offset < 0 || length < 0 || offset > raw_size || length > raw_size - offset)
                 throw std::runtime_error("invalid TES entry bounds");
 
-            std::string combo = column_text(rows.get(), 1);
-            std::string filename = column_text(rows.get(), 2);
+            std::string combo = column_text(rows.get(), 2);
+            std::string filename = column_text(rows.get(), 3);
             if (combo.empty() || filename.empty()
                     || fs::path(combo).filename() != fs::path(combo)
                     || fs::path(filename).filename() != fs::path(filename))
@@ -240,11 +243,18 @@ int64_t extract_tes_database(const std::string& database_path,
             if (fs::weakly_canonical(parent).parent_path() != output_root)
                 throw std::runtime_error("TES entry path escapes extraction directory");
             fs::path path = parent / filename;
-            if (fs::exists(path))
-                throw std::runtime_error("extracted TES file already exists: " + path.string());
+            if (fs::exists(path)) {
+                if (!written_paths.count(path.string()))
+                    throw std::runtime_error("extracted TES file already exists: " + path.string());
+                path = parent / (path.stem().string() + " [" + std::to_string(entry_id)
+                                 + "]" + path.extension().string());
+                if (fs::exists(path))
+                    throw std::runtime_error("extracted TES file already exists: " + path.string());
+            }
             std::ofstream out(path, std::ios::binary | std::ios::trunc);
             out.write(decompressed.data() + offset, length);
             if (!out) throw std::runtime_error("write extracted TES file: " + path.string());
+            written_paths.insert(path.string());
             ++count;
         }
         if (rc != SQLITE_DONE) check_sqlite(rc, db, "read TES entries");
