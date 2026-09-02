@@ -24,6 +24,7 @@ int g_wl_iters = 0;   // 0 = auto: iterate 1-WL to convergence (cap = n darts)
 bool g_use_bfl = false;
 bool g_no_iso_check = false;
 bool g_keep_pruner_inputs = false;
+bool g_profile_pruner = false;
 
 // Diagnostic counters (WL-hash collision rate).
 std::atomic<int64_t> g_wl_hash_hits{0};
@@ -47,7 +48,11 @@ struct RollingCompressedWriter {
     std::ofstream out;
 
     explicit RollingCompressedWriter(std::string p)
-        : path(std::move(p)), out(path, std::ios::out | std::ios::trunc) {}
+        : path(std::move(p)) {
+        std::error_code ec;
+        fs::remove(path + ".zst", ec);
+        out.open(path, std::ios::out | std::ios::trunc);
+    }
 
     ~RollingCompressedWriter() { finish(); }
 
@@ -1249,8 +1254,10 @@ void WLPruner::process_file_wl(const std::string& path) {
     auto millis = [](std::chrono::nanoseconds d) {
         return std::chrono::duration<double, std::milli>(d).count();
     };
-    std::cerr << "  pruner profile " << combo_code << ": records=" << records
-              << " decode=" << millis(decode_time) << "ms"
-              << " compute=" << millis(compute_time) << "ms"
-              << " consume=" << millis(consume_time) << "ms\n";
+    if (g_profile_pruner) {
+        std::cerr << "  pruner profile " << combo_code << ": records=" << records
+                  << " decode=" << millis(decode_time) << "ms"
+                  << " compute=" << millis(compute_time) << "ms"
+                  << " consume=" << millis(consume_time) << "ms\n";
+    }
 }

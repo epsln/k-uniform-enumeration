@@ -361,6 +361,7 @@ int main(int argc, char** argv) {
 		else if (arg == "--no-iso-check") { g_no_iso_check = true; }
 		else if (arg == "--prune-only") { prune_only = true; }
 		else if (arg == "--keep-pruner-inputs") { g_keep_pruner_inputs = true; }
+		else if (arg == "--profile-pruner") { g_profile_pruner = true; }
 		else if (arg == "--propagate") { g_propagate = true; }
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
@@ -393,6 +394,7 @@ int main(int argc, char** argv) {
 				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
 				<< "  --prune-only        prune existing eusolver_* files in --output\n"
 				<< "  --keep-pruner-inputs preserve raw solution files after pruning\n"
+				<< "  --profile-pruner     report per-file pruner stage timings\n"
 				<< "  --fanout N         BFS fan-out target (0=auto, default: 40000)\n"
 				<< "  --spill N          disk spill threshold (0=auto, default: 50000)\n"
 				<< "  --chunks N         number of frontier chunks (0=auto, default: workers*32)\n"
