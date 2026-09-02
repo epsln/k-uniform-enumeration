@@ -11,6 +11,7 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 
@@ -161,7 +162,8 @@ static std::tuple<bool, int, int> decipher_edge(const std::string& text) {
 // Cycle final writer  (ConwayCycleWriter.write_cycle_final)
 // =============================================================================
 void write_cycle_final(const State& st, std::ostream& out,
-                        const std::string& tes_path,
+                        TesStore& tes_store, const std::string& combo,
+                        const std::string& tes_filename,
                         const std::string& solution_label) {
     int n = (int)st.darts.size();
     std::vector<int> seen(n, 0);
@@ -319,30 +321,24 @@ void write_cycle_final(const State& st, std::ostream& out,
     }
     out << conway_str << "\n";
 
-    // Write .tes file
-    {
-        fs::path tpath(tes_path);
-        fs::create_directories(tpath.parent_path());
-        std::ofstream tes(tes_path);
-        tes << "## Euclidean, " << solution_label << "\n";
-        tes << "e2.\n";
-        tes << "angleunit(deg)\n";
-        for (int sz : poly_size_list) {
-            int angle = 180 - 360 / sz;
-            std::string angles;
-            for (int k = 0; k < sz; ++k) {
-                if (k) angles += ",";
-                angles += std::to_string(angle);
-            }
-            tes << "unittile(" << angles << ")\n";
+    std::ostringstream tes;
+    tes << "## Euclidean, " << solution_label << "\n";
+    tes << "e2.\n";
+    tes << "angleunit(deg)\n";
+    for (int sz : poly_size_list) {
+        int angle = 180 - 360 / sz;
+        std::string angles;
+        for (int k = 0; k < sz; ++k) {
+            if (k) angles += ",";
+            angles += std::to_string(angle);
         }
-        tes << "conway(\"" << conway_str << "\")\n";
-        for (size_t i = 0; i < work_reps.size(); ++i)
-            if (work_reps[i] > 1)
-                tes << "repeat(" << i << "," << work_reps[i] << ")\n";
+        tes << "unittile(" << angles << ")\n";
     }
-		compress(tes_path);
-		
+    tes << "conway(\"" << conway_str << "\")\n";
+    for (size_t i = 0; i < work_reps.size(); ++i)
+        if (work_reps[i] > 1)
+            tes << "repeat(" << i << "," << work_reps[i] << ")\n";
+    tes_store.add(combo, solution_label, tes_filename, tes.str());
 }
 
 // =============================================================================
@@ -450,31 +446,41 @@ State SolutionPruner::decode_solution(const std::string& vertex_line,
 
 // ---------------------------------------------------------------------------
 // read_next_solution — streaming parser, reads one solution from file
-// Returns true if a solution was read, false on EOF or parse error.
+// Returns true if a solution was read and false only on clean EOF.
 // ---------------------------------------------------------------------------
 bool read_next_solution(std::istream& in, SolutionPruner::SolutionRecord& rec) {
     std::string line;
+    bool saw_nonempty = false;
 
     // Find next "Number of polygons:" line
     while (std::getline(in, line)) {
         if (line.rfind("Number of polygons:", 0) == 0) break;
+        if (!line.empty()) saw_nonempty = true;
     }
-    if (in.eof() || in.fail()) return false;
+    if (in.bad()) throw std::runtime_error("failed while reading text solution stream");
+    if (in.eof()) {
+        if (saw_nonempty) throw std::runtime_error("unexpected trailing text in solution stream");
+        return false;
+    }
+    if (in.fail()) throw std::runtime_error("failed while scanning text solution stream");
 
     // Read the 4 fixed header lines
-    if (!std::getline(in, rec.vertex_line))    return false;
-    if (!std::getline(in, rec.signature_line)) return false;
-    if (!std::getline(in, rec.tes_line))       return false;
-    if (!std::getline(in, rec.conway_line))    return false;
+    if (!std::getline(in, rec.vertex_line)
+            || !std::getline(in, rec.signature_line)
+            || !std::getline(in, rec.tes_line)
+            || !std::getline(in, rec.conway_line))
+        throw std::runtime_error("truncated text solution header");
 
     // Skip cycle description lines until "---"
     while (std::getline(in, line)) {
         if (!line.empty() && line[0] == '-' && line == "---") break;
     }
+    if (line != "---") throw std::runtime_error("truncated text solution cycles");
 
     // Skip assembled conway and blank line
-    if (!std::getline(in, line)) return false; // assembled conway
-    if (!std::getline(in, line)) return false; // blank line (or next header)
+    if (!std::getline(in, line)) throw std::runtime_error("missing assembled Conway symbol");
+    if (!std::getline(in, line) && !in.eof())
+        throw std::runtime_error("failed after text solution record");
 
     rec.state = SolutionPruner::decode_solution(rec.vertex_line, rec.conway_line);
 
@@ -511,28 +517,32 @@ bool read_next_solution(std::istream& in, SolutionPruner::SolutionRecord& rec) {
 // ---------------------------------------------------------------------------
 bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& rec,
                              int& sol_idx) {
-    if (!in.good() || in.peek() == EOF) return false;
+    if (in.peek() == EOF) {
+        if (in.bad()) throw std::runtime_error("failed while reading binary solution stream");
+        return false;
+    }
 
     uint8_t nv; in.read((char*)&nv, 1);
     uint8_t ne; in.read((char*)&ne, 1);
-    if (in.fail() || nv == 0 || ne == 0) return false;
+    if (in.fail() || nv == 0 || ne == 0)
+        throw std::runtime_error("invalid binary solution header");
 
     std::vector<int> vertype(nv);
     for (int i = 0; i < nv; ++i) {
         uint8_t v; in.read((char*)&v, 1);
-        if (in.fail()) return false;
+        if (in.fail()) throw std::runtime_error("truncated binary vertex types");
         vertype[i] = (int)v;
     }
 
     std::vector<int> glue(ne);
     for (int i = 0; i < ne; ++i) {
         int16_t g; in.read((char*)&g, 2);
-        if (in.fail()) return false;
+        if (in.fail()) throw std::runtime_error("truncated binary glue data");
         glue[i] = (int)g;
     }
 
     State st = EuclideanSolver::rebuild_from_vertype_glue(vertype, glue);
-    if (st.darts.empty()) return false;
+    if (st.darts.empty()) throw std::runtime_error("invalid packed solution state");
 
     rec.state = std::move(st);
     rec.vertex_line    = verbal_vertices(rec.state.vertype);
@@ -1132,6 +1142,7 @@ bool DiskWordIndex::contains(const std::vector<int>& w) {
 // =============================================================================
 WLPruner::WLPruner(const std::string& output_dir, int num_workers)
     : SolutionPruner(output_dir), solutions_words_(output_dir + "/words.bin"),
+      tes_store_(output_dir + "/tilings.sqlite3.tmp"),
       num_workers_(num_workers) {}
 
 void WLPruner::run(const std::vector<std::string>& listfile_paths) {
@@ -1149,6 +1160,14 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
             std::cerr << "]" << std::flush;
         }
         process_file_wl(listfile_paths[i]);
+    }
+    tes_store_.finish();
+    fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
+    for (const auto& path : listfile_paths) {
+        std::error_code ec;
+        fs::remove(path, ec);
+        if (ec) std::cerr << "  warning: could not remove pruned input " << path
+                          << ": " << ec.message() << "\n";
     }
     if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
     if (g_use_bfl) {
@@ -1171,7 +1190,7 @@ WLPruner::CanonicalResult WLPruner::compute_canonical_and_wl(const State& st) co
 }
 
 void WLPruner::process_file_wl(const std::string& path) {
-    if (!fs::exists(path)) return;
+    if (!fs::exists(path)) throw std::runtime_error("solution input disappeared: " + path);
 
     std::string fname = fs::path(path).filename().string();
     std::string combo_code = fname;
@@ -1195,7 +1214,7 @@ void WLPruner::process_file_wl(const std::string& path) {
     if (has_zst_suffix(base)) base.resize(base.size() - 4);
     bool is_bin = (base.size() > 4 && base.substr(base.size() - 4) == ".bin");
     auto in = open_solution_istream(path);
-    if (!in) return;
+    if (!in) throw std::runtime_error("cannot open solution input: " + path);
     std::istream& in_ref = *in;
     int sol_idx = 0;
 
@@ -1301,8 +1320,6 @@ void WLPruner::process_file_wl(const std::string& path) {
             std::string tes_filename = old_rel;
             if (tes_filename.find("eu raw ") == 0)
                 tes_filename = "eu " + tes_filename.substr(7);
-            std::string tes_path = out_dir + "/" + tes_filename;
-
             std::string sig_raw = rec2.signature_line;
             while (!sig_raw.empty() && (sig_raw.back() == '\n' || sig_raw.back() == '\r'))
                 sig_raw.pop_back();
@@ -1312,7 +1329,8 @@ void WLPruner::process_file_wl(const std::string& path) {
             pruned_out << "Count type: " << rec2.count_signature << "\n";
             pruned_out << rec2.tes_line << "\n";
             pruned_out << rec2.conway_line << "\n";
-            write_cycle_final(rec2.state, pruned_out.stream(), tes_path, sig_raw);
+            write_cycle_final(rec2.state, pruned_out.stream(), tes_store_, combo_code,
+                              tes_filename, sig_raw);
             pruned_out << "\n";
         }
 
@@ -1320,5 +1338,5 @@ void WLPruner::process_file_wl(const std::string& path) {
         // up to 2000 solutions — keeps the stat()+possible zstd spawn rare.
         pruned_out.maybe_compress();
     }
-		std::remove(path.c_str());
+		tes_store_.checkpoint();
 }
