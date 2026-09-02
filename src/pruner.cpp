@@ -32,17 +32,11 @@ std::atomic<int64_t> g_solutions_match_calls{0};
 std::atomic<int> g_wl_max_iters{0};
 bool g_compress_pruner_outputs = true;  // compress eupruned/euraw rolling outputs by default
 
-static void compress(const std::string& path) {
-    std::string cmd = "zstd -c -q \"" + path + "\" >> \"" + path + ".zst\" && rm \"" + path + "\"";
-    std::system(cmd.c_str());
-}
-
 // Compress euraw.txt/eupruned.txt "on the go" instead of only once at the
 // end: these are opened once per combo_code and streamed to for the whole
 // run, so left alone they can grow very large before ever getting
 // compressed. Neither file is ever read back within this program, so we
-// reuse exactly the same trick as compress() above (shell out to zstd,
-// append a new frame onto path.zst, drop the plain tail) — just triggered
+// append a new frame onto path.zst and drop the plain tail, just triggered
 // periodically on size instead of once at the end. zstd frames concatenate,
 // so decompressing path.zst afterward yields the full file regardless of
 // how many times it was flushed mid-run.
@@ -76,7 +70,7 @@ struct RollingCompressedWriter {
         auto sz = fs::file_size(path, ec);
         if (ec || (int64_t)sz < g_pruner_compress_threshold) return;
         out.close();
-        compress(path);                              // path -> path.zst (appended), path removed
+        compress_to_zst(path);                       // path -> path.zst (appended), path removed
         out.open(path, std::ios::out | std::ios::trunc);
     }
 
@@ -87,7 +81,7 @@ struct RollingCompressedWriter {
         if (!g_compress_pruner_outputs) return;
         std::error_code ec;
         if (fs::exists(path) && fs::file_size(path, ec) > 0)
-            compress(path);
+            compress_to_zst(path);
         else
             fs::remove(path, ec);   // drop empty leftover rather than leaving a stray .zst frame
     }
@@ -1354,7 +1348,6 @@ void WLPruner::process_file_wl(const std::string& path) {
         pruned_out.maybe_compress();
         consume_time += Clock::now() - stage_start;
     }
-		tes_store_.checkpoint();
     auto millis = [](std::chrono::nanoseconds d) {
         return std::chrono::duration<double, std::milli>(d).count();
     };
