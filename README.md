@@ -12,10 +12,24 @@ This method does have a drawback: it produces a large amount of duplicate tiling
 # Build & Run
 
 ```sh
-make                                       # builds ./eusolver (C++17, requires libzstd)
+make                                       # builds ./eusolver (C++17, requires libzstd and SQLite)
 ./eusolver --max-polygons 5 --workers 8 --output solutions
 ./eusolver --mode disk --max-polygons 10 --workers 8 --compress-solutions
 ```
+
+The pruner stores all HyperRogue `.tes` documents in
+`<output>/wl/tilings.sqlite3`. Documents are grouped into zstd-compressed
+chunks, avoiding one filesystem inode and one compression process per tiling.
+Extract all documents when individual files are needed:
+
+```sh
+./eusolver --extract-tes solutions/wl/tilings.sqlite3 --extract-output extracted
+./eusolver --extract-tes solutions/wl/tilings.sqlite3 --extract-output one --tes-id 42
+```
+
+Extraction refuses to overwrite existing files. Starting a new pruner run in
+an existing output directory replaces the previous `tilings.sqlite3`; it does
+not resume an interrupted prune.
 
 Run `./eusolver --help` for the full option list. See `CLAUDE.md` for the
 architecture overview and `IMPLEMENTATION.md` for implementation details.

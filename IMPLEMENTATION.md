@@ -99,7 +99,7 @@ Only `glue` and `vertype` carry state-specific information.
                       │
               WLPruner (parallel)
                       │
-              pruned output + .tes files
+              pruned output + tilings.sqlite3
 ```
 
 ### Shared work queue (`SharedQueue`, main.cpp)
@@ -176,6 +176,29 @@ The sequential filtering phase uses `solutions_by_hash_` (a
 `map<wl_hash_string, vector<State>>`) for O(1) dedup lookups. Only on WL
 hash collisions (theoretically impossible for Euclidean tiling graphs) does
 it fall back to the O(n²) `solutions_match`.
+
+### TES storage (`tes_store.cpp`)
+
+The pruner renders each HyperRogue `.tes` document in memory and appends it to
+`wl/tilings.sqlite3`, rather than creating millions of small files. The SQLite
+database has three tables:
+
+- `metadata`: format version and compression algorithm.
+- `chunks`: zstd-compressed concatenated document data and size metadata.
+- `entries`: stable numeric ID, byte range, combo, signature, and legacy name.
+
+Chunks target 8 MiB of uncompressed text. A transaction is committed after
+each merged solver input file, before that input is deleted. This bounds data
+at risk without requiring a transaction or zstd frame per tiny document. A
+document larger than the target is stored as its own chunk.
+
+`--extract-tes DB --extract-output DIR` recreates the combo-directory layout.
+`--tes-id N` limits extraction to one entry. Extraction validates stored path
+components, zstd sizes, and byte ranges, and refuses to overwrite files.
+
+The database is a final-output container, not a pruner checkpoint. A fresh
+pruner run replaces an existing `tilings.sqlite3`; global deduplication state
+still lives in memory and cannot currently be resumed safely.
 
 ### Binary serialization (disk_solver.cpp)
 
