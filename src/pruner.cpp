@@ -450,13 +450,18 @@ State SolutionPruner::decode_solution(const std::string& vertex_line,
 // ---------------------------------------------------------------------------
 bool read_next_solution(std::istream& in, SolutionPruner::SolutionRecord& rec) {
     std::string line;
+    bool saw_nonempty = false;
 
     // Find next "Number of polygons:" line
     while (std::getline(in, line)) {
         if (line.rfind("Number of polygons:", 0) == 0) break;
+        if (!line.empty()) saw_nonempty = true;
     }
     if (in.bad()) throw std::runtime_error("failed while reading text solution stream");
-    if (in.eof()) return false;
+    if (in.eof()) {
+        if (saw_nonempty) throw std::runtime_error("unexpected trailing text in solution stream");
+        return false;
+    }
     if (in.fail()) throw std::runtime_error("failed while scanning text solution stream");
 
     // Read the 4 fixed header lines
@@ -1185,7 +1190,7 @@ WLPruner::CanonicalResult WLPruner::compute_canonical_and_wl(const State& st) co
 }
 
 void WLPruner::process_file_wl(const std::string& path) {
-    if (!fs::exists(path)) return;
+    if (!fs::exists(path)) throw std::runtime_error("solution input disappeared: " + path);
 
     std::string fname = fs::path(path).filename().string();
     std::string combo_code = fname;
@@ -1209,7 +1214,7 @@ void WLPruner::process_file_wl(const std::string& path) {
     if (has_zst_suffix(base)) base.resize(base.size() - 4);
     bool is_bin = (base.size() > 4 && base.substr(base.size() - 4) == ".bin");
     auto in = open_solution_istream(path);
-    if (!in) return;
+    if (!in) throw std::runtime_error("cannot open solution input: " + path);
     std::istream& in_ref = *in;
     int sol_idx = 0;
 
