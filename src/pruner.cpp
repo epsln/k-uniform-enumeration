@@ -4,6 +4,7 @@
 #include "zstd_stream.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -22,6 +23,7 @@ int g_wl_dim = 1;
 int g_wl_iters = 0;   // 0 = auto: iterate 1-WL to convergence (cap = n darts)
 bool g_use_bfl = false;
 bool g_no_iso_check = false;
+bool g_keep_pruner_inputs = false;
 
 // Diagnostic counters (WL-hash collision rate).
 std::atomic<int64_t> g_wl_hash_hits{0};
@@ -1163,11 +1165,13 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
     }
     tes_store_.finish();
     fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
-    for (const auto& path : listfile_paths) {
-        std::error_code ec;
-        fs::remove(path, ec);
-        if (ec) std::cerr << "  warning: could not remove pruned input " << path
-                          << ": " << ec.message() << "\n";
+    if (!g_keep_pruner_inputs) {
+        for (const auto& path : listfile_paths) {
+            std::error_code ec;
+            fs::remove(path, ec);
+            if (ec) std::cerr << "  warning: could not remove pruned input " << path
+                              << ": " << ec.message() << "\n";
+        }
     }
     if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
     if (g_use_bfl) {
@@ -1217,8 +1221,14 @@ void WLPruner::process_file_wl(const std::string& path) {
     if (!in) throw std::runtime_error("cannot open solution input: " + path);
     std::istream& in_ref = *in;
     int sol_idx = 0;
+    using Clock = std::chrono::steady_clock;
+    std::chrono::nanoseconds decode_time{0};
+    std::chrono::nanoseconds compute_time{0};
+    std::chrono::nanoseconds consume_time{0};
+    int64_t records = 0;
 
     while (true) {
+        auto stage_start = Clock::now();
         batch.clear();
         results.clear();
         SolutionRecord rec;
@@ -1242,10 +1252,13 @@ void WLPruner::process_file_wl(const std::string& path) {
             batch.push_back(std::move(rec2));
         }
         if (batch.empty()) break;
+        decode_time += Clock::now() - stage_start;
+        records += (int64_t)batch.size();
 
         int n = (int)batch.size();
         results.resize(n);
 
+        stage_start = Clock::now();
         if (num_workers_ <= 1 || n < 10) {
             for (int i = 0; i < n; ++i)
                 results[i] = compute_canonical_and_wl(batch[i].state);
@@ -1264,7 +1277,9 @@ void WLPruner::process_file_wl(const std::string& path) {
             }
             for (auto& t : threads) t.join();
         }
+        compute_time += Clock::now() - stage_start;
 
+        stage_start = Clock::now();
         for (int i = 0; i < n; ++i) {
             auto& rec2 = batch[i];
             auto& r = results[i];
@@ -1337,6 +1352,14 @@ void WLPruner::process_file_wl(const std::string& path) {
         // Once per batch (not per line) is plenty granular given batches are
         // up to 2000 solutions — keeps the stat()+possible zstd spawn rare.
         pruned_out.maybe_compress();
+        consume_time += Clock::now() - stage_start;
     }
 		tes_store_.checkpoint();
+    auto millis = [](std::chrono::nanoseconds d) {
+        return std::chrono::duration<double, std::milli>(d).count();
+    };
+    std::cerr << "  pruner profile " << combo_code << ": records=" << records
+              << " decode=" << millis(decode_time) << "ms"
+              << " compute=" << millis(compute_time) << "ms"
+              << " consume=" << millis(consume_time) << "ms\n";
 }
