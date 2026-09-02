@@ -1,6 +1,7 @@
 #pragma once
 #include "state.h"
 #include "bfl.h"
+#include "tes_store.h"
 #include <array>
 #include <cstdint>
 #include <istream>
@@ -12,7 +13,8 @@
 #include <vector>
 
 void write_cycle_final(const State& st, std::ostream& out,
-                       const std::string& tes_path,
+                       TesStore& tes_store, const std::string& combo,
+                       const std::string& tes_filename,
                        const std::string& sig_raw);
 
 class SolutionPruner {
@@ -120,6 +122,7 @@ private:
     void process_file_wl(const std::string& path);
     std::map<std::string, std::vector<PackedState>> solutions_by_hash_;
     DiskWordIndex solutions_words_;  // used when g_use_bfl
+    TesStore tes_store_;
     int num_workers_;
 
     struct CanonicalResult {

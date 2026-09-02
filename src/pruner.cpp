@@ -161,7 +161,8 @@ static std::tuple<bool, int, int> decipher_edge(const std::string& text) {
 // Cycle final writer  (ConwayCycleWriter.write_cycle_final)
 // =============================================================================
 void write_cycle_final(const State& st, std::ostream& out,
-                        const std::string& tes_path,
+                        TesStore& tes_store, const std::string& combo,
+                        const std::string& tes_filename,
                         const std::string& solution_label) {
     int n = (int)st.darts.size();
     std::vector<int> seen(n, 0);
@@ -319,30 +320,24 @@ void write_cycle_final(const State& st, std::ostream& out,
     }
     out << conway_str << "\n";
 
-    // Write .tes file
-    {
-        fs::path tpath(tes_path);
-        fs::create_directories(tpath.parent_path());
-        std::ofstream tes(tes_path);
-        tes << "## Euclidean, " << solution_label << "\n";
-        tes << "e2.\n";
-        tes << "angleunit(deg)\n";
-        for (int sz : poly_size_list) {
-            int angle = 180 - 360 / sz;
-            std::string angles;
-            for (int k = 0; k < sz; ++k) {
-                if (k) angles += ",";
-                angles += std::to_string(angle);
-            }
-            tes << "unittile(" << angles << ")\n";
+    std::ostringstream tes;
+    tes << "## Euclidean, " << solution_label << "\n";
+    tes << "e2.\n";
+    tes << "angleunit(deg)\n";
+    for (int sz : poly_size_list) {
+        int angle = 180 - 360 / sz;
+        std::string angles;
+        for (int k = 0; k < sz; ++k) {
+            if (k) angles += ",";
+            angles += std::to_string(angle);
         }
-        tes << "conway(\"" << conway_str << "\")\n";
-        for (size_t i = 0; i < work_reps.size(); ++i)
-            if (work_reps[i] > 1)
-                tes << "repeat(" << i << "," << work_reps[i] << ")\n";
+        tes << "unittile(" << angles << ")\n";
     }
-		compress(tes_path);
-		
+    tes << "conway(\"" << conway_str << "\")\n";
+    for (size_t i = 0; i < work_reps.size(); ++i)
+        if (work_reps[i] > 1)
+            tes << "repeat(" << i << "," << work_reps[i] << ")\n";
+    tes_store.add(combo, solution_label, tes_filename, tes.str());
 }
 
 // =============================================================================
@@ -1132,6 +1127,7 @@ bool DiskWordIndex::contains(const std::vector<int>& w) {
 // =============================================================================
 WLPruner::WLPruner(const std::string& output_dir, int num_workers)
     : SolutionPruner(output_dir), solutions_words_(output_dir + "/words.bin"),
+      tes_store_(output_dir + "/tilings.sqlite3"),
       num_workers_(num_workers) {}
 
 void WLPruner::run(const std::vector<std::string>& listfile_paths) {
@@ -1150,6 +1146,7 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
         }
         process_file_wl(listfile_paths[i]);
     }
+    tes_store_.finish();
     if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
     if (g_use_bfl) {
         std::cerr << "  BFL words: " << solutions_words_.size() << " unique\n";
@@ -1301,8 +1298,6 @@ void WLPruner::process_file_wl(const std::string& path) {
             std::string tes_filename = old_rel;
             if (tes_filename.find("eu raw ") == 0)
                 tes_filename = "eu " + tes_filename.substr(7);
-            std::string tes_path = out_dir + "/" + tes_filename;
-
             std::string sig_raw = rec2.signature_line;
             while (!sig_raw.empty() && (sig_raw.back() == '\n' || sig_raw.back() == '\r'))
                 sig_raw.pop_back();
@@ -1312,7 +1307,8 @@ void WLPruner::process_file_wl(const std::string& path) {
             pruned_out << "Count type: " << rec2.count_signature << "\n";
             pruned_out << rec2.tes_line << "\n";
             pruned_out << rec2.conway_line << "\n";
-            write_cycle_final(rec2.state, pruned_out.stream(), tes_path, sig_raw);
+            write_cycle_final(rec2.state, pruned_out.stream(), tes_store_, combo_code,
+                              tes_filename, sig_raw);
             pruned_out << "\n";
         }
 
@@ -1320,5 +1316,6 @@ void WLPruner::process_file_wl(const std::string& path) {
         // up to 2000 solutions — keeps the stat()+possible zstd spawn rare.
         pruned_out.maybe_compress();
     }
+		tes_store_.checkpoint();
 		std::remove(path.c_str());
 }

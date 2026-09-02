@@ -4,6 +4,7 @@
 #include "vertex_catalog.h"
 #include "metrics.h"
 #include "zstd_stream.h"
+#include "tes_store.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -305,6 +306,7 @@ static std::map<int,int> run_pruner(const std::string& output_dir, int num_worke
 	std::map<int,int> counts;
 	{
 		std::string pruned_dir = output_dir + "/wl";
+		fs::remove(pruned_dir + "/tilings.sqlite3");
 		WLPruner pruner(pruned_dir, num_workers);
 		pruner.run(solution_files);
 		int total = 0;
@@ -343,6 +345,8 @@ int main(int argc, char** argv) {
 	int64_t sol_dedup_cap_user = 0;  // 0 = auto-scale
 	int max_ram_gb = 0;  // 0 = auto (k-based formula)
 	bool resume = false;
+	std::string extract_database, extract_output;
+	int64_t extract_id = 0;
 	std::string telegram_token, telegram_chat;
 	int notify_minutes = 30;
 	g_propagate = true;
@@ -371,6 +375,9 @@ int main(int argc, char** argv) {
 		else if (arg == "--sol-dedup-cap" && i + 1 < argc) sol_dedup_cap_user = std::stoll(argv[++i]);
 		else if (arg == "--max-ram-gb" && i + 1 < argc) max_ram_gb = std::stoi(argv[++i]);
 		else if (arg == "--resume") { resume = true; }
+		else if (arg == "--extract-tes" && i + 1 < argc) extract_database = argv[++i];
+		else if (arg == "--extract-output" && i + 1 < argc) extract_output = argv[++i];
+		else if (arg == "--tes-id" && i + 1 < argc) extract_id = std::stoll(argv[++i]);
 		else if (arg == "--compress-solutions") { g_compress_solutions = true; g_compress_pruner_outputs = true;}
 		else if (arg == "--compress-threshold-mb" && i + 1 < argc)
 			g_compress_threshold = (int64_t)std::stoll(argv[++i]) * 1024 * 1024;
@@ -398,6 +405,9 @@ int main(int argc, char** argv) {
 				<< "  --no-spill          keep all partial states in RAM (no disk spill)\n"
 				<< "  --compress-solutions  compress worker .bin output with zstd\n"
 				<< "  --compress-threshold-mb N  mid-run compression threshold (default 256)\n"
+				<< "  --extract-tes DB   extract .tes records from a pruner SQLite database\n"
+				<< "  --extract-output DIR  extraction directory (required with --extract-tes)\n"
+				<< "  --tes-id N         extract only this database entry id (default: all)\n"
 				<< "  --telegram-token T  Telegram bot token for progress updates\n"
 				<< "  --telegram-chat C   Telegram chat id to message\n"
 				<< "  --notify-minutes N  interval between Telegram updates (default 30)\n"
@@ -411,6 +421,21 @@ int main(int argc, char** argv) {
 		}
 	}
 	if (num_workers < 1) num_workers = 1;
+	if (!extract_database.empty()) {
+		if (extract_output.empty()) {
+			std::cerr << "--extract-output is required with --extract-tes\n";
+			return 1;
+		}
+		try {
+			int64_t count = extract_tes_database(extract_database, extract_output, extract_id);
+			std::cout << "Extracted " << count << " .tes file" << (count == 1 ? "" : "s")
+			          << " to " << extract_output << "\n";
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "TES extraction failed: " << e.what() << "\n";
+			return 1;
+		}
+	}
 
 	// Auto-scale thresholds
 	if (fanout_target <= 0)  fanout_target  = std::max(5000, num_workers * 1000);
