@@ -3,6 +3,7 @@ CXXFLAGS := -O3 -std=c++17 -Wall -Wextra -march=native -fno-strict-aliasing -pth
 LDLIBS := -lzstd -lsqlite3
 TARGET := eusolver
 SAFETY_TEST := tests/high_k_safety
+MORTIER_TEST := tests/mortier_export
 
 SRCDIR := src
 SRCS := $(wildcard $(SRCDIR)/*.cpp)
@@ -17,7 +18,7 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET) eusolver_dbg $(SAFETY_TEST)
+	rm -f $(OBJS) $(TARGET) eusolver_dbg $(SAFETY_TEST) $(MORTIER_TEST)
 
 debug:
 	$(CXX) -g -O0 -std=c++17 -Wall -Wextra -pthread -Isrc -o eusolver_dbg $(SRCS) $(LDLIBS)
@@ -30,8 +31,12 @@ run: $(TARGET)
 $(SAFETY_TEST): tests/high_k_safety.cpp $(filter-out $(SRCDIR)/main.o,$(OBJS))
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
 
-test: $(TARGET) $(SAFETY_TEST)
+$(MORTIER_TEST): tests/mortier_export.cpp $(filter-out $(SRCDIR)/main.o,$(OBJS))
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
+
+test: $(TARGET) $(SAFETY_TEST) $(MORTIER_TEST)
 	./$(SAFETY_TEST)
+	./$(MORTIER_TEST)
 	python3 -m unittest discover -s tests -v
 	python3 scripts/regression.py --candidate "./$(TARGET)" --max-k $(or $(TEST_MAX_K),1) $(if $(BASELINE),--baseline "$(BASELINE)",)
 
