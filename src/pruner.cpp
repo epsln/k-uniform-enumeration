@@ -1,4 +1,5 @@
 #include "pruner.h"
+#include "disk_solver.h"
 #include "solver.h"
 #include "vertex_catalog.h"
 #include "zstd_stream.h"
@@ -529,27 +530,10 @@ bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& re
         return false;
     }
 
-    uint8_t nv; in.read((char*)&nv, 1);
-    uint8_t ne; in.read((char*)&ne, 1);
-    if (in.fail() || nv == 0 || ne == 0)
-        throw std::runtime_error("invalid binary solution header");
-
-    std::vector<int> vertype(nv);
-    for (int i = 0; i < nv; ++i) {
-        uint8_t v; in.read((char*)&v, 1);
-        if (in.fail()) throw std::runtime_error("truncated binary vertex types");
-        vertype[i] = (int)v;
-    }
-
-    std::vector<int> glue(ne);
-    for (int i = 0; i < ne; ++i) {
-        int16_t g; in.read((char*)&g, 2);
-        if (in.fail()) throw std::runtime_error("truncated binary glue data");
-        glue[i] = (int)g;
-    }
-
-    State st = EuclideanSolver::rebuild_from_vertype_glue(vertype, glue);
-    if (st.darts.empty()) throw std::runtime_error("invalid packed solution state");
+    State st = read_state_bin(in);
+    for (const Dart& d : st.darts)
+        if (d.glue < 0)
+            throw std::runtime_error("binary solution contains an unglued dart");
 
     rec.state = std::move(st);
     rec.solution_index = ++sol_idx;
@@ -561,11 +545,40 @@ bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& re
 // is_canonical_labeling — bit-set alias refinement (O(1) membership)
 // ---------------------------------------------------------------------------
 using BS4 = std::array<uint64_t, 4>;
-static inline void bs4_set (BS4& b, int i)    { b[i>>6] |=  (1ULL << (i&63)); }
-static inline bool bs4_get (const BS4& b, int i) { return (b[i>>6] >> (i&63)) & 1; }
-static inline bool bs4_singleton(const BS4& b, int n) {
+struct AliasRows {
+    int n;
+    int nw;
+    std::vector<BS4>& small;
+    std::vector<uint64_t>& large;
+
+    uint64_t* operator[](int i) {
+        return n <= 256 ? small[i].data() : large.data() + (size_t)i * nw;
+    }
+    const uint64_t* operator[](int i) const {
+        return n <= 256 ? small[i].data() : large.data() + (size_t)i * nw;
+    }
+};
+
+static AliasRows alias_rows(int n, int nw, std::vector<BS4>& small,
+                            std::vector<uint64_t>& large) {
+    if (n <= 256) {
+        if ((int)small.size() < n) small.resize(n);
+    } else {
+        large.resize((size_t)n * nw);
+    }
+    return {n, nw, small, large};
+}
+
+static inline bool alias_get(const AliasRows& alias, int row, int i) {
+    return row >= 0 && row < alias.n && i >= 0 && i < alias.n
+        && ((alias[row][i >> 6] >> (i & 63)) & 1);
+}
+static inline bool alias_singleton(const AliasRows& alias, int row) {
     int c = 0;
-    for (int w = 0; w < (n+63)/64; ++w) { c += __builtin_popcountll(b[w]); if (c > 1) return false; }
+    for (int w = 0; w < alias.nw; ++w) {
+        c += __builtin_popcountll(alias[row][w]);
+        if (c > 1) return false;
+    }
     return c == 1;
 }
 
@@ -573,9 +586,9 @@ std::pair<bool, std::string> SolutionPruner::is_canonical_labeling(const State& 
     int n = (int)st.darts.size();
     int nw = (n + 63) / 64;
 
-    static thread_local std::vector<BS4> alias_buf;
-    if ((int)alias_buf.size() < n) alias_buf.resize(n);
-    BS4* alias = alias_buf.data();
+    static thread_local std::vector<BS4> alias_small;
+    static thread_local std::vector<uint64_t> alias_large;
+    AliasRows alias = alias_rows(n, nw, alias_small, alias_large);
 
     // Initialise: all candidates {0..n-1}
     for (int i = 0; i < n; ++i) {
@@ -595,18 +608,18 @@ std::pair<bool, std::string> SolutionPruner::is_canonical_labeling(const State& 
                     int bit = __builtin_ctzll(bits); bits &= bits - 1;
                     int j = w * 64 + bit; if (j == i) continue;
                     if (st.darts[i].polygon_size != st.darts[j].polygon_size
-                        || !bs4_get(alias[j], i)
-                        || !bs4_get(alias[st.darts[i].mirro], st.darts[j].mirro)
-                        || !bs4_get(alias[st.darts[i].glue],  st.darts[j].glue)
-                        || !bs4_get(alias[st.darts[i].rneig], st.darts[j].rneig)
-                        || !bs4_get(alias[st.darts[i].lneig], st.darts[j].lneig))
+                        || !alias_get(alias, j, i)
+                        || !alias_get(alias, st.darts[i].mirro, st.darts[j].mirro)
+                        || !alias_get(alias, st.darts[i].glue, st.darts[j].glue)
+                        || !alias_get(alias, st.darts[i].rneig, st.darts[j].rneig)
+                        || !alias_get(alias, st.darts[i].lneig, st.darts[j].lneig))
                     {
                         alias[i][w] &= ~(1ULL << bit);
                         changed = true;
                     }
                 }
             }
-            if (bs4_singleton(alias[i], n))
+            if (alias_singleton(alias, i))
                 unique[i] = true;
         }
     }
@@ -617,25 +630,9 @@ std::pair<bool, std::string> SolutionPruner::is_canonical_labeling(const State& 
 
     if (all_unique) return {true, ""};
 
-    // Debug log
-    std::vector<int> seen(n, 0);
-    std::string log;
-    for (int i = 0; i < n; ++i) {
-        if (seen[i]) continue;
-        int cnt = 0;
-        for (int w = 0; w < nw; ++w) cnt += __builtin_popcountll(alias[i][w]);
-        if (cnt <= 1) continue;
-        log += (log.empty() ? "" : " ") + std::string("[");
-        bool first = true;
-        for (int j = 0; j < n; ++j) {
-            if (bs4_get(alias[i], j)) {
-                if (!first) log += "/";
-                log += rebuild_label(j, st.vertype); first = false; seen[j] = 1;
-            }
-        }
-        log += "]";
-    }
-    return {false, log + "\n"};
+    // The caller only needs the decision. Building labels for every rejected
+    // solution was a significant allocation-heavy hot path.
+    return {false, ""};
 }
 
 // ---------------------------------------------------------------------------
@@ -931,9 +928,9 @@ std::vector<bool> compute_orbit_canonicals(const State& st, bool mirrored) {
     int nw = (n + 63) / 64;
 
     // Run bit-set alias refinement to find automorphism orbits
-    static thread_local std::vector<BS4> alias_buf;
-    if ((int)alias_buf.size() < n) alias_buf.resize(n);
-    BS4* alias = alias_buf.data();
+    static thread_local std::vector<BS4> alias_small;
+    static thread_local std::vector<uint64_t> alias_large;
+    AliasRows alias = alias_rows(n, nw, alias_small, alias_large);
 
     for (int i = 0; i < n; ++i) {
         for (int w = 0; w < nw; ++w) alias[i][w] = ~0ULL;
@@ -957,12 +954,15 @@ std::vector<bool> compute_orbit_canonicals(const State& st, bool mirrored) {
                 while (bits) {
                     int bit = __builtin_ctzll(bits); bits &= bits - 1;
                     int j = w * 64 + bit; if (j == i) continue;
+                    int gi = st.darts[i].glue, gj = st.darts[j].glue;
+                    bool glue_matches = (gi == -1 && gj == -1)
+                        || (gi != -1 && gj != -1 && alias_get(alias, gi, gj));
                     if (st.darts[i].polygon_size != st.darts[j].polygon_size
-                        || !bs4_get(alias[j], i)
-                        || !bs4_get(alias[st.darts[i].mirro], st.darts[j].mirro)
-                        || !bs4_get(alias[st.darts[i].glue],  st.darts[j].glue)
-                        || !bs4_get(alias[st.darts[i].rneig], st.darts[j].rneig)
-                        || !bs4_get(alias[st.darts[i].lneig], st.darts[j].lneig))
+                        || !alias_get(alias, j, i)
+                        || !alias_get(alias, st.darts[i].mirro, st.darts[j].mirro)
+                        || !glue_matches
+                        || !alias_get(alias, st.darts[i].rneig, st.darts[j].rneig)
+                        || !alias_get(alias, st.darts[i].lneig, st.darts[j].lneig))
                     {
                         alias[i][w] &= ~(1ULL << bit);
                         if (!dirty[j]) { dirty[j] = 1; worklist[nwl++] = j; }
@@ -986,7 +986,7 @@ std::vector<bool> compute_orbit_canonicals(const State& st, bool mirrored) {
         for (int j = 0; j < i; ++j) {
             if (st.darts[j].glue != -1) continue;
             if ((st.darts[j].mirro == j) != mirrored) continue;
-            if (bs4_get(alias[i], j)) { has_earlier = true; break; }
+            if (alias_get(alias, i, j)) { has_earlier = true; break; }
         }
         if (!has_earlier) canonical[i] = true;
     }
@@ -1084,7 +1084,12 @@ WLPruner::CanonicalResult WLPruner::compute_canonical_and_wl(const State& st) co
     auto [ok, log] = is_canonical_labeling(st);
     r.is_canonical = ok;
     r.canon_log = log;
-    r.wl_hash = ok ? wl_hash_dispatch(st) : "";
+    if (ok) {
+        if (g_use_bfl)
+            r.bfl_word = bfl_word_signature(st);
+        else
+            r.wl_hash = wl_hash_dispatch(st);
+    }
     return r;
 }
 
@@ -1185,7 +1190,7 @@ void WLPruner::process_file_wl(const std::string& path) {
                 // Exact disk-backed canonical-word dedup.  The canonical word
                 // (lex-min over all starting darts) identifies the tiling up to
                 // isomorphism (Theorem 1); words live on disk, hashes in RAM.
-                auto word = bfl_word_signature(rec2.state);
+                const auto& word = r.bfl_word;
                 if (!word.empty()) {
                     if (solutions_words_.contains(word)) {
                         is_dup = true;

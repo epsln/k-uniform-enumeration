@@ -3,6 +3,7 @@
 *.obj
 eusolver
 eusolver_*
+/tests/high_k_safety
 
 # Python
 __pycache__/
@@ -16,3 +17,4 @@ __pycache__/
 # Output directories
 solutions/
 solutions_*/
+/tilings_*.sqlite3

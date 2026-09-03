@@ -132,6 +132,8 @@ public:
     static State make_initial(int vertex_type);
     static PackedState pack_state(const State& st);
     static State unpack_state(const PackedState& p);
+    static State rebuild_from_vertype_glue(const std::vector<uint8_t>& vertype,
+                                            const std::vector<int16_t>& glue);
     static State rebuild_from_vertype_glue(const std::vector<int>& vertype,
                                             const std::vector<int>& glue);
     static bool check_partial(const State& st);

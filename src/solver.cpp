@@ -1,4 +1,5 @@
 #include "solver.h"
+#include "disk_solver.h"
 #include "vertex_catalog.h"
 #include <algorithm>
 #include <array>
@@ -181,12 +182,31 @@ State EuclideanSolver::make_initial(int vt) {
 // =============================================================================
 // Compact state pack / unpack
 // =============================================================================
-State EuclideanSolver::rebuild_from_vertype_glue(const std::vector<int>& vertype,
-                                                   const std::vector<int>& glue) {
+template<typename VertexTypes, typename Glues>
+static State rebuild_state(const VertexTypes& vertype, const Glues& glue) {
     State s;
-    s.vertype = vertype;
-    for (size_t tile = 0; tile < vertype.size(); ++tile) {
-        int vt = vertype[tile];
+    s.vertype.reserve(vertype.size());
+    size_t dart_count = 0;
+    for (auto raw_vt : vertype) {
+        int vt = (int)raw_vt;
+        if (vt < 0 || vt >= NUM_VERTEX_TYPES)
+            throw std::runtime_error("state has invalid vertex type");
+        s.vertype.push_back(vt);
+        dart_count += left_neighbors[vt].size();
+    }
+    if (dart_count != glue.size())
+        throw std::runtime_error("state dart count does not match vertex types");
+    if (dart_count > (size_t)std::numeric_limits<int16_t>::max())
+        throw std::runtime_error("state has too many darts for PackedState");
+    for (size_t i = 0; i < glue.size(); ++i) {
+        int g = (int)glue[i];
+        if (g < -1 || (g >= 0 && (size_t)g >= dart_count))
+            throw std::runtime_error("state has invalid glue index");
+        if (g >= 0 && (int)glue[(size_t)g] != (int)i)
+            throw std::runtime_error("state glue is not an involution");
+    }
+    s.darts.reserve(dart_count);
+    for (int vt : s.vertype) {
         int offset = (int)s.darts.size();
         int sl = (int)left_neighbors[vt].size();
         for (int sg = 0; sg < sl; ++sg) {
@@ -195,7 +215,7 @@ State EuclideanSolver::rebuild_from_vertype_glue(const std::vector<int>& vertype
             d.lneig = offset + left_neighbors[vt][sg];
             d.mirro = offset + mirrors[vt][sg];
             d.polygon_size = polygon_sizes[vt][sg];
-            d.glue = (offset + sg < (int)glue.size()) ? glue[offset + sg] : -1;
+            d.glue = (offset + sg < (int)glue.size()) ? (int)glue[offset + sg] : -1;
             d.is_mirror_edge = edge_label_templates[vt][sg][0] == '*';
             s.darts.push_back(d);
         }
@@ -203,19 +223,38 @@ State EuclideanSolver::rebuild_from_vertype_glue(const std::vector<int>& vertype
     return s;
 }
 
+State EuclideanSolver::rebuild_from_vertype_glue(const std::vector<uint8_t>& vertype,
+                                                   const std::vector<int16_t>& glue) {
+    return rebuild_state(vertype, glue);
+}
+
+State EuclideanSolver::rebuild_from_vertype_glue(const std::vector<int>& vertype,
+                                                   const std::vector<int>& glue) {
+    return rebuild_state(vertype, glue);
+}
+
 PackedState EuclideanSolver::pack_state(const State& st) {
+    if (st.vertype.empty() || st.vertype.size() > std::numeric_limits<uint16_t>::max()
+            || st.darts.empty() || st.darts.size() > (size_t)std::numeric_limits<int16_t>::max())
+        throw std::runtime_error("state dimensions cannot be represented in PackedState");
     PackedState p;
     p.vertype.reserve(st.vertype.size());
-    for (int v : st.vertype) p.vertype.push_back((uint8_t)v);
+    for (int v : st.vertype) {
+        if (v < 0 || v >= NUM_VERTEX_TYPES)
+            throw std::runtime_error("state has invalid vertex type");
+        p.vertype.push_back((uint8_t)v);
+    }
     p.glue.reserve(st.darts.size());
-    for (const auto& d : st.darts) p.glue.push_back((int16_t)d.glue);
+    for (const auto& d : st.darts) {
+        if (d.glue < -1 || d.glue >= (int)st.darts.size())
+            throw std::runtime_error("state has invalid glue index");
+        p.glue.push_back((int16_t)d.glue);
+    }
     return p;
 }
 
 State EuclideanSolver::unpack_state(const PackedState& p) {
-    std::vector<int> vt(p.vertype.begin(), p.vertype.end());
-    std::vector<int> gl(p.glue.begin(), p.glue.end());
-    return rebuild_from_vertype_glue(vt, gl);
+    return rebuild_from_vertype_glue(p.vertype, p.glue);
 }
 
 // =============================================================================
@@ -372,18 +411,23 @@ bool EuclideanSolver::is_canonical_partial(const State& st) {
     int nw = (n + 63) / 64;
 
     using BS4 = std::array<uint64_t, 4>;
-    static thread_local std::vector<BS4> alias_buf;
-    if ((int)alias_buf.size() < n) alias_buf.resize(n);
-    BS4* alias = alias_buf.data();
+    static thread_local std::vector<BS4> alias_small;
+    static thread_local std::vector<uint64_t> alias_large;
+    if (n <= 256 && (int)alias_small.size() < n) alias_small.resize(n);
+    if (n > 256) alias_large.resize((size_t)n * nw);
+    auto row = [&](int i) -> uint64_t* {
+        return n <= 256 ? alias_small[i].data() : alias_large.data() + (size_t)i * nw;
+    };
 
     for (int i = 0; i < n; ++i) {
-        for (int w = 0; w < nw; ++w) alias[i][w] = ~0ULL;
+        for (int w = 0; w < nw; ++w) row(i)[w] = ~0ULL;
         int rem = n & 63;
-        if (rem) alias[i][nw - 1] &= (1ULL << rem) - 1;
+        if (rem) row(i)[nw - 1] &= (1ULL << rem) - 1;
     }
 
-    auto bs4_get = [&](const BS4& b, int idx) -> bool {
-        return idx >= 0 && idx < n && ((b[idx >> 6] >> (idx & 63)) & 1);
+    auto alias_get = [&](int source, int idx) -> bool {
+        return source >= 0 && source < n && idx >= 0 && idx < n
+            && ((row(source)[idx >> 6] >> (idx & 63)) & 1);
     };
 
     std::vector<bool> unique(n, false);
@@ -392,35 +436,35 @@ bool EuclideanSolver::is_canonical_partial(const State& st) {
         changed = false;
         for (int i = 0; i < n; ++i) {
             for (int w = 0; w < nw; ++w) {
-                uint64_t bits = alias[i][w];
+                uint64_t bits = row(i)[w];
                 while (bits) {
                     int bit = __builtin_ctzll(bits); bits &= bits - 1;
                     int j = w * 64 + bit;
                     if (j == i || j >= n) continue;
 
                     bool ok = (st.darts[i].polygon_size == st.darts[j].polygon_size)
-                           && bs4_get(alias[j], i)
-                           && bs4_get(alias[st.darts[i].mirro], st.darts[j].mirro)
-                           && bs4_get(alias[st.darts[i].rneig], st.darts[j].rneig)
-                           && bs4_get(alias[st.darts[i].lneig], st.darts[j].lneig);
+                           && alias_get(j, i)
+                           && alias_get(st.darts[i].mirro, st.darts[j].mirro)
+                           && alias_get(st.darts[i].rneig, st.darts[j].rneig)
+                           && alias_get(st.darts[i].lneig, st.darts[j].lneig);
 
                     if (ok) {
                         int gi = st.darts[i].glue, gj = st.darts[j].glue;
                         if (gi != -1 || gj != -1) {
                             if (gi == -1 || gj == -1) ok = false;
-                            else ok = bs4_get(alias[gi], gj);
+                            else ok = alias_get(gi, gj);
                         }
                     }
 
                     if (!ok) {
-                        alias[i][w] &= ~(1ULL << bit);
+                        row(i)[w] &= ~(1ULL << bit);
                         changed = true;
                     }
                 }
             }
 
             int cnt = 0;
-            for (int w = 0; w < nw; ++w) cnt += __builtin_popcountll(alias[i][w]);
+            for (int w = 0; w < nw; ++w) cnt += __builtin_popcountll(row(i)[w]);
             if (cnt == 1) unique[i] = true;
         }
     }
@@ -516,12 +560,7 @@ void EuclideanSolver::write_solution_static(const State& st, const std::string& 
 
     if (g_binary_solutions) {
         std::ofstream bout(path, std::ios::binary | (is_new ? std::ios::out : std::ios::app));
-        uint8_t nv = (uint8_t)st.vertype.size();
-        uint8_t ne = (uint8_t)st.darts.size();
-        bout.write((char*)&nv, 1);
-        bout.write((char*)&ne, 1);
-        for (int v : st.vertype) { uint8_t x = (uint8_t)v; bout.write((char*)&x, 1); }
-        for (const auto& d : st.darts) { int16_t x = (int16_t)d.glue; bout.write((char*)&x, 2); }
+        write_state_bin(bout, st);
         return;
     }
 

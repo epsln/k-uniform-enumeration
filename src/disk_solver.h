@@ -3,28 +3,71 @@
 #include <atomic>
 #include <cstdint>
 #include <fstream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 // Compact binary serialization of State for disk-based search.
-// Format:  uint8 num | uint8 n_edges | num*uint8 vertype | n_edges*int16 glue
+// Version 2 record: 0 marker | uint8 version | uint16 num | uint16 n_edges |
+//                   num*uint8 vertype | n_edges*int16 glue
+// Legacy unversioned uint8-count records remain readable. New writes are v2.
 // Derived fields (rneig, lneig, mirro, polygon_size, label) are NOT stored —
 // they are reconstructed from vertype on deserialization.
 
 inline void write_u8(std::ostream& os, uint8_t v)  { os.write((char*)&v, 1); }
-inline uint8_t read_u8(std::istream& is)            { uint8_t v; is.read((char*)&v, 1); return v; }
+inline uint8_t read_u8(std::istream& is)            { uint8_t v = 0; is.read((char*)&v, 1); return v; }
+inline void write_u16(std::ostream& os, uint16_t v) {
+    uint8_t b[2] = {(uint8_t)(v & 0xff), (uint8_t)(v >> 8)};
+    os.write((char*)b, 2);
+}
+inline uint16_t read_u16(std::istream& is) {
+    uint8_t b[2] = {}; is.read((char*)b, 2);
+    return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+}
 inline void write_i16(std::ostream& os, int16_t v)  { os.write((char*)&v, 2); }
-inline int16_t read_i16(std::istream& is)           { int16_t v; is.read((char*)&v, 2); return v; }
+inline int16_t read_i16(std::istream& is)           { int16_t v = 0; is.read((char*)&v, 2); return v; }
 inline void write_i32(std::ostream& os, int32_t v)  { os.write((char*)&v, 4); }
-inline int32_t read_i32(std::istream& is)           { int32_t v; is.read((char*)&v, 4); return v; }
+inline int32_t read_i32(std::istream& is)           { int32_t v = 0; is.read((char*)&v, 4); return v; }
+
+constexpr uint8_t BINARY_STATE_VERSION = 2;
+inline void write_binary_record_header(std::ostream& os, size_t num, size_t ne) {
+    if (num == 0 || num > std::numeric_limits<uint16_t>::max()
+            || ne == 0 || ne > std::numeric_limits<int16_t>::max())
+        throw std::runtime_error("binary state dimensions are out of range");
+    write_u8(os, 0);
+    write_u8(os, BINARY_STATE_VERSION);
+    write_u16(os, (uint16_t)num);
+    write_u16(os, (uint16_t)ne);
+}
+inline void read_binary_record_header(std::istream& is, uint16_t& num, uint16_t& ne) {
+    uint8_t first = read_u8(is);
+    if (is.fail()) throw std::runtime_error("truncated binary state header");
+    if (first != 0) {
+        num = first;
+        ne = read_u8(is);
+    } else {
+        uint8_t version = read_u8(is);
+        if (is.fail()) throw std::runtime_error("truncated binary state version");
+        if (version != BINARY_STATE_VERSION)
+            throw std::runtime_error("unsupported binary state version " + std::to_string(version));
+        num = read_u16(is);
+        ne = read_u16(is);
+    }
+    if (is.fail()) throw std::runtime_error("truncated binary state header");
+    if (num == 0 || ne == 0 || ne > (uint16_t)std::numeric_limits<int16_t>::max())
+        throw std::runtime_error("invalid binary state dimensions");
+}
 
 void write_state_bin(std::ostream& os, const State& s);
 State read_state_bin(std::istream& is);
+PackedState read_packed_state_bin(std::istream& is);
 
 // Write vector with leading count
 void write_states_bin(const std::string& path, const std::vector<State>& v);
 void write_packed_states_bin(const std::string& path, const std::vector<PackedState>& v);
 std::vector<State> read_states_bin(const std::string& path);
+std::vector<PackedState> read_packed_states_bin(const std::string& path);
 
 // Stream states from a file (no leading count), calling cb on each
 template<class F>
@@ -32,9 +75,10 @@ int64_t stream_states_bin(const std::string& path, F&& cb) {
     std::ifstream f(path, std::ios::binary);
     int64_t count = 0;
     while (f.good() && f.peek() != EOF) {
-        try { cb(read_state_bin(f)); ++count; }
-        catch (...) { break; }
+        cb(read_state_bin(f));
+        ++count;
     }
+    if (f.bad()) throw std::runtime_error("failed while streaming binary states");
     return count;
 }
 
@@ -59,8 +103,8 @@ DiskSolverStats disk_solver_worker(
 
 // BFS fan-out: expand initial states until we have at least `target` frontier states.
 // Returns the frontier states.  early_states receives completed solutions found during fan-out.
-std::vector<State> bfs_fanout(int target, int max_polygons,
-                               std::vector<State>* early_states = nullptr);
+std::vector<PackedState> bfs_fanout(int target, int max_polygons,
+                                    std::vector<State>* early_states = nullptr);
 
 // Enable global shared partial dedup for disk workers
 void set_pdedup_shared(bool v);
