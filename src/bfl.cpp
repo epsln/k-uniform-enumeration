@@ -1,6 +1,5 @@
 #include "bfl.h"
 #include <algorithm>
-#include <cstring>
 #include <deque>
 
 std::vector<int> bfl_labels(const State& st, int start) {
@@ -121,6 +120,8 @@ std::string bfl_canonical_hash(const State& st) {
     auto h = bfl_canonical_hash128(st);
     std::string out(32, '\0');
     for (int i = 0; i < 4; ++i)
-        std::memcpy(&out[i * sizeof(uint64_t)], &h[i], sizeof(uint64_t));
+        for (int byte = 0; byte < 8; ++byte)
+            out[i * 8 + byte] = static_cast<char>(
+                static_cast<unsigned char>((h[i] >> (byte * 8)) & 0xff));
     return out;
 }

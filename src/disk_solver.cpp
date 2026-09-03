@@ -8,7 +8,9 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_set>
 #include <zstd.h>
 
@@ -20,6 +22,46 @@ using namespace catalog;
 // this is on the hot path, unlike the once-in-a-while output compression.
 static int g_spill_zstd_level = 3;
 
+static void validate_packed_state(const std::vector<uint8_t>& vertype,
+                                  const std::vector<int16_t>& glue,
+                                  bool require_complete) {
+    if (vertype.empty() || glue.empty())
+        throw std::runtime_error("binary state has empty vertex or dart data");
+    size_t expected = 0;
+    for (uint8_t vt : vertype) {
+        if (vt >= NUM_VERTEX_TYPES)
+            throw std::runtime_error("binary state has invalid vertex type");
+        expected += left_neighbors[vt].size();
+    }
+    if (expected != glue.size())
+        throw std::runtime_error("binary state dart count does not match vertex types");
+    for (size_t i = 0; i < glue.size(); ++i) {
+        int g = glue[i];
+        if (g == -1 && !require_complete) continue;
+        if (g < 0 || (size_t)g >= glue.size())
+            throw std::runtime_error("binary state has invalid glue index");
+        if (glue[(size_t)g] != (int)i)
+            throw std::runtime_error("binary state glue is not an involution");
+    }
+}
+
+static void append_packed_record(std::string& out, const PackedState& ps) {
+    validate_packed_state(ps.vertype, ps.glue, false);
+    if (ps.vertype.size() > std::numeric_limits<uint16_t>::max()
+            || ps.glue.size() > (size_t)std::numeric_limits<int16_t>::max())
+        throw std::runtime_error("spill state dimensions are out of range");
+    out.push_back(0);
+    out.push_back((char)BINARY_STATE_VERSION);
+    uint16_t nv = (uint16_t)ps.vertype.size(), ne = (uint16_t)ps.glue.size();
+    out.push_back((char)(nv & 0xff)); out.push_back((char)(nv >> 8));
+    out.push_back((char)(ne & 0xff)); out.push_back((char)(ne >> 8));
+    for (uint8_t v : ps.vertype) out.push_back((char)v);
+    for (int16_t g : ps.glue) {
+        out.push_back((char)(g & 0xff));
+        out.push_back((char)(((uint16_t)g >> 8) & 0xff));
+    }
+}
+
 // Compress one spill batch (a vector of PackedState) into a single
 // self-contained zstd frame and append it to the spill file as:
 //   [i32 record_count][i32 uncompressed_size][i32 compressed_size][compressed bytes]
@@ -30,15 +72,7 @@ static int g_spill_zstd_level = 3;
 static void write_spill_batch(std::ofstream& sf, const std::vector<PackedState>& batch) {
     std::string plain;
     plain.reserve(batch.size() * 24);
-    for (const auto& ps : batch) {
-        plain.push_back((char)(uint8_t)ps.vertype.size());
-        plain.push_back((char)(uint8_t)ps.glue.size());
-        for (uint8_t v : ps.vertype) plain.push_back((char)v);
-        for (int16_t g : ps.glue) {
-            plain.push_back((char)(g & 0xFF));
-            plain.push_back((char)((g >> 8) & 0xFF));
-        }
-    }
+    for (const auto& ps : batch) append_packed_record(plain, ps);
 
     size_t bound = ZSTD_compressBound(plain.size());
     std::string comp(bound, '\0');
@@ -80,20 +114,37 @@ static bool read_spill_batch(std::ifstream& sf, std::deque<PackedState>& queue) 
 
     size_t pos = 0;
     for (int i = 0; i < count; ++i) {
-        int num = (uint8_t)plain[pos++];
-        int ne  = (uint8_t)plain[pos++];
+        if (pos >= plain.size()) return false;
+        uint16_t num = (uint8_t)plain[pos++], ne;
+        if (num == 0) {
+            if (plain.size() - pos < 5) return false;
+            uint8_t version = (uint8_t)plain[pos++];
+            if (version != BINARY_STATE_VERSION)
+                throw std::runtime_error("unsupported spill state version");
+            num = (uint16_t)(uint8_t)plain[pos] | ((uint16_t)(uint8_t)plain[pos + 1] << 8);
+            ne = (uint16_t)(uint8_t)plain[pos + 2] | ((uint16_t)(uint8_t)plain[pos + 3] << 8);
+            pos += 4;
+        } else {
+            if (pos >= plain.size()) return false;
+            ne = (uint8_t)plain[pos++];
+        }
+        if (num == 0 || ne == 0 || ne > (uint16_t)std::numeric_limits<int16_t>::max()
+                || plain.size() - pos < (size_t)num + (size_t)ne * 2)
+            return false;
         PackedState ps;
         ps.vertype.resize(num);
-        for (int j = 0; j < num; ++j) ps.vertype[j] = (uint8_t)plain[pos++];
+        for (uint16_t j = 0; j < num; ++j) ps.vertype[j] = (uint8_t)plain[pos++];
         ps.glue.resize(ne);
-        for (int j = 0; j < ne; ++j) {
+        for (uint16_t j = 0; j < ne; ++j) {
             uint16_t lo = (uint8_t)plain[pos];
             uint16_t hi = (uint8_t)plain[pos + 1];
             pos += 2;
             ps.glue[j] = (int16_t)(lo | (hi << 8));
         }
+        validate_packed_state(ps.vertype, ps.glue, false);
         queue.push_front(std::move(ps));
     }
+    if (pos != plain.size()) return false;
     return true;
 }
 
@@ -105,9 +156,6 @@ std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];
 std::atomic<bool> g_disk_running{false};
 bool g_compress_solutions = false;
 int64_t g_compress_threshold = 256LL * 1024 * 1024;
-static bool s_pdedup_shared = false;
-void set_pdedup_shared(bool v) { s_pdedup_shared = v; }
-
 // Append-compress a .bin file: compress the current tail into a zstd frame and
 // concatenate it onto X.bin.zst (zstd streams concatenate, so zstd -d yields the
 // full history), then remove the tail.  Never overwrites X.bin.zst, so earlier
@@ -121,21 +169,29 @@ static void append_compress(const std::string& path) {
 // Binary I/O
 // =============================================================================
 void write_state_bin(std::ostream& os, const State& s) {
-    int ne = (int)s.darts.size();
-    write_u8(os, (uint8_t)s.vertype.size());
-    write_u8(os, (uint8_t)ne);
-    for (int v : s.vertype) write_u8(os, (uint8_t)v);
-    for (const auto& d : s.darts) write_i16(os, (int16_t)d.glue);
+    PackedState ps = EuclideanSolver::pack_state(s);
+    validate_packed_state(ps.vertype, ps.glue, false);
+    write_binary_record_header(os, ps.vertype.size(), ps.glue.size());
+    for (uint8_t v : ps.vertype) write_u8(os, v);
+    for (int16_t g : ps.glue) write_i16(os, g);
+    if (!os) throw std::runtime_error("failed to write binary state");
+}
+
+PackedState read_packed_state_bin(std::istream& is) {
+    uint16_t num, ne;
+    read_binary_record_header(is, num, ne);
+    PackedState p;
+    p.vertype.resize(num);
+    for (uint8_t& vt : p.vertype) vt = read_u8(is);
+    p.glue.resize(ne);
+    for (int16_t& glue : p.glue) glue = read_i16(is);
+    if (is.fail()) throw std::runtime_error("truncated binary state payload");
+    validate_packed_state(p.vertype, p.glue, false);
+    return p;
 }
 
 State read_state_bin(std::istream& is) {
-    int num = (int)read_u8(is);
-    int ne  = (int)read_u8(is);
-    std::vector<int> vt(num);
-    for (int i = 0; i < num; ++i) vt[i] = (int)read_u8(is);
-    std::vector<int> gl(ne);
-    for (int i = 0; i < ne; ++i) gl[i] = (int)(int16_t)read_i16(is);
-    return EuclideanSolver::rebuild_from_vertype_glue(vt, gl);
+    return EuclideanSolver::unpack_state(read_packed_state_bin(is));
 }
 
 void write_states_bin(const std::string& path, const std::vector<State>& v) {
@@ -151,8 +207,8 @@ void write_packed_states_bin(const std::string& path, const std::vector<PackedSt
     { std::ofstream f(tmp, std::ios::binary);
       write_i32(f, (int32_t)v.size());
       for (const auto& ps : v) {
-          write_u8(f, (uint8_t)ps.vertype.size());
-          write_u8(f, (uint8_t)ps.glue.size());
+          validate_packed_state(ps.vertype, ps.glue, false);
+          write_binary_record_header(f, ps.vertype.size(), ps.glue.size());
           for (uint8_t vt : ps.vertype) write_u8(f, vt);
           for (int16_t g : ps.glue)   write_i16(f, g);
       }
@@ -164,16 +220,29 @@ std::vector<State> read_states_bin(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return {};
     int32_t n = read_i32(f);
+    if (f.fail() || n < 0) throw std::runtime_error("invalid binary state file count");
     std::vector<State> v(n);
     for (auto& s : v) s = read_state_bin(f);
+    if (f.peek() != EOF) throw std::runtime_error("trailing data in binary state file");
+    return v;
+}
+
+std::vector<PackedState> read_packed_states_bin(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    int32_t n = read_i32(f);
+    if (f.fail() || n < 0) throw std::runtime_error("invalid binary state file count");
+    std::vector<PackedState> v(n);
+    for (auto& s : v) s = read_packed_state_bin(f);
+    if (f.peek() != EOF) throw std::runtime_error("trailing data in binary state file");
     return v;
 }
 
 // =============================================================================
 // BFS fan-out
 // =============================================================================
-std::vector<State> bfs_fanout(int target, int max_polygons,
-                               std::vector<State>* early_states) {
+std::vector<PackedState> bfs_fanout(int target, int max_polygons,
+                                    std::vector<State>* early_states) {
     std::vector<PackedState> frontier;
     for (int vt = 0; vt < NUM_VERTEX_TYPES; ++vt)
         frontier.push_back(EuclideanSolver::pack_state(EuclideanSolver::make_initial(vt)));
@@ -196,11 +265,7 @@ std::vector<State> bfs_fanout(int target, int max_polygons,
     if (head > 0) frontier.erase(frontier.begin(), frontier.begin() + head);
     if (early_states) *early_states = std::move(early);
 
-    std::vector<State> result;
-    result.reserve(frontier.size());
-    for (auto& ps : frontier)
-        result.push_back(EuclideanSolver::unpack_state(ps));
-    return result;
+    return frontier;
 }
 
 // =============================================================================
@@ -215,6 +280,8 @@ DiskSolverStats disk_solver_worker(
     int64_t sol_dedup_cap,
     int worker_id)
 {
+    if (worker_id < 0 || worker_id >= MAX_WORKERS)
+        throw std::invalid_argument("worker_id exceeds MAX_WORKERS");
     fs::create_directories(out_dir);
     DiskSolverStats stats;
 
@@ -268,8 +335,8 @@ DiskSolverStats disk_solver_worker(
     auto pull_chunk = [&]() -> bool {
         int ci = next_chunk.fetch_add(1);
         if (ci >= (int)chunk_paths.size()) return false;
-        auto v = read_states_bin(chunk_paths[ci]);
-        for (auto& s : v) queue.push_back(EuclideanSolver::pack_state(s));
+        auto v = read_packed_states_bin(chunk_paths[ci]);
+        for (auto& s : v) queue.push_back(std::move(s));
         return true;
     };
 
@@ -347,6 +414,11 @@ DiskSolverStats disk_solver_worker(
                 append_compress(entry.path().string());
         }
     }
+
+    g_disk_partials[worker_id].store(stats.partials_checked, std::memory_order_relaxed);
+    g_disk_solutions[worker_id].store(stats.solutions_found, std::memory_order_relaxed);
+    g_disk_queue[worker_id].store(0, std::memory_order_relaxed);
+    g_disk_spilled[worker_id].store(0, std::memory_order_relaxed);
 
     return stats;
 }

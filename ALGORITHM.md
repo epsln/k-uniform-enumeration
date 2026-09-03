@@ -156,23 +156,15 @@ satisfy:
 3. If the ring closes back at `i`, the nominal size must divide the segment
    count evenly.
 
-### Partial deduplication
+### Partial canonical filtering
 
-Two partial states may represent the same connectivity pattern under different
-flag labellings. To avoid exploring duplicate subtrees, each worker maintains
-a **fingerprint → bucket** map:
-
-1. **Fingerprint** (`state_fingerprint`): a 64-bit FNV-1a hash over the 6-tuple
-   of polygon sizes around each glued edge pair, plus the vertex-type histogram.
-   Invariant under relabeling.
-
-2. **Isomorphism check** (`are_isomorphic_partial`): bit-level alias refinement
-   of the constraint propagation problem. Two states of equal size are
-   isomorphic iff every flag's alias set (the set of flags it could map to
-   under an automorphism) is uniquely determined.
-
-Candidates that are isomorphic to a previously seen state are discarded.
-Bucket size is capped at 8 to limit memory.
+Before a partial state is queued, bitset alias refinement checks whether its
+current flag labeling is canonical. A non-canonical labeling is discarded
+because another construction order produces its canonical representative.
+Forced propagation also closes an edge when only one compatible partner is
+possible. Complete solutions receive an additional bounded per-worker hash
+deduplication pass before being written; global deduplication remains the
+pruner's responsibility.
 
 ## Pruning pipeline
 
@@ -192,7 +184,7 @@ itself, this labeling is canonical and should be kept.
 **Weisfeiler-Lehman (1-WL) colour refinement** over the flag-slot graph:
 
 1. Initial node colour = polygon size.
-2. For 3 iterations, replace each node's colour with:
+2. Until convergence (or the configured iteration cap), replace each node's colour with:
 
        FNV(colour, sort{FNV("R", rneig_colour),
                          FNV("L", lneig_colour),
@@ -215,11 +207,16 @@ valid bijection exists and one is a duplicate.
 
 For each accepted unique tiling, the pruner writes:
 
-- **`eupruned.txt`**: vertex types, signature, count type, Conway symbol, cycle
-  descriptions with assembled tile-adjacency Conway string.
-- **`euraw.txt`**: same records plus debug information (alias groups for
-  non-canonical labelings, WL collision diagnostics).
-- **`.tes` files**: HyperRogue-compatible tiling description files.
+- **Raw**: retained compressed text or versioned binary solver states.
+- **TES**: canonical HyperRogue documents packed into zstd-compressed SQLite
+  chunks, with optional extraction to individual `.tes` files.
+- **Mortier**: canonical exact Z4 translation vectors and seed sets packed into
+  a versioned zstd/SQLite database. Translation periods are derived by exact
+  affine development of the assembled polygon adjacency.
+
+All modes still run global pruning and report canonical counts. TES and Mortier
+databases use different schemas despite sharing the conventional output path
+`<output>/wl/tilings.sqlite3`.
 
 ## Conway symbols
 
@@ -242,10 +239,12 @@ The assembled tile-adjacency Conway symbol (the one in the `.tes` file)
 describes which tile edges meet, using parentheses for normal edges and
 brackets for mirror edges.
 
-## Reference counts
+## Generated counts
 
-Known k-uniform Euclidean tiling counts (unique, after deduplication,
-excluding the `(4,8,8)` vertex type not in the catalogue):
+Counts in the checked local `k<=20` result database (unique after
+deduplication, excluding the `(4,8,8)` vertex type not in the catalogue).
+Counts through `k=8` agree with existing references; higher values are solver
+results rather than an independent proof:
 
 | k | Unique tilings |
 |---|---------------|
@@ -257,3 +256,15 @@ excluding the `(4,8,8)` vertex type not in the catalogue):
 | 6 | 673 |
 | 7 | 1,472 |
 | 8 | 2,849 |
+| 9 | 5,959 |
+| 10 | 11,866 |
+| 11 | 24,459 |
+| 12 | 49,793 |
+| 13 | 103,080 |
+| 14 | 212,630 |
+| 15 | 445,289 |
+| 16 | 933,636 |
+| 17 | 1,972,148 |
+| 18 | 4,177,505 |
+| 19 | 8,896,553 |
+| 20 | 18,992,613 |

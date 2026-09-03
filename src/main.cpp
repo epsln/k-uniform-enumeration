@@ -4,6 +4,7 @@
 #include "vertex_catalog.h"
 #include "metrics.h"
 #include "zstd_stream.h"
+#include "tes_store.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -41,9 +42,9 @@ struct SharedQueue {
 	int active = 0;
 	bool stop = false;
 
-	static constexpr int BATCH = 64;
+	static constexpr int BATCH = 16;
 
-	int pop_batch(std::vector<State>& out) {
+	int pop_batch(std::vector<PackedState>& out) {
 		out.clear();
 		std::unique_lock<std::mutex> lk(mu);
 		while (q.empty() && active > 0 && !stop)
@@ -51,29 +52,18 @@ struct SharedQueue {
 		if (q.empty()) { stop = true; cv.notify_all(); return 0; }
 		int n = std::min(BATCH, (int)q.size());
 		for (int i = 0; i < n; ++i) {
-			out.push_back(EuclideanSolver::unpack_state(q.front()));
+			out.push_back(std::move(q.front()));
 			q.pop_front();
 		}
 		active += n;
 		return n;
 	}
 
-	void push_batch(std::vector<State>& batch) {
-		if (batch.empty()) return;
+	void finish_batch(int completed, std::vector<PackedState>& successors) {
 		std::lock_guard<std::mutex> lk(mu);
-		for (auto& s : batch) q.push_back(EuclideanSolver::pack_state(s));
-		cv.notify_all();
-	}
-
-	void push_one(State&& s) {
-		std::lock_guard<std::mutex> lk(mu);
-		q.push_back(EuclideanSolver::pack_state(s));
-		cv.notify_one();
-	}
-
-	void done_one(int n = 1) {
-		std::lock_guard<std::mutex> lk(mu);
-		active -= n;
+		for (auto& s : successors) q.push_back(std::move(s));
+		active -= completed;
+		if (q.empty() && active == 0) stop = true;
 		cv.notify_all();
 	}
 
@@ -277,10 +267,16 @@ static void merge_worker_outputs(const std::string& output_dir,
 		bool zst = !paths.empty() && has_zst_suffix(paths.front());
 		std::string dest = output_dir + "/" + base + (zst ? ".zst" : "");
 		std::ofstream out(dest, std::ios::binary | std::ios::app);
+		if (!out) throw std::runtime_error("cannot open merged output " + dest);
 		for (const auto& p : paths) {
 			std::ifstream in(p, std::ios::binary);
+			if (!in) throw std::runtime_error("cannot open worker output " + p);
 			out << in.rdbuf();
+			if (in.bad() || !out)
+				throw std::runtime_error("failed to merge worker output " + p);
 		}
+		out.close();
+		if (!out) throw std::runtime_error("failed to finalize merged output " + dest);
 	}
 }
 
@@ -293,7 +289,8 @@ static void compress_merged_solutions(const std::string& output_dir) {
 	}
 }
 
-static std::map<int,int> run_pruner(const std::string& output_dir, int num_workers) {
+static std::map<int,int> run_pruner(const std::string& output_dir, int num_workers,
+                                    FinalOutputFormat format) {
 	std::vector<std::string> solution_files;
 	for (const auto& entry : fs::directory_iterator(output_dir)) {
 		if (!entry.is_regular_file()) continue;
@@ -305,7 +302,12 @@ static std::map<int,int> run_pruner(const std::string& output_dir, int num_worke
 	std::map<int,int> counts;
 	{
 		std::string pruned_dir = output_dir + "/wl";
-		WLPruner pruner(pruned_dir, num_workers);
+		fs::remove(pruned_dir + "/tilings.sqlite3.tmp");
+		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-journal");
+		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-wal");
+		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-shm");
+		if (format == FinalOutputFormat::Raw) fs::remove(pruned_dir + "/tilings.sqlite3");
+		WLPruner pruner(pruned_dir, num_workers, format);
 		pruner.run(solution_files);
 		int total = 0;
 		for (const auto& [k, count] : pruner.solutions_per_k()) {
@@ -335,14 +337,20 @@ int main(int argc, char** argv) {
 	if (num_workers < 1) num_workers = 4;
 	std::string output_dir = "solutions";
 	std::string mode = "memory";
+	FinalOutputFormat output_format = FinalOutputFormat::Tes;
 	int fanout_target = 0;    // 0 = auto-scale
 	int spill_threshold = 0;  // 0 = auto-scale
 	int chunks_user = 0;      // 0 = auto (num_workers * 32)
-	int pdedup_mode = 0;  // 0=per-worker, 1=global shared
 	std::string dedup_mode  = "wl";
 	int64_t sol_dedup_cap_user = 0;  // 0 = auto-scale
 	int max_ram_gb = 0;  // 0 = auto (k-based formula)
 	bool resume = false;
+	std::string extract_database, extract_output;
+	std::string export_mortier_database, export_mortier_json_path, mortier_stable_id;
+	std::string import_mortier_json_path, import_mortier_database;
+	int64_t mortier_id = 0;
+	bool prune_only = false;
+	int64_t extract_id = 0;
 	std::string telegram_token, telegram_chat;
 	int notify_minutes = 30;
 	g_propagate = true;
@@ -353,15 +361,24 @@ int main(int argc, char** argv) {
 		else if (arg == "--workers" && i + 1 < argc) num_workers = std::stoi(argv[++i]);
 		else if (arg == "--output" && i + 1 < argc) output_dir = argv[++i];
 		else if (arg == "--mode" && i + 1 < argc) mode = argv[++i];
+		else if (arg == "--format" && i + 1 < argc) {
+			std::string value = argv[++i];
+			if (value == "raw") output_format = FinalOutputFormat::Raw;
+			else if (value == "tes") output_format = FinalOutputFormat::Tes;
+			else if (value == "mortier") output_format = FinalOutputFormat::Mortier;
+			else { std::cerr << "--format must be raw, tes, or mortier\n"; return 1; }
+		}
 		else if (arg == "--wl-dim" && i + 1 < argc) { int d = std::stoi(argv[++i]); g_wl_dim = (d == 2 ? 2 : 1); }
 		else if (arg == "--wl-iters" && i + 1 < argc) g_wl_iters = std::stoi(argv[++i]);
-		else if (arg == "--pdedup" && i + 1 < argc) { std::string v = argv[++i]; pdedup_mode = (v == "shared" ? 1 : 0); }
 		else if (arg == "--dedup" && i + 1 < argc) {
 			std::string v = argv[++i];
 			if (v == "bfl") { dedup_mode = "bfl"; g_use_bfl = true; }
 			else { dedup_mode = "wl"; g_use_bfl = false; }
 		}
-		else if (arg == "--propagate") { g_propagate = true; }
+		else if (arg == "--no-iso-check") { g_no_iso_check = true; }
+		else if (arg == "--prune-only") { prune_only = true; }
+		else if (arg == "--keep-pruner-inputs") { g_keep_pruner_inputs = true; }
+		else if (arg == "--profile-pruner") { g_profile_pruner = true; }
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
 		else if (arg == "--fanout" && i + 1 < argc) fanout_target = std::stoi(argv[++i]);
@@ -370,6 +387,15 @@ int main(int argc, char** argv) {
 		else if (arg == "--sol-dedup-cap" && i + 1 < argc) sol_dedup_cap_user = std::stoll(argv[++i]);
 		else if (arg == "--max-ram-gb" && i + 1 < argc) max_ram_gb = std::stoi(argv[++i]);
 		else if (arg == "--resume") { resume = true; }
+		else if (arg == "--extract-tes" && i + 1 < argc) extract_database = argv[++i];
+		else if (arg == "--extract-output" && i + 1 < argc) extract_output = argv[++i];
+		else if (arg == "--tes-id" && i + 1 < argc) extract_id = std::stoll(argv[++i]);
+		else if (arg == "--export-mortier-json" && i + 1 < argc) export_mortier_database = argv[++i];
+		else if (arg == "--json-output" && i + 1 < argc) export_mortier_json_path = argv[++i];
+		else if (arg == "--mortier-id" && i + 1 < argc) mortier_id = std::stoll(argv[++i]);
+		else if (arg == "--mortier-stable-id" && i + 1 < argc) mortier_stable_id = argv[++i];
+		else if (arg == "--import-mortier-json" && i + 1 < argc) import_mortier_json_path = argv[++i];
+		else if (arg == "--mortier-database" && i + 1 < argc) import_mortier_database = argv[++i];
 		else if (arg == "--compress-solutions") { g_compress_solutions = true; g_compress_pruner_outputs = true;}
 		else if (arg == "--compress-threshold-mb" && i + 1 < argc)
 			g_compress_threshold = (int64_t)std::stoll(argv[++i]) * 1024 * 1024;
@@ -377,15 +403,24 @@ int main(int argc, char** argv) {
 		else if (arg == "--telegram-chat" && i + 1 < argc) telegram_chat = argv[++i];
 		else if (arg == "--notify-minutes" && i + 1 < argc) notify_minutes = std::stoi(argv[++i]);
 		else if (arg == "--telegram-dry-run") { g_telegram_dry_run = true; }
+		else if (arg == "--version") {
+			std::cout << "eusolver 1.0.0\n";
+			return 0;
+		}
 		else if (arg == "--help") {
 			std::cout << "Usage: eusolver [options]\n"
 				<< "  --max-polygons N   max vertex types (default: 5)\n"
 				<< "  --workers N        number of threads (default: hw)\n"
 				<< "  --output DIR       output directory (default: solutions)\n"
 				<< "  --mode memory|disk solver mode (default: memory)\n"
+				<< "  --format raw|tes|mortier  final output format (default: tes)\n"
 				<< "  --wl-dim 1|2       WL hash dimension (default: 1)\n"
-				<< "  --pdedup local|shared  partial dedup scope (default: local)\n"
+				<< "  --wl-iters N       WL iteration cap (default: 0 = iterate to convergence)\n"
 				<< "  --dedup wl|bfl       online solver dedup mode (default: wl)\n"
+				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
+				<< "  --prune-only        prune existing eusolver_* files in --output\n"
+				<< "  --keep-pruner-inputs preserve raw solution files after pruning\n"
+				<< "  --profile-pruner     report per-file pruner stage timings\n"
 				<< "  --fanout N         BFS fan-out target (0=auto, default: 40000)\n"
 				<< "  --spill N          disk spill threshold (0=auto, default: 50000)\n"
 				<< "  --chunks N         number of frontier chunks (0=auto, default: workers*32)\n"
@@ -395,10 +430,20 @@ int main(int argc, char** argv) {
 				<< "  --no-spill          keep all partial states in RAM (no disk spill)\n"
 				<< "  --compress-solutions  compress worker .bin output with zstd\n"
 				<< "  --compress-threshold-mb N  mid-run compression threshold (default 256)\n"
+				<< "  --extract-tes DB   extract .tes records from a pruner SQLite database\n"
+				<< "  --extract-output DIR  extraction directory (required with --extract-tes)\n"
+				<< "  --tes-id N         extract only this database entry id (default: all)\n"
+				<< "  --export-mortier-json DB  convert a Mortier SQLite database to JSON\n"
+				<< "  --json-output FILE  JSON path required with --export-mortier-json\n"
+				<< "  --mortier-id N      export only this numeric Mortier entry id\n"
+				<< "  --mortier-stable-id HEX  export only this stable Mortier id\n"
+				<< "  --import-mortier-json FILE  convert generated Mortier JSON to SQLite\n"
+				<< "  --mortier-database DB  SQLite path required with --import-mortier-json\n"
 				<< "  --telegram-token T  Telegram bot token for progress updates\n"
 				<< "  --telegram-chat C   Telegram chat id to message\n"
 				<< "  --notify-minutes N  interval between Telegram updates (default 30)\n"
 				<< "  --telegram-dry-run  print messages to stderr instead of sending\n"
+				<< "  --version          show program version\n"
 				<< "  --help             show this help\n";
 			return 0;
 		}
@@ -408,6 +453,84 @@ int main(int argc, char** argv) {
 		}
 	}
 	if (num_workers < 1) num_workers = 1;
+	if (num_workers > MAX_WORKERS) {
+		std::cerr << "--workers must not exceed " << MAX_WORKERS << "\n";
+		return 1;
+	}
+	bool tes_operation = !extract_database.empty();
+	bool export_operation = !export_mortier_database.empty();
+	bool import_operation = !import_mortier_json_path.empty();
+	if ((tes_operation + export_operation + import_operation) > 1
+			|| (!tes_operation && (!extract_output.empty() || extract_id != 0))
+			|| (!export_operation
+				&& (!export_mortier_json_path.empty() || mortier_id != 0
+					|| !mortier_stable_id.empty()))
+			|| (!import_operation && !import_mortier_database.empty())) {
+		std::cerr << "invalid or conflicting extraction/conversion options\n";
+		return 1;
+	}
+	if (!extract_database.empty()) {
+		if (extract_output.empty()) {
+			std::cerr << "--extract-output is required with --extract-tes\n";
+			return 1;
+		}
+		try {
+			int64_t count = extract_tes_database(extract_database, extract_output, extract_id);
+			std::cout << "Extracted " << count << " .tes file" << (count == 1 ? "" : "s")
+			          << " to " << extract_output << "\n";
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "TES extraction failed: " << e.what() << "\n";
+			return 1;
+		}
+	}
+	if (!export_mortier_database.empty()) {
+		if (export_mortier_json_path.empty()) {
+			std::cerr << "--json-output is required with --export-mortier-json\n";
+			return 1;
+		}
+		try {
+			auto stable_id = mortier_stable_id.empty()
+				? std::vector<uint8_t>{} : parse_hex_id(mortier_stable_id);
+			int64_t count = export_mortier_json(export_mortier_database,
+				export_mortier_json_path, mortier_id, stable_id);
+			std::cout << "Exported " << count << " Mortier record"
+			          << (count == 1 ? "" : "s") << " to " << export_mortier_json_path << "\n";
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "Mortier JSON export failed: " << e.what() << "\n";
+			return 1;
+		}
+	}
+	if (!import_mortier_json_path.empty()) {
+		if (import_mortier_database.empty()) {
+			std::cerr << "--mortier-database is required with --import-mortier-json\n";
+			return 1;
+		}
+		try {
+			int64_t count = import_mortier_json(import_mortier_json_path,
+			                                           import_mortier_database);
+			std::cout << "Imported " << count << " Mortier record"
+			          << (count == 1 ? "" : "s") << " to " << import_mortier_database << "\n";
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "Mortier JSON import failed: " << e.what() << "\n";
+			return 1;
+		}
+	}
+	if (output_format == FinalOutputFormat::Raw) g_keep_pruner_inputs = true;
+	if (prune_only) {
+		try {
+			auto start = std::chrono::steady_clock::now();
+			run_pruner(output_dir, num_workers, output_format);
+			auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+			std::cout << "Pruner phase:  " << std::fixed << std::setprecision(1) << elapsed << "s\n";
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "Pruner failed: " << e.what() << "\n";
+			return 1;
+		}
+	}
 
 	// Auto-scale thresholds
 	if (fanout_target <= 0)  fanout_target  = std::max(5000, num_workers * 1000);
@@ -495,7 +618,6 @@ int main(int argc, char** argv) {
 	auto t0 = std::chrono::steady_clock::now();
 
 	if (mode == "disk") {
-		set_pdedup_shared(pdedup_mode == 1);
 		fs::create_directories(output_dir);
 
 		std::vector<std::string> chunk_paths;
@@ -511,7 +633,7 @@ int main(int argc, char** argv) {
 			// Phase 1: BFS fan-out
 			std::cout << "Phase 1: BFS fan-out to " << fanout_target << " frontier states...\n";
 			std::vector<State> early_solutions;
-			std::vector<State> frontier = bfs_fanout(fanout_target, max_polygons, &early_solutions);
+			std::vector<PackedState> frontier = bfs_fanout(fanout_target, max_polygons, &early_solutions);
 			t1 = std::chrono::steady_clock::now();
 			std::cout << "  Done: " << frontier.size() << " frontier, "
 			          << early_solutions.size() << " early solutions  ("
@@ -530,15 +652,15 @@ int main(int argc, char** argv) {
 			std::cout << "  Early solutions written.\n";
 
 			// Write frontier as chunks
-			std::vector<std::vector<State>> chunks(n_chunks);
+			std::vector<std::vector<PackedState>> chunks(n_chunks);
 			for (size_t i = 0; i < frontier.size(); ++i)
 				chunks[i % n_chunks].push_back(std::move(frontier[i]));
-			{ std::vector<State>().swap(frontier); }
+			{ std::vector<PackedState>().swap(frontier); }
 
 			for (int ci = 0; ci < n_chunks; ++ci) {
 				if (chunks[ci].empty()) continue;
 				std::string cp = output_dir + "/chunk_" + std::to_string(ci) + ".bin";
-				write_states_bin(cp, chunks[ci]);
+				write_packed_states_bin(cp, chunks[ci]);
 				chunk_paths.push_back(cp);
 			}
 		} else {
@@ -728,15 +850,19 @@ int main(int argc, char** argv) {
 		for (const auto& cp : chunk_paths) fs::remove(cp);
 
 		auto t2 = std::chrono::steady_clock::now();
+		int64_t disk_partials = 0;
+		for (int w = 0; w < num_workers; ++w)
+			disk_partials += g_disk_partials[w].load(std::memory_order_relaxed);
 		std::cout << "Solver phase: " << std::fixed << std::setprecision(1)
-		          << std::chrono::duration<double>(t2 - t1).count() << "s\n";
+		          << std::chrono::duration<double>(t2 - t1).count() << "s ("
+		          << disk_partials << " partials)\n";
 
 		merge_worker_outputs(output_dir, worker_dirs);
 		for (const auto& wd : worker_dirs) fs::remove_all(wd);
 		compress_merged_solutions(output_dir);
 
 		std::cout << "Pruner phase starting...\n";
-		auto counts = run_pruner(output_dir, num_workers);
+		auto counts = run_pruner(output_dir, num_workers, output_format);
 		std::cout << "\nPruner phase:  " << std::fixed << std::setprecision(1)
 		          << std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count() << "s\n";
 		finish_notify(counts, output_dir, telegram_token, telegram_chat);
@@ -750,10 +876,10 @@ int main(int argc, char** argv) {
 			// Shared queue and per-worker output tracking
 			SharedQueue sq;
 			{
-				std::vector<State> init_batch;
+				std::vector<PackedState> init_batch;
 				for (int vt = 0; vt < NUM_VERTEX_TYPES; ++vt)
-					init_batch.push_back(EuclideanSolver::make_initial(vt));
-				sq.push_batch(init_batch);
+					init_batch.push_back(EuclideanSolver::pack_state(EuclideanSolver::make_initial(vt)));
+				sq.finish_batch(0, init_batch);
 			}
 
 			// Each worker writes to its own directory for thread safety
@@ -763,7 +889,7 @@ int main(int argc, char** argv) {
 
 			// Shared counters (updated by workers, read by progress thread)
 			std::atomic<int64_t> total_partials{0}, total_solutions{0};
-			std::atomic<int64_t> total_deduped{0}, total_sol_deduped{0};
+			std::atomic<int64_t> total_sol_deduped{0};
 			std::atomic<bool> solver_running{true};
 
 			std::thread progress(progress_thread_fn, std::ref(sq),
@@ -787,18 +913,21 @@ int main(int argc, char** argv) {
 						std::map<std::string,int> rt;
 						std::map<std::string,std::string> sf;
 						HistogramMap vc;
-						int64_t pd_seen = 0, pd_deduped = 0;
 						int64_t solutions = 0, sol_accepted = 0;
-						std::vector<State> local_batch;
+						std::vector<PackedState> local_batch;
+						std::vector<PackedState> packed_work;
 						std::vector<State> work_items;
 
 						while (true) {
-						int nb = sq.pop_batch(work_items);
+						int nb = sq.pop_batch(packed_work);
 						if (nb == 0) break;
+						work_items.clear();
+						work_items.reserve(packed_work.size());
+						for (const auto& packed : packed_work)
+							work_items.push_back(EuclideanSolver::unpack_state(packed));
 
 						local_batch.clear();
 						for (auto& st : work_items) {
-						total_partials.fetch_add(1);
 						EuclideanSolver::extend_into(st, [&](State&& cand) {
 								bool done = true;
 								for (const auto& d : cand.darts) if (d.glue == -1) { done = false; break; }
@@ -809,21 +938,18 @@ int main(int argc, char** argv) {
 								EuclideanSolver::write_solution_static(cand, wdir, mu,
 										rt, sf, vc);
 								} else {
-								++pd_seen;
-								local_batch.push_back(std::move(cand));
+								local_batch.push_back(EuclideanSolver::pack_state(cand));
 								}
 								}, max_polygons);
 						}
-						sq.done_one(nb);
-						sq.push_batch(local_batch);
+						sq.finish_batch(nb, local_batch);
+						total_partials.fetch_add(nb);
 						total_solutions.fetch_add(sol_accepted);
 						total_sol_deduped.fetch_add(solutions - sol_accepted);
-						total_deduped.fetch_add(pd_deduped);
-						solutions = 0; sol_accepted = 0; pd_deduped = 0;
+						solutions = 0; sol_accepted = 0;
 						}
 						total_solutions.fetch_add(sol_accepted);
 						total_sol_deduped.fetch_add(solutions - sol_accepted);
-						total_deduped.fetch_add(pd_deduped);
 				});
 			}
 			for (auto& t : threads) t.join();
@@ -832,21 +958,20 @@ int main(int argc, char** argv) {
 
 			int64_t tp = total_partials.load();
 			int64_t ts = total_solutions.load();
-			int64_t td = total_deduped.load();
 			int64_t tsd = total_sol_deduped.load();
 
 			auto t1 = std::chrono::steady_clock::now();
 			std::cout << "\nSolver phase: " << std::fixed << std::setprecision(1)
 				<< std::chrono::duration<double>(t1 - t0).count() << "s  ("
 				<< tp << " partials, " << ts
-				<< " sols, dd " << td << "/" << tsd << ")\n";
+				<< " sols, deduped " << tsd << ")\n";
 
 			merge_worker_outputs(output_dir, worker_dirs);
 			for (const auto& wd : worker_dirs) fs::remove_all(wd);
 			compress_merged_solutions(output_dir);
 
 			std::cout << "Pruner phase starting...\n";
-			auto counts = run_pruner(output_dir, num_workers);
+			auto counts = run_pruner(output_dir, num_workers, output_format);
 			auto t2 = std::chrono::steady_clock::now();
 			std::cout << "\nPruner phase:  " << std::fixed << std::setprecision(1)
 				<< std::chrono::duration<double>(t2 - t1).count() << "s\n";

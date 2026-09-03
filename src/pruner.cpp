@@ -1,9 +1,11 @@
 #include "pruner.h"
+#include "disk_solver.h"
 #include "solver.h"
 #include "vertex_catalog.h"
 #include "zstd_stream.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -11,6 +13,7 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 
@@ -18,21 +21,24 @@ namespace fs = std::filesystem;
 using namespace catalog;
 
 int g_wl_dim = 1;
-int g_wl_iters = 25;
+int g_wl_iters = 0;   // 0 = auto: iterate 1-WL to convergence (cap = n darts)
 bool g_use_bfl = false;
-bool g_compress_pruner_outputs = true;  // compress eupruned/euraw rolling outputs by default
+bool g_no_iso_check = false;
+bool g_keep_pruner_inputs = false;
+bool g_profile_pruner = false;
 
-static void compress(const std::string& path) {
-    std::string cmd = "zstd -c -q \"" + path + "\" >> \"" + path + ".zst\" && rm \"" + path + "\"";
-    std::system(cmd.c_str());
-}
+// Diagnostic counters (WL-hash collision rate).
+std::atomic<int64_t> g_wl_hash_hits{0};
+std::atomic<int64_t> g_wl_collisions{0};
+std::atomic<int64_t> g_solutions_match_calls{0};
+std::atomic<int> g_wl_max_iters{0};
+bool g_compress_pruner_outputs = true;  // compress rolling pruner output by default
 
-// Compress euraw.txt/eupruned.txt "on the go" instead of only once at the
+// Compress eupruned.txt on the go instead of only once at the
 // end: these are opened once per combo_code and streamed to for the whole
 // run, so left alone they can grow very large before ever getting
 // compressed. Neither file is ever read back within this program, so we
-// reuse exactly the same trick as compress() above (shell out to zstd,
-// append a new frame onto path.zst, drop the plain tail) — just triggered
+// append a new frame onto path.zst and drop the plain tail, just triggered
 // periodically on size instead of once at the end. zstd frames concatenate,
 // so decompressing path.zst afterward yields the full file regardless of
 // how many times it was flushed mid-run.
@@ -43,7 +49,11 @@ struct RollingCompressedWriter {
     std::ofstream out;
 
     explicit RollingCompressedWriter(std::string p)
-        : path(std::move(p)), out(path, std::ios::out | std::ios::trunc) {}
+        : path(std::move(p)) {
+        std::error_code ec;
+        fs::remove(path + ".zst", ec);
+        out.open(path, std::ios::out | std::ios::trunc);
+    }
 
     ~RollingCompressedWriter() { finish(); }
 
@@ -66,7 +76,7 @@ struct RollingCompressedWriter {
         auto sz = fs::file_size(path, ec);
         if (ec || (int64_t)sz < g_pruner_compress_threshold) return;
         out.close();
-        compress(path);                              // path -> path.zst (appended), path removed
+        compress_to_zst(path);                       // path -> path.zst (appended), path removed
         out.open(path, std::ios::out | std::ios::trunc);
     }
 
@@ -77,7 +87,7 @@ struct RollingCompressedWriter {
         if (!g_compress_pruner_outputs) return;
         std::error_code ec;
         if (fs::exists(path) && fs::file_size(path, ec) > 0)
-            compress(path);
+            compress_to_zst(path);
         else
             fs::remove(path, ec);   // drop empty leftover rather than leaving a stray .zst frame
     }
@@ -97,6 +107,36 @@ static char count_digit(int x) {
     if (x == 10) return 'a';
     if (x == 11) return 'b';
     return (char)('0' + x);
+}
+
+static std::string make_count_signature(const State& st) {
+    std::map<std::string, int> base_counts;
+    for (int t : st.vertype) {
+        const std::string& sym = symbols[t];
+        ++base_counts[sym.substr(0, sym.find(')') + 1)];
+    }
+
+    std::string result = std::to_string(base_counts.size());
+    std::vector<int> multiplicities;
+    for (const auto& [symbol, count] : base_counts) multiplicities.push_back(count);
+    std::sort(multiplicities.begin(), multiplicities.end(), std::greater<int>());
+    if (std::any_of(multiplicities.begin(), multiplicities.end(), [](int n) { return n > 1; })) {
+        result += " (";
+        for (int n : multiplicities) result += count_digit(n);
+        result += ")";
+    }
+    return result;
+}
+
+static void materialize_output_fields(SolutionPruner::SolutionRecord& rec) {
+    if (rec.vertex_line.empty()) {
+        rec.vertex_line = verbal_vertices(rec.state.vertype);
+        rec.signature_line = signature(rec.state.vertype);
+        rec.conway_line = write_conway(rec.state);
+        rec.tes_line = "eu raw " + file_signature(rec.state.vertype) + " "
+                     + std::to_string(rec.solution_index) + ".tes";
+    }
+    rec.count_signature = make_count_signature(rec.state);
 }
 
 // =============================================================================
@@ -153,9 +193,8 @@ static std::tuple<bool, int, int> decipher_edge(const std::string& text) {
 // =============================================================================
 // Cycle final writer  (ConwayCycleWriter.write_cycle_final)
 // =============================================================================
-void write_cycle_final(const State& st, std::ostream& out,
-                        const std::string& tes_path,
-                        const std::string& solution_label) {
+CanonicalTilingOutput build_canonical_tiling_output(const State& st) {
+    CanonicalTilingOutput output;
     int n = (int)st.darts.size();
     std::vector<int> seen(n, 0);
     std::vector<std::string> mainst_list;
@@ -216,18 +255,16 @@ void write_cycle_final(const State& st, std::ostream& out,
     for (int m = 0; m < (int)mainst_list.size(); ++m) {
         int sub = sublist[m];
         if (sub == 0) {
-            out << m << ": " << mainst_list[m];
+            output.cycle_lines.push_back(std::to_string(m) + ": " + mainst_list[m]);
         } else if (sub == 1) {
             std::string hdr = ultra_chiral ? std::to_string(m/2) + ": "
                                            : std::to_string(m) + "/" + std::to_string(m+1) + ": ";
             subheader = std::string(hdr.size(), ' ');
-            out << hdr << mainst_list[m];
+            output.cycle_lines.push_back(hdr + mainst_list[m]);
         } else {
-            out << subheader << mainst_list[m];
+            output.cycle_lines.push_back(subheader + mainst_list[m]);
         }
-        out << "\n";
     }
-    out << "---\n";
 
     // Build assembled Conway string
     bool is_chiral = ultra_chiral;
@@ -310,32 +347,39 @@ void write_cycle_final(const State& st, std::ostream& out,
             edges.erase(edges.begin());
         }
     }
-    out << conway_str << "\n";
+    output.conway = conway_str;
+    output.geometry = mortier_geometry::make_tiling_description(
+        poly_size_list, work_reps, conway_str);
+    return output;
+}
 
-    // Write .tes file
-    {
-        fs::path tpath(tes_path);
-        fs::create_directories(tpath.parent_path());
-        std::ofstream tes(tes_path);
-        tes << "## Euclidean, " << solution_label << "\n";
-        tes << "e2.\n";
-        tes << "angleunit(deg)\n";
-        for (int sz : poly_size_list) {
-            int angle = 180 - 360 / sz;
-            std::string angles;
-            for (int k = 0; k < sz; ++k) {
-                if (k) angles += ",";
-                angles += std::to_string(angle);
-            }
-            tes << "unittile(" << angles << ")\n";
+void write_cycle_final(const State& st, std::ostream& out,
+                        TesStore* tes_store, const std::string& combo,
+                        const std::string& tes_filename,
+                        const std::string& solution_label) {
+    CanonicalTilingOutput output = build_canonical_tiling_output(st);
+    for (const std::string& line : output.cycle_lines) out << line << "\n";
+    out << "---\n" << output.conway << "\n";
+    if (!tes_store) return;
+
+    std::ostringstream tes;
+    tes << "## Euclidean, " << solution_label << "\n";
+    tes << "e2.\n";
+    tes << "angleunit(deg)\n";
+    for (int sz : output.geometry.polygon_sides) {
+        int angle = 180 - 360 / sz;
+        std::string angles;
+        for (int k = 0; k < sz; ++k) {
+            if (k) angles += ",";
+            angles += std::to_string(angle);
         }
-        tes << "conway(\"" << conway_str << "\")\n";
-        for (size_t i = 0; i < work_reps.size(); ++i)
-            if (work_reps[i] > 1)
-                tes << "repeat(" << i << "," << work_reps[i] << ")\n";
+        tes << "unittile(" << angles << ")\n";
     }
-		compress(tes_path);
-		
+    tes << "conway(\"" << output.conway << "\")\n";
+    for (size_t i = 0; i < output.geometry.repeats.size(); ++i)
+        if (output.geometry.repeats[i] > 1)
+            tes << "repeat(" << i << "," << output.geometry.repeats[i] << ")\n";
+    tes_store->add(combo, solution_label, tes_filename, tes.str());
 }
 
 // =============================================================================
@@ -443,57 +487,43 @@ State SolutionPruner::decode_solution(const std::string& vertex_line,
 
 // ---------------------------------------------------------------------------
 // read_next_solution — streaming parser, reads one solution from file
-// Returns true if a solution was read, false on EOF or parse error.
+// Returns true if a solution was read and false only on clean EOF.
 // ---------------------------------------------------------------------------
 bool read_next_solution(std::istream& in, SolutionPruner::SolutionRecord& rec) {
     std::string line;
+    bool saw_nonempty = false;
 
     // Find next "Number of polygons:" line
     while (std::getline(in, line)) {
         if (line.rfind("Number of polygons:", 0) == 0) break;
+        if (!line.empty()) saw_nonempty = true;
     }
-    if (in.eof() || in.fail()) return false;
+    if (in.bad()) throw std::runtime_error("failed while reading text solution stream");
+    if (in.eof()) {
+        if (saw_nonempty) throw std::runtime_error("unexpected trailing text in solution stream");
+        return false;
+    }
+    if (in.fail()) throw std::runtime_error("failed while scanning text solution stream");
 
     // Read the 4 fixed header lines
-    if (!std::getline(in, rec.vertex_line))    return false;
-    if (!std::getline(in, rec.signature_line)) return false;
-    if (!std::getline(in, rec.tes_line))       return false;
-    if (!std::getline(in, rec.conway_line))    return false;
+    if (!std::getline(in, rec.vertex_line)
+            || !std::getline(in, rec.signature_line)
+            || !std::getline(in, rec.tes_line)
+            || !std::getline(in, rec.conway_line))
+        throw std::runtime_error("truncated text solution header");
 
     // Skip cycle description lines until "---"
     while (std::getline(in, line)) {
         if (!line.empty() && line[0] == '-' && line == "---") break;
     }
+    if (line != "---") throw std::runtime_error("truncated text solution cycles");
 
     // Skip assembled conway and blank line
-    if (!std::getline(in, line)) return false; // assembled conway
-    if (!std::getline(in, line)) return false; // blank line (or next header)
+    if (!std::getline(in, line)) throw std::runtime_error("missing assembled Conway symbol");
+    if (!std::getline(in, line) && !in.eof())
+        throw std::runtime_error("failed after text solution record");
 
     rec.state = SolutionPruner::decode_solution(rec.vertex_line, rec.conway_line);
-
-    // Compute count_signature
-    {
-        std::vector<int> vt = rec.state.vertype;
-        std::map<std::string, int> base_counts;
-        for (int t : vt) {
-            const std::string& sym = symbols[t];
-            std::string base = sym.substr(0, sym.find(')') + 1);
-            ++base_counts[base];
-        }
-        std::string cs = std::to_string(base_counts.size());
-        std::vector<int> mults;
-        for (const auto& [s, c] : base_counts)
-            mults.push_back(c);
-        std::sort(mults.begin(), mults.end(), std::greater<int>());
-        bool any_gt_1 = false;
-        for (int m : mults) if (m > 1) any_gt_1 = true;
-        if (any_gt_1) {
-            cs += " (";
-            for (int m : mults) cs += count_digit(m);
-            cs += ")";
-        }
-        rec.count_signature = cs;
-    }
 
     return true;
 }
@@ -504,61 +534,18 @@ bool read_next_solution(std::istream& in, SolutionPruner::SolutionRecord& rec) {
 // ---------------------------------------------------------------------------
 bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& rec,
                              int& sol_idx) {
-    if (!in.good() || in.peek() == EOF) return false;
-
-    uint8_t nv; in.read((char*)&nv, 1);
-    uint8_t ne; in.read((char*)&ne, 1);
-    if (in.fail() || nv == 0 || ne == 0) return false;
-
-    std::vector<int> vertype(nv);
-    for (int i = 0; i < nv; ++i) {
-        uint8_t v; in.read((char*)&v, 1);
-        if (in.fail()) return false;
-        vertype[i] = (int)v;
+    if (in.peek() == EOF) {
+        if (in.bad()) throw std::runtime_error("failed while reading binary solution stream");
+        return false;
     }
 
-    std::vector<int> glue(ne);
-    for (int i = 0; i < ne; ++i) {
-        int16_t g; in.read((char*)&g, 2);
-        if (in.fail()) return false;
-        glue[i] = (int)g;
-    }
-
-    State st = EuclideanSolver::rebuild_from_vertype_glue(vertype, glue);
-    if (st.darts.empty()) return false;
+    State st = read_state_bin(in);
+    for (const Dart& d : st.darts)
+        if (d.glue < 0)
+            throw std::runtime_error("binary solution contains an unglued dart");
 
     rec.state = std::move(st);
-    rec.vertex_line    = verbal_vertices(rec.state.vertype);
-    rec.signature_line = signature(rec.state.vertype);
-    rec.conway_line    = write_conway(rec.state);
-
-    std::string filesig = file_signature(rec.state.vertype);
-    ++sol_idx;
-    rec.tes_line = "eu raw " + filesig + " " + std::to_string(sol_idx) + ".tes";
-
-    // count_signature
-    {
-        std::vector<int> vt = rec.state.vertype;
-        std::map<std::string, int> base_counts;
-        for (int t : vt) {
-            const std::string& sym = symbols[t];
-            std::string base = sym.substr(0, sym.find(')') + 1);
-            ++base_counts[base];
-        }
-        std::string cs = std::to_string(base_counts.size());
-        std::vector<int> mults;
-        for (const auto& [s, c] : base_counts)
-            mults.push_back(c);
-        std::sort(mults.begin(), mults.end(), std::greater<int>());
-        bool any_gt_1 = false;
-        for (int m : mults) if (m > 1) any_gt_1 = true;
-        if (any_gt_1) {
-            cs += " (";
-            for (int m : mults) cs += count_digit(m);
-            cs += ")";
-        }
-        rec.count_signature = cs;
-    }
+    rec.solution_index = ++sol_idx;
 
     return true;
 }
@@ -567,11 +554,40 @@ bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& re
 // is_canonical_labeling — bit-set alias refinement (O(1) membership)
 // ---------------------------------------------------------------------------
 using BS4 = std::array<uint64_t, 4>;
-static inline void bs4_set (BS4& b, int i)    { b[i>>6] |=  (1ULL << (i&63)); }
-static inline bool bs4_get (const BS4& b, int i) { return (b[i>>6] >> (i&63)) & 1; }
-static inline bool bs4_singleton(const BS4& b, int n) {
+struct AliasRows {
+    int n;
+    int nw;
+    std::vector<BS4>& small;
+    std::vector<uint64_t>& large;
+
+    uint64_t* operator[](int i) {
+        return n <= 256 ? small[i].data() : large.data() + (size_t)i * nw;
+    }
+    const uint64_t* operator[](int i) const {
+        return n <= 256 ? small[i].data() : large.data() + (size_t)i * nw;
+    }
+};
+
+static AliasRows alias_rows(int n, int nw, std::vector<BS4>& small,
+                            std::vector<uint64_t>& large) {
+    if (n <= 256) {
+        if ((int)small.size() < n) small.resize(n);
+    } else {
+        large.resize((size_t)n * nw);
+    }
+    return {n, nw, small, large};
+}
+
+static inline bool alias_get(const AliasRows& alias, int row, int i) {
+    return row >= 0 && row < alias.n && i >= 0 && i < alias.n
+        && ((alias[row][i >> 6] >> (i & 63)) & 1);
+}
+static inline bool alias_singleton(const AliasRows& alias, int row) {
     int c = 0;
-    for (int w = 0; w < (n+63)/64; ++w) { c += __builtin_popcountll(b[w]); if (c > 1) return false; }
+    for (int w = 0; w < alias.nw; ++w) {
+        c += __builtin_popcountll(alias[row][w]);
+        if (c > 1) return false;
+    }
     return c == 1;
 }
 
@@ -579,9 +595,9 @@ std::pair<bool, std::string> SolutionPruner::is_canonical_labeling(const State& 
     int n = (int)st.darts.size();
     int nw = (n + 63) / 64;
 
-    static thread_local std::vector<BS4> alias_buf;
-    if ((int)alias_buf.size() < n) alias_buf.resize(n);
-    BS4* alias = alias_buf.data();
+    static thread_local std::vector<BS4> alias_small;
+    static thread_local std::vector<uint64_t> alias_large;
+    AliasRows alias = alias_rows(n, nw, alias_small, alias_large);
 
     // Initialise: all candidates {0..n-1}
     for (int i = 0; i < n; ++i) {
@@ -601,18 +617,18 @@ std::pair<bool, std::string> SolutionPruner::is_canonical_labeling(const State& 
                     int bit = __builtin_ctzll(bits); bits &= bits - 1;
                     int j = w * 64 + bit; if (j == i) continue;
                     if (st.darts[i].polygon_size != st.darts[j].polygon_size
-                        || !bs4_get(alias[j], i)
-                        || !bs4_get(alias[st.darts[i].mirro], st.darts[j].mirro)
-                        || !bs4_get(alias[st.darts[i].glue],  st.darts[j].glue)
-                        || !bs4_get(alias[st.darts[i].rneig], st.darts[j].rneig)
-                        || !bs4_get(alias[st.darts[i].lneig], st.darts[j].lneig))
+                        || !alias_get(alias, j, i)
+                        || !alias_get(alias, st.darts[i].mirro, st.darts[j].mirro)
+                        || !alias_get(alias, st.darts[i].glue, st.darts[j].glue)
+                        || !alias_get(alias, st.darts[i].rneig, st.darts[j].rneig)
+                        || !alias_get(alias, st.darts[i].lneig, st.darts[j].lneig))
                     {
                         alias[i][w] &= ~(1ULL << bit);
                         changed = true;
                     }
                 }
             }
-            if (bs4_singleton(alias[i], n))
+            if (alias_singleton(alias, i))
                 unique[i] = true;
         }
     }
@@ -623,25 +639,9 @@ std::pair<bool, std::string> SolutionPruner::is_canonical_labeling(const State& 
 
     if (all_unique) return {true, ""};
 
-    // Debug log
-    std::vector<int> seen(n, 0);
-    std::string log;
-    for (int i = 0; i < n; ++i) {
-        if (seen[i]) continue;
-        int cnt = 0;
-        for (int w = 0; w < nw; ++w) cnt += __builtin_popcountll(alias[i][w]);
-        if (cnt <= 1) continue;
-        log += (log.empty() ? "" : " ") + std::string("[");
-        bool first = true;
-        for (int j = 0; j < n; ++j) {
-            if (bs4_get(alias[i], j)) {
-                if (!first) log += "/";
-                log += rebuild_label(j, st.vertype); first = false; seen[j] = 1;
-            }
-        }
-        log += "]";
-    }
-    return {false, log + "\n"};
+    // The caller only needs the decision. Building labels for every rejected
+    // solution was a significant allocation-heavy hot path.
+    return {false, ""};
 }
 
 // ---------------------------------------------------------------------------
@@ -650,124 +650,44 @@ std::pair<bool, std::string> SolutionPruner::is_canonical_labeling(const State& 
 std::pair<bool, std::string> SolutionPruner::solutions_match(const State& a, const State& b) {
     int n = (int)a.darts.size();
     if ((int)b.darts.size() != n) return {false, ""};
+    if (n == 0) return {true, ""};
 
-    int total = 2 * n;
-    int nw = (total + 63) / 64;
+    static thread_local std::vector<int> map_ab, map_ba, queue;
+    map_ab.resize(n);
+    map_ba.resize(n);
+    queue.resize(n);
 
-    // Flat bit-set alias: alias[i*nw + w] = bits [w*64, w*64+64) of alias[i].
-    // This is O(total^2 / 64) memory instead of O(total^2) heap nodes for
-    // std::set — the old version allocated ~2n^2 set nodes per call, which
-    // exploded the heap at high k.
-    std::vector<uint64_t> alias((size_t)total * nw, 0);
-
-    auto set_bit   = [&](int i, int j) { alias[(size_t)i * nw + (j >> 6)] |=  (1ULL << (j & 63)); };
-    auto get_bit   = [&](int i, int j) -> bool { return (alias[(size_t)i * nw + (j >> 6)] >> (j & 63)) & 1ULL; };
-    auto clear_bit = [&](int i, int j) { alias[(size_t)i * nw + (j >> 6)] &= ~(1ULL << (j & 63)); };
-    auto count_bits = [&](int i) -> int {
-        int c = 0;
-        for (int w = 0; w < nw; ++w) c += __builtin_popcountll(alias[(size_t)i * nw + w]);
-        return c;
+    auto assign = [&](int ai, int bi, int& tail) {
+        if (map_ab[ai] != -1 || map_ba[bi] != -1)
+            return map_ab[ai] == bi && map_ba[bi] == ai;
+        if (a.darts[ai].polygon_size != b.darts[bi].polygon_size) return false;
+        map_ab[ai] = bi;
+        map_ba[bi] = ai;
+        queue[tail++] = ai;
+        return true;
     };
 
-    // alias[i] for i in 0..n-1: {i} ∪ {n .. 2n-1}
-    // alias[i] for i in n..2n-1: {i} ∪ {0 .. n-1}
-    for (int i = 0; i < n; ++i) {
-        set_bit(i, i);
-        for (int j = n; j < total; ++j) set_bit(i, j);
-    }
-    for (int i = n; i < total; ++i) {
-        set_bit(i, i);
-        for (int j = 0; j < n; ++j) set_bit(i, j);
-    }
+    for (int root_b = 0; root_b < n; ++root_b) {
+        if (a.darts[0].polygon_size != b.darts[root_b].polygon_size) continue;
+        std::fill(map_ab.begin(), map_ab.end(), -1);
+        std::fill(map_ba.begin(), map_ba.end(), -1);
+        int head = 0, tail = 0;
+        if (!assign(0, root_b, tail)) continue;
 
-    // Build combined arrays
-    std::vector<int> rneig(total), lneig(total), poly(total), mirro(total), glue(total);
-    for (int i = 0; i < n; ++i) {
-        rneig[i] = a.darts[i].rneig;
-        lneig[i] = a.darts[i].lneig;
-        poly[i]  = a.darts[i].polygon_size;
-        mirro[i] = a.darts[i].mirro;
-        glue[i]  = a.darts[i].glue;
-    }
-    for (int i = 0; i < n; ++i) {
-        rneig[n+i] = n + b.darts[i].rneig;
-        lneig[n+i] = n + b.darts[i].lneig;
-        poly[n+i]  = b.darts[i].polygon_size;
-        mirro[n+i] = n + b.darts[i].mirro;
-        glue[n+i]  = n + b.darts[i].glue;
-    }
-    auto label_of = [&](int i) -> std::string {
-        if (i < n) return rebuild_label(i, a.vertype);
-        return rebuild_label(i - n, b.vertype);
-    };
-
-    std::vector<bool> unique(total, false);
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (int i = 0; i < total; ++i) {
-            for (int w = 0; w < nw; ++w) {
-                uint64_t word = alias[(size_t)i * nw + w];
-                while (word) {
-                    int bit = __builtin_ctzll(word);
-                    int j = w * 64 + bit;
-                    word &= word - 1;
-                    if (j >= total) continue;
-                    if (poly[i] != poly[j]
-                        || !get_bit(j, i)
-                        || !get_bit(mirro[i], mirro[j])
-                        || !get_bit(glue[i], glue[j])
-                        || !get_bit(rneig[i], rneig[j])
-                        || !get_bit(lneig[i], lneig[j]))
-                    {
-                        clear_bit(i, j);
-                        changed = true;
-                    }
-                }
-            }
-            if (count_bits(i) == 1)
-                unique[i] = true;
+        bool valid = true;
+        while (head < tail && valid) {
+            int ai = queue[head++];
+            int bi = map_ab[ai];
+            const Dart& ad = a.darts[ai];
+            const Dart& bd = b.darts[bi];
+            valid = assign(ad.rneig, bd.rneig, tail)
+                 && assign(ad.lneig, bd.lneig, tail)
+                 && assign(ad.mirro, bd.mirro, tail)
+                 && assign(ad.glue, bd.glue, tail);
         }
+        if (valid && tail == n) return {true, ""};
     }
-
-    bool all_unique = true;
-    for (int i = 0; i < total; ++i)
-        if (!unique[i]) { all_unique = false; break; }
-
-    // _solutions_match returns True when NOT all unique (= isomorphic)
-    bool is_isomorphic = !all_unique;
-
-    std::string log;
-    if (is_isomorphic) {
-        std::vector<char> seen(total, 0);
-        std::vector<std::string> groups;
-        for (int i = 0; i < total; ++i) {
-            if (seen[i] || count_bits(i) <= 1) continue;
-            std::string g = "[";
-            bool first = true;
-            for (int w = 0; w < nw; ++w) {
-                uint64_t word = alias[(size_t)i * nw + w];
-                while (word) {
-                    int bit = __builtin_ctzll(word);
-                    int j = w * 64 + bit;
-                    word &= word - 1;
-                    if (j >= total) continue;
-                    if (!first) g += "=";
-                    g += label_of(j);
-                    first = false;
-                    seen[j] = 1;
-                }
-            }
-            g += "]";
-            groups.push_back(g);
-        }
-        for (size_t k = 0; k < groups.size(); ++k) {
-            if (k) log += " ";
-            log += groups[k];
-        }
-        log += "\n";
-    }
-    return {is_isomorphic, log};
+    return {false, ""};
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +711,7 @@ bool OnlineDedup::check_and_remember(const State& st) {
     if (stored_ >= cap_) { seen_wl_.clear(); stored_ = 0; }
     auto it = seen_wl_.find(h);
     if (it != seen_wl_.end()) {
+        if (g_no_iso_check) return true;   // trust the WL hash, skip isomorphism fallback
         for (const auto& kept : it->second) {
             State k = EuclideanSolver::unpack_state(kept);
             if (SolutionPruner::solutions_match(st, k).first) return true;
@@ -809,6 +730,16 @@ static inline uint64_t fnv64(uint64_t h, uint64_t x) {
     return (h ^ x) * 1099511628211ULL;
 }
 
+static int count_distinct(const std::vector<uint64_t>& v) {
+    if (v.empty()) return 0;
+    std::vector<uint64_t> s = v;
+    std::sort(s.begin(), s.end());
+    int c = 1;
+    for (size_t i = 1; i < s.size(); ++i)
+        if (s[i] != s[i - 1]) ++c;
+    return c;
+}
+
 std::string wl_hash(const State& st, int iterations) {
     int n = (int)st.darts.size();
     if (n == 0) return "";
@@ -825,10 +756,18 @@ std::string wl_hash(const State& st, int iterations) {
     for (int i = 0; i < n; ++i)
         labels[i] = fnv64(14695981039346656037ULL, (uint64_t)(uint32_t)st.darts[i].polygon_size);
 
-		if (iterations <= 0) iterations = 3;
+    // 1-WL colour refinement converges once the number of distinct colours
+    // stops growing (each round strictly refines the partition otherwise),
+    // which happens in at most n rounds.  Iterate to convergence so the hash
+    // is as discriminating as 1-WL can be — enough iterations eliminates
+    // hash collisions at large k (see collision-rate diagnostics).
+    int cap = iterations > 0 ? iterations : (g_wl_iters > 0 ? g_wl_iters : n);
+    if (cap > n) cap = n;
 
     std::vector<uint64_t> new_labels(n);
-    for (int iter = 0; iter < iterations; ++iter) {
+    int prev_distinct = count_distinct(labels);
+    int used = 0;
+    for (int iter = 0; iter < cap; ++iter) {
         for (int i = 0; i < n; ++i) {
             uint64_t typed[4] = {
                 fnv64(0x0000000000000001ULL, labels[st.darts[i].rneig]),
@@ -842,7 +781,15 @@ std::string wl_hash(const State& st, int iterations) {
             new_labels[i] = h;
         }
         std::swap(labels, new_labels);
+        ++used;
+        int distinct = count_distinct(labels);
+        if (distinct == prev_distinct) break;   // converged
+        prev_distinct = distinct;
     }
+    int u = used;
+    int cur = g_wl_max_iters.load(std::memory_order_relaxed);
+    while (u > cur && !g_wl_max_iters.compare_exchange_weak(cur, u, std::memory_order_relaxed))
+        ;
 
     // Canonical 32-byte hash of sorted multiset
     std::sort(labels.begin(), labels.end());
@@ -871,7 +818,7 @@ std::string wl_hash_partial(const State& st, int iterations) {
         if (st.darts[i].lneig < 0 || st.darts[i].lneig >= n) return "";
         if (st.darts[i].mirro < 0 || st.darts[i].mirro >= n) return "";
     }
-    if (iterations <= 0) iterations = g_wl_iters;
+    if (iterations <= 0) iterations = (g_wl_iters > 0 ? g_wl_iters : n);
 
     std::vector<uint64_t> labels(n);
     for (int i = 0; i < n; ++i)
@@ -928,6 +875,7 @@ std::string wl_hash_2(const State& st, int iterations) {
         if (st.darts[i].lneig < 0 || st.darts[i].lneig >= n) return "";
         if (st.darts[i].mirro < 0 || st.darts[i].mirro >= n) return "";
     }
+    if (iterations <= 0) iterations = 25;   // 2-WL is O(n^3)/iter: keep a fixed default
 
     std::vector<uint64_t> colours(n * n);
     for (int i = 0; i < n; ++i) {
@@ -981,77 +929,6 @@ std::string wl_hash_2(const State& st, int iterations) {
     return out;
 }
 
-// =============================================================================
-// Orbit filter for partial states during search
-// =============================================================================
-std::vector<bool> compute_orbit_canonicals(const State& st, bool mirrored) {
-    int n = (int)st.darts.size();
-    int nw = (n + 63) / 64;
-
-    // Run bit-set alias refinement to find automorphism orbits
-    static thread_local std::vector<BS4> alias_buf;
-    if ((int)alias_buf.size() < n) alias_buf.resize(n);
-    BS4* alias = alias_buf.data();
-
-    for (int i = 0; i < n; ++i) {
-        for (int w = 0; w < nw; ++w) alias[i][w] = ~0ULL;
-        int rem = n & 63;
-        if (rem) alias[i][nw-1] &= (1ULL << rem) - 1;
-    }
-
-    static thread_local std::vector<uint8_t> dirty;
-    static thread_local std::vector<int> worklist;
-    if ((int)dirty.size() < n)  dirty.resize(n, 0);
-    if ((int)worklist.size() < n) worklist.resize(n);
-    int wl = n;
-    for (int i = 0; i < n; ++i) { dirty[i] = 1; worklist[i] = i; }
-
-    while (wl > 0) {
-        int nwl = 0;
-        for (int wi = 0; wi < wl; ++wi) {
-            int i = worklist[wi]; dirty[i] = 0;
-            for (int w = 0; w < nw; ++w) {
-                uint64_t bits = alias[i][w];
-                while (bits) {
-                    int bit = __builtin_ctzll(bits); bits &= bits - 1;
-                    int j = w * 64 + bit; if (j == i) continue;
-                    if (st.darts[i].polygon_size != st.darts[j].polygon_size
-                        || !bs4_get(alias[j], i)
-                        || !bs4_get(alias[st.darts[i].mirro], st.darts[j].mirro)
-                        || !bs4_get(alias[st.darts[i].glue],  st.darts[j].glue)
-                        || !bs4_get(alias[st.darts[i].rneig], st.darts[j].rneig)
-                        || !bs4_get(alias[st.darts[i].lneig], st.darts[j].lneig))
-                    {
-                        alias[i][w] &= ~(1ULL << bit);
-                        if (!dirty[j]) { dirty[j] = 1; worklist[nwl++] = j; }
-                        if (!dirty[i]) { dirty[i] = 1; worklist[nwl++] = i; }
-                        goto next_orbit;
-                    }
-                }
-            }
-            next_orbit:;
-        }
-        wl = nwl;
-    }
-
-    // Now find canonical representatives among FREE edges with matching mirror type
-    std::vector<bool> canonical(n, false);
-    for (int i = 0; i < n; ++i) {
-        if (st.darts[i].glue != -1) continue;
-        if ((st.darts[i].mirro == i) != mirrored) continue;
-        // Check if any j < i in the same orbit is also free and matching
-        bool has_earlier = false;
-        for (int j = 0; j < i; ++j) {
-            if (st.darts[j].glue != -1) continue;
-            if ((st.darts[j].mirro == j) != mirrored) continue;
-            if (bs4_get(alias[i], j)) { has_earlier = true; break; }
-        }
-        if (!has_earlier) canonical[i] = true;
-    }
-    return canonical;
-}
-
-// =============================================================================
 // DiskWordIndex — exact disk-backed canonical-word set
 // =============================================================================
 static uint64_t word_hash(const std::vector<int>& w) {
@@ -1095,9 +972,15 @@ bool DiskWordIndex::contains(const std::vector<int>& w) {
 // =============================================================================
 // WLPruner
 // =============================================================================
-WLPruner::WLPruner(const std::string& output_dir, int num_workers)
+WLPruner::WLPruner(const std::string& output_dir, int num_workers,
+                   FinalOutputFormat format)
     : SolutionPruner(output_dir), solutions_words_(output_dir + "/words.bin"),
-      num_workers_(num_workers) {}
+      num_workers_(num_workers), format_(format) {
+    if (format_ == FinalOutputFormat::Tes)
+        tes_store_ = std::make_unique<TesStore>(output_dir + "/tilings.sqlite3.tmp");
+    else if (format_ == FinalOutputFormat::Mortier)
+        mortier_store_ = std::make_unique<MortierStore>(output_dir + "/tilings.sqlite3.tmp");
+}
 
 void WLPruner::run(const std::vector<std::string>& listfile_paths) {
     fs::create_directories(output_dir_);
@@ -1115,9 +998,30 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
         }
         process_file_wl(listfile_paths[i]);
     }
+    if (tes_store_) {
+        tes_store_->finish();
+        fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
+    }
+    if (mortier_store_) {
+        mortier_store_->finish();
+        fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
+    }
+    if (!g_keep_pruner_inputs) {
+        for (const auto& path : listfile_paths) {
+            std::error_code ec;
+            fs::remove(path, ec);
+            if (ec) std::cerr << "  warning: could not remove pruned input " << path
+                              << ": " << ec.message() << "\n";
+        }
+    }
     if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
     if (g_use_bfl) {
         std::cerr << "  BFL words: " << solutions_words_.size() << " unique\n";
+    } else {
+        std::cerr << "  WL diag: hash_hits=" << g_wl_hash_hits.load()
+                  << " collisions=" << g_wl_collisions.load()
+                  << " iso_calls=" << g_solutions_match_calls.load()
+                  << " max_iters=" << g_wl_max_iters.load() << "\n";
     }
 }
 
@@ -1125,13 +1029,18 @@ WLPruner::CanonicalResult WLPruner::compute_canonical_and_wl(const State& st) co
     CanonicalResult r;
     auto [ok, log] = is_canonical_labeling(st);
     r.is_canonical = ok;
-    r.canon_log = log;
-    r.wl_hash = ok ? wl_hash_dispatch(st) : "";
+    (void)log;
+    if (ok) {
+        if (g_use_bfl)
+            r.bfl_word = bfl_word_signature(st);
+        else
+            r.wl_hash = wl_hash_dispatch(st);
+    }
     return r;
 }
 
 void WLPruner::process_file_wl(const std::string& path) {
-    if (!fs::exists(path)) return;
+    if (!fs::exists(path)) throw std::runtime_error("solution input disappeared: " + path);
 
     std::string fname = fs::path(path).filename().string();
     std::string combo_code = fname;
@@ -1155,11 +1064,17 @@ void WLPruner::process_file_wl(const std::string& path) {
     if (has_zst_suffix(base)) base.resize(base.size() - 4);
     bool is_bin = (base.size() > 4 && base.substr(base.size() - 4) == ".bin");
     auto in = open_solution_istream(path);
-    if (!in) return;
+    if (!in) throw std::runtime_error("cannot open solution input: " + path);
     std::istream& in_ref = *in;
     int sol_idx = 0;
+    using Clock = std::chrono::steady_clock;
+    std::chrono::nanoseconds decode_time{0};
+    std::chrono::nanoseconds compute_time{0};
+    std::chrono::nanoseconds consume_time{0};
+    int64_t records = 0;
 
     while (true) {
+        auto stage_start = Clock::now();
         batch.clear();
         results.clear();
         SolutionRecord rec;
@@ -1183,10 +1098,13 @@ void WLPruner::process_file_wl(const std::string& path) {
             batch.push_back(std::move(rec2));
         }
         if (batch.empty()) break;
+        decode_time += Clock::now() - stage_start;
+        records += (int64_t)batch.size();
 
         int n = (int)batch.size();
         results.resize(n);
 
+        stage_start = Clock::now();
         if (num_workers_ <= 1 || n < 10) {
             for (int i = 0; i < n; ++i)
                 results[i] = compute_canonical_and_wl(batch[i].state);
@@ -1205,7 +1123,9 @@ void WLPruner::process_file_wl(const std::string& path) {
             }
             for (auto& t : threads) t.join();
         }
+        compute_time += Clock::now() - stage_start;
 
+        stage_start = Clock::now();
         for (int i = 0; i < n; ++i) {
             auto& rec2 = batch[i];
             auto& r = results[i];
@@ -1216,7 +1136,7 @@ void WLPruner::process_file_wl(const std::string& path) {
                 // Exact disk-backed canonical-word dedup.  The canonical word
                 // (lex-min over all starting darts) identifies the tiling up to
                 // isomorphism (Theorem 1); words live on disk, hashes in RAM.
-                auto word = bfl_word_signature(rec2.state);
+                const auto& word = r.bfl_word;
                 if (!word.empty()) {
                     if (solutions_words_.contains(word)) {
                         is_dup = true;
@@ -1227,22 +1147,33 @@ void WLPruner::process_file_wl(const std::string& path) {
             } else {
                 auto it = solutions_by_hash_.find(r.wl_hash);
                 if (it != solutions_by_hash_.end()) {
-                    for (const auto& stored : it->second) {
-                        State stored_st = EuclideanSolver::unpack_state(stored);
-                        if (solutions_match(rec2.state, stored_st).first) {
-                            is_dup = true;
-                            break;
+                    g_wl_hash_hits++;
+                    if (g_no_iso_check) {
+                        is_dup = true;   // trust the WL hash, skip isomorphism fallback
+                    } else {
+                        for (const auto& stored : it->second) {
+                            State stored_st = EuclideanSolver::unpack_state(stored);
+                            g_solutions_match_calls++;
+                            if (solutions_match(rec2.state, stored_st).first) {
+                                is_dup = true;
+                                break;
+                            }
                         }
+                        if (!is_dup) g_wl_collisions++;
                     }
                 }
             }
             if (is_dup) continue;
 
-            if (!g_use_bfl)
-                solutions_by_hash_[r.wl_hash].push_back(EuclideanSolver::pack_state(rec2.state));
+            if (!g_use_bfl) {
+                if (g_no_iso_check) solutions_by_hash_.try_emplace(r.wl_hash);  // track key only
+                else solutions_by_hash_[r.wl_hash].push_back(EuclideanSolver::pack_state(rec2.state));
+            }
             int k = (int)rec2.state.vertype.size();
             auto kit = solutions_per_k_.find(k);
             solutions_per_k_[k] = (kit != solutions_per_k_.end() ? kit->second + 1 : 1);
+
+            materialize_output_fields(rec2);
 
             std::string tes_line_raw = rec2.tes_line;
             size_t eu_pos = tes_line_raw.find("eu");
@@ -1252,8 +1183,6 @@ void WLPruner::process_file_wl(const std::string& path) {
             std::string tes_filename = old_rel;
             if (tes_filename.find("eu raw ") == 0)
                 tes_filename = "eu " + tes_filename.substr(7);
-            std::string tes_path = out_dir + "/" + tes_filename;
-
             std::string sig_raw = rec2.signature_line;
             while (!sig_raw.empty() && (sig_raw.back() == '\n' || sig_raw.back() == '\r'))
                 sig_raw.pop_back();
@@ -1263,13 +1192,40 @@ void WLPruner::process_file_wl(const std::string& path) {
             pruned_out << "Count type: " << rec2.count_signature << "\n";
             pruned_out << rec2.tes_line << "\n";
             pruned_out << rec2.conway_line << "\n";
-            write_cycle_final(rec2.state, pruned_out.stream(), tes_path, sig_raw);
+            if (mortier_store_) {
+                CanonicalTilingOutput output = build_canonical_tiling_output(rec2.state);
+                mortier_geometry::DevelopmentResult developed;
+                try {
+                    developed = mortier_geometry::develop_exact_geometry(output.geometry);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error("Mortier export failed for " + sig_raw
+                                             + ": " + error.what());
+                }
+                std::string hash = bfl_canonical_hash(rec2.state);
+                mortier_store_->add(std::vector<uint8_t>(hash.begin(), hash.end()), k,
+                                    developed.record, sig_raw);
+                for (const std::string& line : output.cycle_lines)
+                    pruned_out << line << "\n";
+                pruned_out << "---\n" << output.conway << "\n";
+            } else {
+                write_cycle_final(rec2.state, pruned_out.stream(), tes_store_.get(), combo_code,
+                                  tes_filename, sig_raw);
+            }
             pruned_out << "\n";
         }
 
         // Once per batch (not per line) is plenty granular given batches are
         // up to 2000 solutions — keeps the stat()+possible zstd spawn rare.
         pruned_out.maybe_compress();
+        consume_time += Clock::now() - stage_start;
     }
-		std::remove(path.c_str());
+    auto millis = [](std::chrono::nanoseconds d) {
+        return std::chrono::duration<double, std::milli>(d).count();
+    };
+    if (g_profile_pruner) {
+        std::cerr << "  pruner profile " << combo_code << ": records=" << records
+                  << " decode=" << millis(decode_time) << "ms"
+                  << " compute=" << millis(compute_time) << "ms"
+                  << " consume=" << millis(consume_time) << "ms\n";
+    }
 }

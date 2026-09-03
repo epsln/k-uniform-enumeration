@@ -110,6 +110,11 @@ inline std::string write_conway(const State& st) {
 
 class EuclideanSolver {
 public:
+    struct AttachmentSlot {
+        int vertex_type;
+        int slot;
+    };
+
     EuclideanSolver(int max_polygons, const std::string& output_dir);
     EuclideanSolver(int max_polygons, const std::string& output_dir,
                     std::vector<State> initial_states, bool write_log = false);
@@ -127,36 +132,34 @@ public:
     static State make_initial(int vertex_type);
     static PackedState pack_state(const State& st);
     static State unpack_state(const PackedState& p);
+    static State rebuild_from_vertype_glue(const std::vector<uint8_t>& vertype,
+                                            const std::vector<int16_t>& glue);
     static State rebuild_from_vertype_glue(const std::vector<int>& vertype,
                                             const std::vector<int>& glue);
     static bool check_partial(const State& st);
     static std::pair<int,int> analyze_cycles(const State& st);
     static bool propagate_forced(std::vector<Dart>& darts);
 
-    // Partial dedup and helpers (capped per worker, disabled by default)
-    static bool partial_dedup_check(const State& cand, int max_polygons);
-    static void set_pdedup_cap(int cap);
-
     // Canonical labeling check for partial states (glue[i]==-1 handled).
     // Returns true if this partial state's labeling is canonical — skip otherwise.
     static bool is_canonical_partial(const State& st);
-
-    // Lexicographic edge ordering: deterministic, enables canonical pruning.
-    // Returns -1 if no free edges.
-    static int first_free_lex(const State& st);
 
     // Helpers needed by extend_into template (must be declared before use)
     static int neighbors_len(int gr);
     static int attach_limit(int gr);
     static int polygon_size_of(int gr, int slot);
     static State extend_state(const State& base, int gr, int offset, int sl);
+    static bool seam_compatible(int a, int b, const std::vector<Dart>& darts);
+    static const std::vector<AttachmentSlot>& compatible_attachment_slots(int source,
+                                                                           const std::vector<Dart>& darts);
+    static bool propagate_unique_partners(State& st, int max_polygons);
 
     // Core extend logic: for a given state, find first_free, then iterate over
     // all valid candidates (pairings + new-vertex attachments).  Calls `cb` for
     // each candidate.  `max_polygons` is the k limit.
     template<typename F>
     static void extend_into(const State& st, F&& cb, int max_polygons) {
-        auto [first_free, slack] = analyze_cycles(st);
+        int first_free = analyze_cycles(st).first;
         if (first_free < 0) return;
         if (st.darts[first_free].is_mirror_edge)
             first_free = st.darts[first_free].mirro;
@@ -172,6 +175,7 @@ public:
         for (int free_i = 0; free_i < (int)free_edges.size(); ++free_i) {
             int i = free_edges[free_i];
             if ((st.darts[i].mirro == i) != mirrored) continue;
+            if (!seam_compatible(first_free, i, st.darts)) continue;
             State cand = st;
             cand.darts[first_free].glue = i; cand.darts[i].glue = first_free;
             if (!mirrored) {
@@ -181,27 +185,34 @@ public:
             if (g_propagate && !propagate_forced(cand.darts))
                 continue;
             if (!check_partial(cand)) continue;
+            if (!propagate_unique_partners(cand, max_polygons)) continue;
             cb(std::move(cand));
         }
         if ((int)st.vertype.size() < max_polygons) {
-            for (int gr = st.vertype[0]; gr < 44; ++gr) {
-                int sl = neighbors_len(gr);
-                int offset = n;
-                int limit = attach_limit(gr);
-                for (int i = offset; i < offset + limit; ++i) {
-                    State cand = extend_state(st, gr, offset, sl);
-                    if ((cand.darts[i].mirro == i) != mirrored) continue;
-                    cand.darts[first_free].glue = i; cand.darts[i].glue = first_free;
-                    if (!mirrored) {
-                        cand.darts[cand.darts[first_free].mirro].glue = cand.darts[i].mirro;
-                        cand.darts[cand.darts[i].mirro].glue = cand.darts[first_free].mirro;
-                    }
-                    if (!check_partial(cand)) continue;
-                    if (g_propagate && !propagate_forced(cand.darts))
-                        continue;
-                    if (!check_partial(cand)) continue;
-                    cb(std::move(cand));
+            const auto& attachments = compatible_attachment_slots(first_free, st.darts);
+            int prepared_type = -1;
+            State prepared;
+            for (const auto& attachment : attachments) {
+                int gr = attachment.vertex_type;
+                if (gr < st.vertype[0]) continue;
+                if (gr != prepared_type) {
+                    int sl = neighbors_len(gr);
+                    prepared = extend_state(st, gr, n, sl);
+                    prepared_type = gr;
                 }
+                int i = n + attachment.slot;
+                State cand = prepared;
+                cand.darts[first_free].glue = i; cand.darts[i].glue = first_free;
+                if (!mirrored) {
+                    cand.darts[cand.darts[first_free].mirro].glue = cand.darts[i].mirro;
+                    cand.darts[cand.darts[i].mirro].glue = cand.darts[first_free].mirro;
+                }
+                if (!check_partial(cand)) continue;
+                if (g_propagate && !propagate_forced(cand.darts))
+                    continue;
+                if (!check_partial(cand)) continue;
+                if (!propagate_unique_partners(cand, max_polygons)) continue;
+                cb(std::move(cand));
             }
         }
     }

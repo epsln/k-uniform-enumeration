@@ -7,6 +7,7 @@
 #include <istream>
 #include <memory>
 #include <streambuf>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <zstd.h>
@@ -43,7 +44,11 @@ protected:
 
         for (;;) {
             if (in_len_ == 0) {
-                if (in_.eof()) return traits_type::eof();
+                if (in_.eof()) {
+                    if (frame_incomplete_)
+                        throw std::runtime_error("truncated zstd stream: " + path_);
+                    return traits_type::eof();
+                }
                 in_.read(in_buf_.data(), (std::streamsize)in_buf_.size());
                 in_len_ = (size_t)in_.gcount();
                 in_pos_ = 0;
@@ -55,7 +60,10 @@ protected:
             size_t rc = ZSTD_decompressStream(dctx_, &zout, &zin);
             in_pos_ += zin.pos;
             in_len_ -= zin.pos;
-            if (ZSTD_isError(rc)) return traits_type::eof();
+            if (ZSTD_isError(rc))
+                throw std::runtime_error("invalid zstd stream " + path_ + ": "
+                                         + ZSTD_getErrorName(rc));
+            frame_incomplete_ = rc != 0;
 
             if (zout.pos > 0) {
                 setg(out_buf_.data(), out_buf_.data(), out_buf_.data() + zout.pos);
@@ -81,6 +89,7 @@ private:
     size_t in_pos_ = 0;
     size_t in_len_ = 0;
     std::vector<char> out_buf_;
+    bool frame_incomplete_ = false;
 };
 
 class ZstdInputFile : public std::istream {
@@ -106,7 +115,12 @@ inline std::unique_ptr<std::istream> open_solution_istream(const std::string& pa
     return std::unique_ptr<std::istream>(std::move(f));
 }
 
-// Compress `path` into `path.zst` (overwriting) and remove the plain source.
+// Compress `path` into `path.zst` (appending) and remove the plain source.
+// Appending (rather than truncating) is essential: in disk mode the worker
+// outputs for a combo are merged into X.bin.zst first, while the BFS fan-out's
+// "early solutions" for that same combo are written straight to X.bin.  A
+// truncate here would overwrite the worker frame and lose those solutions.
+// zstd frames concatenate, so appending yields the full record.
 // Aborts on failure (e.g. disk full) rather than silently losing data.
 inline void compress_to_zst(const std::string& path) {
     if (has_zst_suffix(path)) return;
@@ -115,9 +129,10 @@ inline void compress_to_zst(const std::string& path) {
     if (!in) return;
 
     std::string zst = path + ".zst";
-    std::ofstream out(zst, std::ios::binary | std::ios::trunc);
+    std::string frame = zst + ".frame.tmp";
+    std::ofstream out(frame, std::ios::binary | std::ios::trunc);
     if (!out) {
-        std::cerr << "FATAL: cannot open " << zst << " for writing.\n";
+        std::cerr << "FATAL: cannot open " << frame << " for writing.\n";
         std::abort();
     }
 
@@ -126,7 +141,13 @@ inline void compress_to_zst(const std::string& path) {
         std::cerr << "FATAL: zstd stream creation failed.\n";
         std::abort();
     }
-    ZSTD_initCStream(cs, 3);
+    size_t init = ZSTD_initCStream(cs, 3);
+    if (ZSTD_isError(init)) {
+        std::cerr << "FATAL: zstd stream initialization failed: "
+                  << ZSTD_getErrorName(init) << "\n";
+        ZSTD_freeCStream(cs);
+        std::abort();
+    }
 
     std::vector<char> inbuf(1 << 16);
     std::vector<char> outbuf(ZSTD_CStreamOutSize());
@@ -145,6 +166,7 @@ inline void compress_to_zst(const std::string& path) {
         }
         if (!ok) break;
     }
+    if (in.bad()) ok = false;
 
     if (ok) {
         for (;;) {
@@ -162,8 +184,42 @@ inline void compress_to_zst(const std::string& path) {
     if (!ok || !out) {
         std::cerr << "FATAL: compression of " << path << " failed (disk full?).\n";
         std::error_code ec;
-        std::filesystem::remove(zst, ec);
+        std::filesystem::remove(frame, ec);
         std::abort();
     }
-    std::filesystem::remove(path);
+
+    std::ifstream frame_in(frame, std::ios::binary);
+    std::error_code size_ec;
+    uintmax_t original_size = std::filesystem::exists(zst, size_ec)
+        ? std::filesystem::file_size(zst, size_ec) : 0;
+    if (size_ec) {
+        std::cerr << "FATAL: cannot inspect existing compressed output " << zst << ".\n";
+        std::abort();
+    }
+    std::ofstream zst_out(zst, std::ios::binary | std::ios::app);
+    if (!frame_in || !zst_out) {
+        std::cerr << "FATAL: cannot append compressed frame to " << zst << ".\n";
+        std::abort();
+    }
+    zst_out << frame_in.rdbuf();
+    zst_out.close();
+    if (frame_in.bad() || !zst_out) {
+        std::error_code rollback_ec;
+        std::filesystem::resize_file(zst, original_size, rollback_ec);
+        std::cerr << "FATAL: appending compressed frame to " << zst
+                  << " failed (disk full?).\n";
+        std::abort();
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(frame, ec);
+    if (ec) {
+        std::cerr << "FATAL: cannot remove temporary compressed frame " << frame << ".\n";
+        std::abort();
+    }
+    std::filesystem::remove(path, ec);
+    if (ec) {
+        std::cerr << "FATAL: cannot remove compressed source " << path << ".\n";
+        std::abort();
+    }
 }

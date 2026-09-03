@@ -1,19 +1,32 @@
 #pragma once
 #include "state.h"
 #include "bfl.h"
+#include "tes_store.h"
+#include "mortier_geometry.h"
 #include <array>
 #include <cstdint>
 #include <istream>
 #include <map>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+struct CanonicalTilingOutput {
+    std::vector<std::string> cycle_lines;
+    mortier_geometry::TilingDescription geometry;
+    std::string conway;
+};
+
+CanonicalTilingOutput build_canonical_tiling_output(const State& st);
 void write_cycle_final(const State& st, std::ostream& out,
-                       const std::string& tes_path,
+                       TesStore* tes_store, const std::string& combo,
+                       const std::string& tes_filename,
                        const std::string& sig_raw);
+
+enum class FinalOutputFormat { Raw, Tes, Mortier };
 
 class SolutionPruner {
 public:
@@ -32,6 +45,7 @@ public:
         std::string conway_line;
         State state;
         std::string count_signature;
+        int solution_index = 0;
     };
 
 protected:
@@ -100,7 +114,10 @@ bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& re
 extern int g_wl_dim;
 extern int g_wl_iters;
 extern bool g_use_bfl;
+extern bool g_no_iso_check;
 extern bool g_compress_pruner_outputs;
+extern bool g_keep_pruner_inputs;
+extern bool g_profile_pruner;
 std::string wl_hash  (const State& st, int iterations = 3);
 std::string wl_hash_2(const State& st, int iterations = 3);
 std::string wl_hash_partial(const State& st, int iterations = 0);
@@ -112,19 +129,23 @@ inline std::string wl_hash_dispatch(const State& st, int iters = 0) {
 
 class WLPruner : public SolutionPruner {
 public:
-    explicit WLPruner(const std::string& output_dir, int num_workers = 1);
+    explicit WLPruner(const std::string& output_dir, int num_workers = 1,
+                      FinalOutputFormat format = FinalOutputFormat::Tes);
     void run(const std::vector<std::string>& listfile_paths);
 
 private:
     void process_file_wl(const std::string& path);
     std::map<std::string, std::vector<PackedState>> solutions_by_hash_;
     DiskWordIndex solutions_words_;  // used when g_use_bfl
+    std::unique_ptr<TesStore> tes_store_;
+    std::unique_ptr<MortierStore> mortier_store_;
     int num_workers_;
+    FinalOutputFormat format_;
 
     struct CanonicalResult {
         bool is_canonical;
-        std::string canon_log;
         std::string wl_hash;
+        std::vector<int> bfl_word;
     };
     CanonicalResult compute_canonical_and_wl(const State& st) const;
 };

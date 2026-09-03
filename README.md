@@ -1,7 +1,17 @@
 # K-uniform tiling enumeration
-This repository contains code for an exhaustive enumeration for all k-uniform tilings. This code is directly adapted from the original work of [Fulgura14](https://github.com/Fulgur14/k-uniform-solver), but reworked to use high performance CPP and some optimizations.
 
-Some words of warning though: this is a work in progress. I made extensive use of coding agents for this program, so I cannot guarantee the exactitude of the program, or that it reproduces exactly the results of the original program. I am currently in the process of validating.
+`eusolver` exhaustively enumerates combinatorial candidates for k-uniform
+edge-to-edge tilings of the Euclidean plane by regular polygons. It is adapted
+from [Fulgura14's reference solver](https://github.com/Fulgur14/k-uniform-solver)
+and reimplemented in C++17 with parallel search, disk-backed high-k operation,
+global canonical deduplication, and TES/Mortier output.
+
+Release 1.0.0 validates exact canonical TES output through `k=2` against the
+pre-export baseline, memory/disk equivalence at `k=1`, and all generated
+Mortier records through `k=2` against the Galebach catalogue. Higher-k database
+counts are reproducible solver results, not an independent proof of mathematical
+completeness. The vertex catalogue omits `(4,8,8)`, so `k=1` has 10 rather than
+the literature value 11.
 
 # Algorithm
 The base algorithm is unchanged. This is basically an exhaustive combinatorial enumeration, where we combine local or partial solutions to create larger candidates for tilings. A periodic planar tiling has a finite number of tiles that can be projected onto another by isometry. Each tile has a finite number of edges, which can be paired together using [Conway Symbols](https://www.matematita.it/personali/index.php/the_conway_symbol?blog=7). An edge with symbol 0 of tile 0 will always be adjacent to edge 3 of tile 2, or edge 1 of tile 1 mirrored, etc. Not all combination of conway symbols will produce a valid tiling, but the inverse is true. 
@@ -9,13 +19,147 @@ The base algorithm is unchanged. This is basically an exhaustive combinatorial e
 # Deduplication
 This method does have a drawback: it produces a large amount of duplicate tiling. The computational bottleneck is here. The original pruner would use a isometric check for all pairs of solutions, which turns out to be a costly O(n^2) solution with N being the number of tilings. This check in itself is also costly, being roughly O(N^2) with N the number of nodes in the graph representation of a tiling.
 
-# Build & Run
+# Build And Run
 
 ```sh
-make                                       # builds ./eusolver (C++17, requires libzstd)
+make                                       # C++17; requires zstd, SQLite, and Boost headers
 ./eusolver --max-polygons 5 --workers 8 --output solutions
 ./eusolver --mode disk --max-polygons 10 --workers 8 --compress-solutions
 ```
 
+Select the final representation with `--format raw|tes|mortier` (`tes` is the
+default). `raw` retains the compressed pre-pruning solver state streams while
+still running canonical pruning for counts. `mortier` derives an exact periodic `Z[exp(i*pi/6)]` vertex
+representation and writes `<output>/wl/tilings.sqlite3`.
+
+TES and Mortier databases deliberately use different schemas even though both
+use the conventional path `<output>/wl/tilings.sqlite3`. Select the intended
+format when generating or consuming a database.
+
+The pruner stores all HyperRogue `.tes` documents in
+`<output>/wl/tilings.sqlite3`. Documents are grouped into zstd-compressed
+chunks, avoiding one filesystem inode and one compression process per tiling.
+Extract all documents when individual files are needed:
+
+```sh
+./eusolver --extract-tes solutions/wl/tilings.sqlite3 --extract-output extracted
+./eusolver --extract-tes solutions/wl/tilings.sqlite3 --extract-output one --tes-id 42
+```
+
+Extraction refuses to overwrite existing files. A pruner run builds a temporary
+database and atomically replaces the previous `tilings.sqlite3` only after all
+inputs succeed. It does not resume an interrupted prune.
+
+## Mortier output
+
+Mortier output uses a separate versioned SQLite schema. Normalized records hold
+two translation vectors and a sorted seed set. Signed coordinates are ZigZag
+varints, nearby seeds are delta encoded, and records are grouped into 8 MiB
+zstd-compressed chunks. The entry table stores `k`, seed count, and a binary
+stable ID derived from the canonical BFL representation, allowing indexed
+access without loading or parsing the full collection.
+
+```sh
+./eusolver --max-polygons 6 --format mortier --output solutions
+
+# Export all records, one numeric row, or one stable hash to Mortier JSON.
+./eusolver --export-mortier-json solutions/wl/tilings.sqlite3 \
+  --json-output database.json
+./eusolver --export-mortier-json solutions/wl/tilings.sqlite3 \
+  --json-output one.json --mortier-id 42
+./eusolver --export-mortier-json solutions/wl/tilings.sqlite3 \
+  --json-output one.json --mortier-stable-id HEX
+
+# Convert JSON generated by this exporter back to compressed SQLite.
+./eusolver --import-mortier-json database.json \
+  --mortier-database database.sqlite3
+```
+
+The JSON importer intentionally requires generated keys of the form
+`kNN_<stable-id>`. Legacy catalogue names such as `t1003` do not encode a
+canonical identity and require a separate equivalence-matching workflow.
+
+Exact development supports the regular polygon sizes represented by the solver
+(3, 4, 6, and 12). It uses integer Z4 edge steps throughout and rejects an
+inconsistent tiling, a singular period lattice, or a period not found within the
+configured safety bounds rather than writing a heuristic result.
+
+Validate an exported JSON catalogue against Mortier's Galebach data with:
+
+```sh
+python3 scripts/validate_mortier.py \
+  --generated database.json \
+  --reference ../mortier/data/database.json \
+  --max-k 6
+```
+
 Run `./eusolver --help` for the full option list. See `CLAUDE.md` for the
 architecture overview and `IMPLEMENTATION.md` for implementation details.
+
+# Generated Counts
+
+The following counts come from the internally consistent 35,831,099-entry
+`tilings_k20.sqlite3` result database. Counts through `k=8` agree with the
+repository regression references. The `(4,8,8)` omission applies to this whole
+catalogue, and the database contains no source-commit or completion manifest.
+
+| k | Unique tilings |
+|---:|---------------:|
+| 1 | 10 |
+| 2 | 20 |
+| 3 | 61 |
+| 4 | 151 |
+| 5 | 332 |
+| 6 | 673 |
+| 7 | 1,472 |
+| 8 | 2,849 |
+| 9 | 5,959 |
+| 10 | 11,866 |
+| 11 | 24,459 |
+| 12 | 49,793 |
+| 13 | 103,080 |
+| 14 | 212,630 |
+| 15 | 445,289 |
+| 16 | 933,636 |
+| 17 | 1,972,148 |
+| 18 | 4,177,505 |
+| 19 | 8,896,553 |
+| 20 | 18,992,613 |
+| **Total** | **35,831,099** |
+
+# Regression Tests And Benchmarks
+
+The quick test suite checks the repository's expected k=1 count (10 because the
+catalogue omits `(4,8,8)`) and compares the exact canonical solution documents
+from memory and disk mode:
+
+```sh
+make test
+make test TEST_MAX_K=3
+make test BASELINE=/path/to/baseline TEST_MAX_K=2
+```
+
+With `BASELINE`, the test hashes every canonical TES document in each pruner
+SQLite database and compares the complete sets, not only their counts. This
+comparison uses one worker by default because parallel runs may retain different
+isomorphic representatives; `--exact-workers` can override it. Expected counts
+for k=1 through k=20 are built into the harness; larger subsets can take a long
+time. Run `python3 scripts/regression.py --help` to select counts, workers,
+retained output directories, or to skip the separate mode-equivalence run.
+
+The repeat-sample benchmark reports partial counts plus solver, pruner, and
+end-to-end wall times. It is informational unless an explicit slowdown threshold
+is supplied, and the Make target does not rebuild either executable:
+
+```sh
+make benchmark BASELINE=/path/to/baseline CANDIDATE=./eusolver
+make benchmark BASELINE=/path/to/baseline BENCHMARK_REPEATS=5 \
+  BENCHMARK_MAX_K=3 BENCHMARK_MAX_SLOWDOWN=1.10
+```
+
+Use `scripts/benchmark.py --mode disk` to measure the packed disk pipeline.
+Additional solver arguments can follow `--`, for example
+`-- --binary-solutions --fanout 5000 --chunks 32`.
+
+Both harnesses use only the Python 3 standard library. They require the solver's
+normal runtime `libzstd` library to inspect compressed canonical documents.
