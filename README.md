@@ -33,3 +33,40 @@ inputs succeed. It does not resume an interrupted prune.
 
 Run `./eusolver --help` for the full option list. See `CLAUDE.md` for the
 architecture overview and `IMPLEMENTATION.md` for implementation details.
+
+# Regression tests and benchmarks
+
+The quick test suite checks the repository's expected k=1 count (10 because the
+catalogue omits `(4,8,8)`) and compares the exact canonical solution documents
+from memory and disk mode:
+
+```sh
+make test
+make test TEST_MAX_K=3
+make test BASELINE=/path/to/baseline TEST_MAX_K=2
+```
+
+With `BASELINE`, the test hashes every canonical TES document in each pruner
+SQLite database and compares the complete sets, not only their counts. This
+comparison uses one worker by default because parallel runs may retain different
+isomorphic representatives; `--exact-workers` can override it. Expected counts
+for k=1 through k=8 are built into the harness; larger subsets can take a long
+time. Run `python3 scripts/regression.py --help` to select counts, workers,
+retained output directories, or to skip the separate mode-equivalence run.
+
+The repeat-sample benchmark reports partial counts plus solver, pruner, and
+end-to-end wall times. It is informational unless an explicit slowdown threshold
+is supplied, and the Make target does not rebuild either executable:
+
+```sh
+make benchmark BASELINE=/path/to/baseline CANDIDATE=./eusolver
+make benchmark BASELINE=/path/to/baseline BENCHMARK_REPEATS=5 \
+  BENCHMARK_MAX_K=3 BENCHMARK_MAX_SLOWDOWN=1.10
+```
+
+Use `scripts/benchmark.py --mode disk` to measure the packed disk pipeline.
+Additional solver arguments can follow `--`, for example
+`-- --binary-solutions --fanout 5000 --chunks 32`.
+
+Both harnesses use only the Python 3 standard library. They require the solver's
+normal runtime `libzstd` library to inspect compressed canonical documents.

@@ -129,9 +129,10 @@ inline void compress_to_zst(const std::string& path) {
     if (!in) return;
 
     std::string zst = path + ".zst";
-    std::ofstream out(zst, std::ios::binary | std::ios::app);
+    std::string frame = zst + ".frame.tmp";
+    std::ofstream out(frame, std::ios::binary | std::ios::trunc);
     if (!out) {
-        std::cerr << "FATAL: cannot open " << zst << " for writing.\n";
+        std::cerr << "FATAL: cannot open " << frame << " for writing.\n";
         std::abort();
     }
 
@@ -140,7 +141,13 @@ inline void compress_to_zst(const std::string& path) {
         std::cerr << "FATAL: zstd stream creation failed.\n";
         std::abort();
     }
-    ZSTD_initCStream(cs, 3);
+    size_t init = ZSTD_initCStream(cs, 3);
+    if (ZSTD_isError(init)) {
+        std::cerr << "FATAL: zstd stream initialization failed: "
+                  << ZSTD_getErrorName(init) << "\n";
+        ZSTD_freeCStream(cs);
+        std::abort();
+    }
 
     std::vector<char> inbuf(1 << 16);
     std::vector<char> outbuf(ZSTD_CStreamOutSize());
@@ -159,6 +166,7 @@ inline void compress_to_zst(const std::string& path) {
         }
         if (!ok) break;
     }
+    if (in.bad()) ok = false;
 
     if (ok) {
         for (;;) {
@@ -176,8 +184,42 @@ inline void compress_to_zst(const std::string& path) {
     if (!ok || !out) {
         std::cerr << "FATAL: compression of " << path << " failed (disk full?).\n";
         std::error_code ec;
-        std::filesystem::remove(zst, ec);
+        std::filesystem::remove(frame, ec);
         std::abort();
     }
-    std::filesystem::remove(path);
+
+    std::ifstream frame_in(frame, std::ios::binary);
+    std::error_code size_ec;
+    uintmax_t original_size = std::filesystem::exists(zst, size_ec)
+        ? std::filesystem::file_size(zst, size_ec) : 0;
+    if (size_ec) {
+        std::cerr << "FATAL: cannot inspect existing compressed output " << zst << ".\n";
+        std::abort();
+    }
+    std::ofstream zst_out(zst, std::ios::binary | std::ios::app);
+    if (!frame_in || !zst_out) {
+        std::cerr << "FATAL: cannot append compressed frame to " << zst << ".\n";
+        std::abort();
+    }
+    zst_out << frame_in.rdbuf();
+    zst_out.close();
+    if (frame_in.bad() || !zst_out) {
+        std::error_code rollback_ec;
+        std::filesystem::resize_file(zst, original_size, rollback_ec);
+        std::cerr << "FATAL: appending compressed frame to " << zst
+                  << " failed (disk full?).\n";
+        std::abort();
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(frame, ec);
+    if (ec) {
+        std::cerr << "FATAL: cannot remove temporary compressed frame " << frame << ".\n";
+        std::abort();
+    }
+    std::filesystem::remove(path, ec);
+    if (ec) {
+        std::cerr << "FATAL: cannot remove compressed source " << path << ".\n";
+        std::abort();
+    }
 }

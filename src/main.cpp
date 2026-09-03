@@ -44,7 +44,7 @@ struct SharedQueue {
 
 	static constexpr int BATCH = 16;
 
-	int pop_batch(std::vector<State>& out) {
+	int pop_batch(std::vector<PackedState>& out) {
 		out.clear();
 		std::unique_lock<std::mutex> lk(mu);
 		while (q.empty() && active > 0 && !stop)
@@ -52,16 +52,16 @@ struct SharedQueue {
 		if (q.empty()) { stop = true; cv.notify_all(); return 0; }
 		int n = std::min(BATCH, (int)q.size());
 		for (int i = 0; i < n; ++i) {
-			out.push_back(EuclideanSolver::unpack_state(q.front()));
+			out.push_back(std::move(q.front()));
 			q.pop_front();
 		}
 		active += n;
 		return n;
 	}
 
-	void finish_batch(int completed, std::vector<State>& successors) {
+	void finish_batch(int completed, std::vector<PackedState>& successors) {
 		std::lock_guard<std::mutex> lk(mu);
-		for (auto& s : successors) q.push_back(EuclideanSolver::pack_state(s));
+		for (auto& s : successors) q.push_back(std::move(s));
 		active -= completed;
 		if (q.empty() && active == 0) stop = true;
 		cv.notify_all();
@@ -267,10 +267,16 @@ static void merge_worker_outputs(const std::string& output_dir,
 		bool zst = !paths.empty() && has_zst_suffix(paths.front());
 		std::string dest = output_dir + "/" + base + (zst ? ".zst" : "");
 		std::ofstream out(dest, std::ios::binary | std::ios::app);
+		if (!out) throw std::runtime_error("cannot open merged output " + dest);
 		for (const auto& p : paths) {
 			std::ifstream in(p, std::ios::binary);
+			if (!in) throw std::runtime_error("cannot open worker output " + p);
 			out << in.rdbuf();
+			if (in.bad() || !out)
+				throw std::runtime_error("failed to merge worker output " + p);
 		}
+		out.close();
+		if (!out) throw std::runtime_error("failed to finalize merged output " + dest);
 	}
 }
 
@@ -420,6 +426,10 @@ int main(int argc, char** argv) {
 		}
 	}
 	if (num_workers < 1) num_workers = 1;
+	if (num_workers > MAX_WORKERS) {
+		std::cerr << "--workers must not exceed " << MAX_WORKERS << "\n";
+		return 1;
+	}
 	if (!extract_database.empty()) {
 		if (extract_output.empty()) {
 			std::cerr << "--extract-output is required with --extract-tes\n";
@@ -550,7 +560,7 @@ int main(int argc, char** argv) {
 			// Phase 1: BFS fan-out
 			std::cout << "Phase 1: BFS fan-out to " << fanout_target << " frontier states...\n";
 			std::vector<State> early_solutions;
-			std::vector<State> frontier = bfs_fanout(fanout_target, max_polygons, &early_solutions);
+			std::vector<PackedState> frontier = bfs_fanout(fanout_target, max_polygons, &early_solutions);
 			t1 = std::chrono::steady_clock::now();
 			std::cout << "  Done: " << frontier.size() << " frontier, "
 			          << early_solutions.size() << " early solutions  ("
@@ -569,15 +579,15 @@ int main(int argc, char** argv) {
 			std::cout << "  Early solutions written.\n";
 
 			// Write frontier as chunks
-			std::vector<std::vector<State>> chunks(n_chunks);
+			std::vector<std::vector<PackedState>> chunks(n_chunks);
 			for (size_t i = 0; i < frontier.size(); ++i)
 				chunks[i % n_chunks].push_back(std::move(frontier[i]));
-			{ std::vector<State>().swap(frontier); }
+			{ std::vector<PackedState>().swap(frontier); }
 
 			for (int ci = 0; ci < n_chunks; ++ci) {
 				if (chunks[ci].empty()) continue;
 				std::string cp = output_dir + "/chunk_" + std::to_string(ci) + ".bin";
-				write_states_bin(cp, chunks[ci]);
+				write_packed_states_bin(cp, chunks[ci]);
 				chunk_paths.push_back(cp);
 			}
 		} else {
@@ -767,8 +777,12 @@ int main(int argc, char** argv) {
 		for (const auto& cp : chunk_paths) fs::remove(cp);
 
 		auto t2 = std::chrono::steady_clock::now();
+		int64_t disk_partials = 0;
+		for (int w = 0; w < num_workers; ++w)
+			disk_partials += g_disk_partials[w].load(std::memory_order_relaxed);
 		std::cout << "Solver phase: " << std::fixed << std::setprecision(1)
-		          << std::chrono::duration<double>(t2 - t1).count() << "s\n";
+		          << std::chrono::duration<double>(t2 - t1).count() << "s ("
+		          << disk_partials << " partials)\n";
 
 		merge_worker_outputs(output_dir, worker_dirs);
 		for (const auto& wd : worker_dirs) fs::remove_all(wd);
@@ -789,9 +803,9 @@ int main(int argc, char** argv) {
 			// Shared queue and per-worker output tracking
 			SharedQueue sq;
 			{
-				std::vector<State> init_batch;
+				std::vector<PackedState> init_batch;
 				for (int vt = 0; vt < NUM_VERTEX_TYPES; ++vt)
-					init_batch.push_back(EuclideanSolver::make_initial(vt));
+					init_batch.push_back(EuclideanSolver::pack_state(EuclideanSolver::make_initial(vt)));
 				sq.finish_batch(0, init_batch);
 			}
 
@@ -828,16 +842,20 @@ int main(int argc, char** argv) {
 						HistogramMap vc;
 						int64_t pd_seen = 0, pd_deduped = 0;
 						int64_t solutions = 0, sol_accepted = 0;
-						std::vector<State> local_batch;
+						std::vector<PackedState> local_batch;
+						std::vector<PackedState> packed_work;
 						std::vector<State> work_items;
 
 						while (true) {
-						int nb = sq.pop_batch(work_items);
+						int nb = sq.pop_batch(packed_work);
 						if (nb == 0) break;
+						work_items.clear();
+						work_items.reserve(packed_work.size());
+						for (const auto& packed : packed_work)
+							work_items.push_back(EuclideanSolver::unpack_state(packed));
 
 						local_batch.clear();
 						for (auto& st : work_items) {
-						total_partials.fetch_add(1);
 						EuclideanSolver::extend_into(st, [&](State&& cand) {
 								bool done = true;
 								for (const auto& d : cand.darts) if (d.glue == -1) { done = false; break; }
@@ -849,11 +867,12 @@ int main(int argc, char** argv) {
 										rt, sf, vc);
 								} else {
 								++pd_seen;
-								local_batch.push_back(std::move(cand));
+								local_batch.push_back(EuclideanSolver::pack_state(cand));
 								}
 								}, max_polygons);
 						}
 						sq.finish_batch(nb, local_batch);
+						total_partials.fetch_add(nb);
 						total_solutions.fetch_add(sol_accepted);
 						total_sol_deduped.fetch_add(solutions - sol_accepted);
 						total_deduped.fetch_add(pd_deduped);

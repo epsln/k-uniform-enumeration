@@ -132,6 +132,7 @@ private:
         bool is_canonical;
         std::string canon_log;
         std::string wl_hash;
+        std::vector<int> bfl_word;
     };
     CanonicalResult compute_canonical_and_wl(const State& st) const;
 };
