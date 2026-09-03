@@ -11,12 +11,13 @@ from solver_harness import describe_difference, parse_k_spec  # noqa: E402
 class HarnessTests(unittest.TestCase):
     def test_parse_k_spec_supports_ranges_and_values(self):
         self.assertEqual(parse_k_spec("1-3,5,3"), [1, 2, 3, 5])
+        self.assertEqual(parse_k_spec("20"), [20])
 
     def test_parse_k_spec_rejects_out_of_reference_range(self):
         with self.assertRaises(ValueError):
             parse_k_spec("0,1")
         with self.assertRaises(ValueError):
-            parse_k_spec("9")
+            parse_k_spec("21")
 
     def test_difference_identifies_missing_and_extra_solutions(self):
         message = describe_difference({(1, "aaa")}, {(1, "bbb")})

@@ -1,290 +1,162 @@
-# Implementation: Euclidean k-uniform Tiling Solver (C++)
+# Implementation Guide
+
+This document describes the C++ implementation shipped in release 1.0.0. See
+`ALGORITHM.md` for the combinatorial search itself.
 
 ## Build
 
 ```sh
 make
-# or:
-g++ -O3 -std=c++17 -pthread -march=native -Isrc \
-    src/main.cpp src/solver.cpp src/pruner.cpp src/vertex_catalog.cpp \
-    src/disk_solver.cpp src/bfl.cpp src/sig_tree.cpp src/metrics.cpp \
-    -lzstd -o eusolver
+make debug
+make test TEST_MAX_K=2
 ```
 
-Zero warnings with `-Wall -Wextra`. Requires C++17 (structured bindings,
-`std::filesystem`, `if`-init) and pthreads.
+The build requires a C++17 compiler, pthreads, zstd, SQLite, and the Boost
+Multiprecision headers. Release builds use `-O3 -march=native`.
 
-## Usage
+## Source layout
 
-```
-./eusolver --max-polygons 8 --workers 8 [--output solutions]
-```
+| File | Responsibility |
+|------|----------------|
+| `src/state.h` | `Dart`, `State`, and compact `PackedState` definitions |
+| `src/vertex_catalog.*` | Static catalogue of 44 supported Euclidean vertex types |
+| `src/solver.*` | Extension, polygon-cycle checks, forced propagation, and raw output |
+| `src/disk_solver.*` | Versioned binary records, BFS fan-out, spill/reload, and disk workers |
+| `src/pruner.*` | Canonical filtering, WL/BFL deduplication, and final rendering |
+| `src/bfl.*` | Breadth-first canonical words and portable 256-bit hashes |
+| `src/tes_store.*` | Chunked zstd/SQLite storage and extraction for HyperRogue TES |
+| `src/mortier_geometry.*` | Exact Z4 development and translation-lattice derivation |
+| `src/mortier_store.*` | Mortier codec, chunked SQLite storage, and JSON conversion |
+| `src/zstd_stream.h` | Concatenated-frame zstd input and durable compression helpers |
+| `src/main.cpp` | CLI, memory queue, progress reporting, and pipeline dispatch |
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--max-polygons N` | 5 | Maximum number of vertex types (k) |
-| `--workers N` | hw threads | Number of solver + pruner threads |
-| `--output DIR` | solutions | Output directory |
-| `--mode memory\|disk` | memory | Solver mode |
-| `--fanout N` | 40000 | BFS fan-out target (disk mode only) |
-| `--spill N` | 50000 | Disk spill threshold (disk mode only) |
+## State representation
 
-## File layout
-
-C++ sources live in `src/`.
-
-```
-├── src/
-│   ├── vertex_catalog.h       # Static catalogue interface
-│   ├── vertex_catalog.cpp     # 44 vertex types with per-slot data tables
-│   ├── state.h                # State struct (7 parallel arrays)
-│   ├── solver.h               # EuclideanSolver class + extend_into template
-│   ├── solver.cpp             # Core search: extend, check_partial, analyze_cycles,
-│   │                          #   partial dedup, fingerprint, isomorphism, output
-│   ├── pruner.h               # SolutionPruner + WLPruner classes + wl_hash()
-│   ├── pruner.cpp             # Pruning pipeline: parsing, canonical check,
-│   │                          #   WL hash, solutions_match, cycle-final writer
-│   ├── disk_solver.h          # Binary I/O + BFS fan-out + disk DFS worker
-│   ├── disk_solver.cpp        # Compact serialization, spill/reload, fan-out, worker
-│   ├── zstd_stream.h          # Streaming zstd input + compress_to_zst helper
-│   ├── bfl.h/cpp              # Breadth-First Labelling canonical signatures
-│   ├── sig_tree.h/cpp         # Set-tree signature helpers
-│   ├── metrics.h/cpp          # TensorBoard metrics writer
-│   └── main.cpp               # CLI, shared queue, progress thread, pipeline orchestration
-├── Makefile                   # Build rules
-├── ALGORITHM.md               # Algorithm documentation
-└── IMPLEMENTATION.md          # This file
-```
-
-## Architecture
-
-### `State` struct (state.h)
-
-The central data structure. Contains 7 parallel vectors indexed by slot ID:
+`State` is a vector of darts plus one catalogue type per representative vertex:
 
 ```cpp
+struct Dart {
+    int rneig, lneig;
+    int polygon_size;
+    int mirro;
+    int glue;
+    bool is_mirror_edge;
+};
+
 struct State {
-    std::vector<int> rneig;         // clockwise neighbour
-    std::vector<int> lneig;         // counter-clockwise neighbour
-    std::vector<int> polygon_size;  // polygon size to the right
-    std::vector<int> mirro;         // mirror-image slot
-    std::vector<int> glue;          // −1 = free, else paired slot ID
-    std::vector<std::string> label; // Conway label string
-    std::vector<int> vertype;       // per-vertex catalogue index
+    std::vector<Dart> darts;
+    std::vector<int> vertype;
 };
 ```
 
-`rneig`, `lneig`, `mirro`, `polygon_size`, and `label` are fully determined
-by `vertype` (they are concatenations of the per-vertex-type table rows).
-Only `glue` and `vertype` carry state-specific information.
+Only `vertype` and the dart `glue` values vary between compact states. The
+remaining dart fields are reconstructed from the vertex catalogue. A complete
+state has no `glue == -1` entry.
 
-### Solver pipeline
+## Search pipelines
 
-```
-                    main()
-                      │
-        ┌─────────────┴─────────────┐
-        ▼                           ▼
-  memory mode                 disk mode
-        │                           │
-  SharedQueue ◄── 44 initials   BFS fan-out
-        │                      chunk binary files
-  8 worker threads             parallel disk workers
-  batch pop/push (B=64)        spill/reload to disk
-  per-worker dedup             write solution text
-        │                           │
-        └─────────────┬─────────────┘
-                      ▼
-              merge worker outputs
-                      │
-              WLPruner (parallel)
-                      │
-              pruned output + tilings.sqlite3
-```
+Memory mode keeps packed partial states in a shared queue. Workers unpack a
+batch, call `EuclideanSolver::extend_into`, write complete states into private
+directories, and return packed partials in bulk. Complete-solution online dedup
+is per worker and bounded; the final pruner performs global deduplication.
 
-### Shared work queue (`SharedQueue`, main.cpp)
+Disk mode first performs BFS fan-out into chunk files. Parallel workers claim
+chunks, run DFS-like local queues, and spill bounded batches as zstd-compressed
+frames when queues exceed the configured threshold. Search frontier/spill files
+are internal formats and are independent of the selected final output format.
 
-Workers pull batches of up to 64 states from a shared deque protected by a
-mutex and condition variable. New partials are pushed back in bulk. Workers
-sleep when the queue is empty and active > 0; they wake via `notify_all`
-when new work arrives. Termination occurs when queue is empty and active=0.
+Forced unique-partner propagation is enabled. Partial-state canonical filtering
+uses bitset alias refinement before candidates are queued. The old fingerprint
+bucket partial deduplication path was removed because it was disabled and did
+not improve tested runs.
 
-### Progress display (main.cpp)
+## Binary state records
 
-A dedicated progress thread reads shared atomic counters every 500 ms and
-prints a clean status line:
+New records use binary format version 2:
 
-```
-  P:320648  S:19811  Q:37206  A:512  ETA:<1s
+```text
+u8  marker = 0
+u8  version = 2
+u16 vertex_count, little endian
+u16 dart_count, little endian
+u8[vertex_count] catalogue types
+i16[dart_count] glue indices
 ```
 
-- `P` = partials processed, `S` = raw solutions found
-- `Q` = queue depth, `A` = active states (held by workers)
-- `ETA` = queue × EMA(seconds per partial) × avg-branch-factor
+Readers continue to accept the legacy two-`u8` header. Counts and indices are
+validated before a state is rebuilt.
 
-The pruner prints per-file progress with accumulating per-k unique counts:
+## Global pruning
 
-```
-  pruner: 25/47 files  [k1:10 k2:20 k3:61]
-```
+The pruner reads text or binary raw streams in batches and evaluates canonical
+labeling and graph hashes in parallel. The default path uses 1-WL refinement to
+convergence and exact isomorphism checks on hash collisions. `--dedup bfl` uses
+the canonical BFL word and a disk-backed exact word index. `--wl-dim 2` enables
+the more expensive pair-colour refinement.
 
-### `extend_into` template (solver.h)
+Accepted states are converted once into a structured polygon description. TES
+and Mortier renderers share this description, including polygon repeats,
+mirrored Conway pairings, and chirality decisions.
 
-The core search step is a static template method, allowing both the
-in-memory solver and the disk worker to share the same logic:
+## Final formats
 
-```cpp
-template<typename F>
-static void extend_into(const State& st, F&& cb, int max_polygons);
-```
+`--format tes` is the default. It stores HyperRogue documents in
+`<output>/wl/tilings.sqlite3`, using zstd-compressed text chunks indexed by
+document byte ranges. `--extract-tes` recreates individual files safely.
 
-`cb` is called for each valid candidate state. In memory mode, the callback
-writes complete solutions and enqueues partials. In disk mode, it writes
-solution text and pushes partials to the disk worker's deque.
+`--format mortier` stores canonical Mortier records under the same path but in
+a distinct schema. Z4 points are signed integer coefficients in the ordered
+basis `(1, exp(i*pi/6), exp(i*pi/3), i)`. Exact affine polygon development
+derives translation generators; exact rank-two module reduction derives `T1`
+and `T2`; vertices reduced modulo that lattice form `Seed`.
 
-### Partial dedup (solver.cpp)
+Mortier records use ZigZag varints, sorted/delta-encoded seeds, and 8 MiB zstd
+chunks. The entry table stores `k`, seed count, and a 32-byte BFL stable ID.
+Hash lanes are serialized little-endian, so IDs are platform-independent.
+SQLite metadata versions both the schema and binary codec and marks completion
+only after all records have been committed.
 
-Each worker maintains a `fingerprint → vector<State>` map (lock-free,
-per-worker). Before enqueuing a candidate:
+`--format raw` retains compressed pre-pruning solver streams while still
+running global pruning for counts. It does not create a final geometry database.
 
-1. Compute `state_fingerprint()` — FNV-1a over 6-tuples + vertex histogram.
-2. Look up the fingerprint bucket.
-3. Run `are_isomorphic_partial()` — bit-level alias refinement — against
-   stored entries. If isomorphic, discard. Otherwise store and enqueue.
-4. Bucket size capped at 8 to bound memory.
+## Conversion and validation
 
-### Pruner parallelism (pruner.cpp)
+```sh
+./eusolver --export-mortier-json DB --json-output database.json
+./eusolver --export-mortier-json DB --json-output one.json --mortier-id 42
+./eusolver --import-mortier-json database.json --mortier-database DB
 
-The `WLPruner` computes canonical labelings and WL hashes in parallel:
-
-```cpp
-// Atomic-indexed work distribution
-std::atomic<size_t> idx{0};
-for (int w = 0; w < num_workers; ++w)
-    threads.emplace_back([&]() {
-        while (size_t i = idx.fetch_add(1), i < records.size())
-            results[i] = compute_canonical_and_wl(records[i].state);
-    });
-```
-
-The canonical check (`is_canonical_labeling`) uses set-based alias refinement
-(O(n² × iterations)). The WL hash (`wl_hash`) uses 3-round colour refinement
-with FNV-1a and neighbour-type prefixes. Both are pure functions with no
-shared state, making them trivially parallelizable.
-
-The sequential filtering phase uses `solutions_by_hash_` (a
-`map<wl_hash_string, vector<State>>`) for O(1) dedup lookups. Only on WL
-hash collisions (theoretically impossible for Euclidean tiling graphs) does
-it fall back to the O(n²) `solutions_match`.
-
-### TES storage (`tes_store.cpp`)
-
-The pruner renders each HyperRogue `.tes` document in memory and appends it to
-`wl/tilings.sqlite3`, rather than creating millions of small files. The SQLite
-database has three tables:
-
-- `metadata`: format version and compression algorithm.
-- `chunks`: zstd-compressed concatenated document data and size metadata.
-- `entries`: stable numeric ID, byte range, combo, signature, and legacy name.
-
-Chunks target 8 MiB of uncompressed text. A transaction is committed after
-each merged solver input file. Input files are retained until the complete
-database has been published, then removed together. This bounds data at risk
-and permits a failed prune to be retried without requiring a transaction or
-zstd frame per tiny document. A document larger than the target is stored as
-its own chunk.
-
-`--extract-tes DB --extract-output DIR` recreates the combo-directory layout.
-`--tes-id N` limits extraction to one entry. Extraction validates stored path
-components, zstd sizes, and byte ranges, and refuses to overwrite files.
-
-The database is a final-output container, not a pruner checkpoint. A fresh
-pruner run writes `tilings.sqlite3.tmp` and atomically publishes it only after
-all inputs succeed, preserving a prior completed database on failure. Global
-deduplication state still lives in memory and cannot currently be resumed
-safely.
-
-### Binary serialization (disk_solver.cpp)
-
-For k ≥ 10, states must be spilled to disk. The compact binary format:
-
-```
-uint8  num_vertices
-uint8  num_edges
-num_vertices × uint8   vertex type indices
-num_edges × int16      glue array (−1 = 0xFFFF)
+python3 scripts/validate_mortier.py \
+  --generated database.json \
+  --reference ../mortier/data/database.json
 ```
 
-Derived arrays (rneig, lneig, mirro, polygon_size, label) are reconstructed
-on deserialization from the vertex type catalogue. At k=20, this is ~500
-bytes per state vs ~2,000 for the text format.
+JSON import is intentionally restricted to generated `kNN_<stable-id>` keys.
+The validator matches periodic point sets under translation-basis changes,
+origin shifts, rotations, and reflections.
 
-The disk worker uses spill/reload:
+## Durability
 
-```cpp
-if (queue.size() > spill_threshold) {
-    // Write half of queue to spill file
-    write_i32(sf, count);
-    for each state: write_state_bin(sf, state);
-    queue.erase(first_half);
-}
-// Later:
-while (queue.empty() && spill_has_data) {
-    read_i32(sf); // batch count
-    for count: queue.push_front(read_state_bin(sf));
-}
-```
+Final databases are built as `tilings.sqlite3.tmp` and renamed only after a
+successful finish. Chunk insertion is transactional. Raw inputs are removed
+only after final publication unless `--keep-pruner-inputs` or `--format raw` is
+selected. JSON conversion likewise writes a temporary output and protects the
+source database from direct or symlink-aliased overwrite.
 
-### Thread safety
+## Testing
 
-| Component | Strategy |
-|-----------|----------|
-| `SharedQueue` | Mutex + condition variable, batch push/pop |
-| `write_solution_static` | Per-worker mutex on output tracking maps |
-| Partial dedup | Per-worker (lock-free) fingerprint buckets |
-| WL hash computation | Atomic-index parallel loop, no shared mutable state |
-| `solutions_by_hash_` | Sequential accumulation (must be serial) |
-| Progress display | Shared atomics, read-only from progress thread |
-
-## Performance
-
-All timings are wall-clock on an 8-core machine, k=7:
-
-| Phase | Time | Notes |
-|-------|------|-------|
-| Solver (8 workers) | ~2.0s | 322K partials processed |
-| Output merge | negligible | File concatenation |
-| Pruner (8 workers) | ~3.0s | 66 files, 20K raw → 2.7K unique, parallel WL |
-
-Per-k unique tiling count growth (verified against Python):
-
-| k | Unique | Raw solutions | Solver time (8w) |
-|---|--------|--------------|-------------------|
-| 4 | 151 | 2,841 | 0.5s |
-| 5 | 332 | 8,323 | 1.4s |
-| 6 | 673 | ~17K | 4.0s |
-| 7 | 1,472 | ~20K | 2.0s |
-| 8 | 2,849 | ~37K | 25.8s |
+`make test` runs C++ safety/codec/geometry tests, Python unit tests, count
+regressions, and a memory/disk equivalence run. `TEST_MAX_K` expands the count
+range. Supplying `BASELINE=/path/to/eusolver` also compares exact TES document
+sets. `scripts/benchmark.py` compares partial counts and timings separately.
 
 ## Known limitations
 
-1. **`propagate_forced` disabled** — the constraint propagation function is
-   implemented but produces incorrect solution counts when enabled. Fixing
-   it would reduce the search space by an estimated 40-60%.
-
-2. **Disk mode integration** — binary serialization, BFS fan-out, and disk
-   worker infrastructure exist but the chunk-distribution to workers loses
-   some k=1 solutions when the fan-out target is small. Needs debugging
-   before production use at k ≥ 10.
-
-3. **No (4,8,8) vertex type** — the catalogue omits the semi-regular
-   Archimedean tiling (4,8,8), so k=1 count is 10 instead of the literature
-   value of 11.
-
-4. **Partial dedup is per-worker** — duplicates across different workers'
-   search spaces are not detected. A global shared dedup would increase
-   pruning effectiveness at the cost of lock contention.
-
-5. **Pruner is I/O-bound** — writing cycle-final descriptions and `.tes`
-   files dominates pruner time for k > 6. The parallel WL hash computation
-   helps but the overall speedup is modest.
+- The catalogue omits `(4,8,8)`, so the solver reports 10 rather than 11
+  one-uniform tilings.
+- Mathematical completeness above the independently checked reference range is
+  not proven solely by the generated database.
+- Mortier exact development supports the regular polygon sizes represented by
+  this catalogue: 3, 4, 6, and 12.
+- Search and global deduplication are not resumable as one atomic operation;
+  disk mode can resume frontier work, while pruning restarts from raw inputs.

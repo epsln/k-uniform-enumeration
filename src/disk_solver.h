@@ -106,9 +106,6 @@ DiskSolverStats disk_solver_worker(
 std::vector<PackedState> bfs_fanout(int target, int max_polygons,
                                     std::vector<State>* early_states = nullptr);
 
-// Enable global shared partial dedup for disk workers
-void set_pdedup_shared(bool v);
-
 // Shared progress counters for ETA display (disk mode), one slot per worker.
 constexpr int MAX_WORKERS = 64;
 extern std::atomic<int64_t> g_disk_partials[MAX_WORKERS];

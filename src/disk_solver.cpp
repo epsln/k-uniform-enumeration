@@ -156,9 +156,6 @@ std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];
 std::atomic<bool> g_disk_running{false};
 bool g_compress_solutions = false;
 int64_t g_compress_threshold = 256LL * 1024 * 1024;
-static bool s_pdedup_shared = false;
-void set_pdedup_shared(bool v) { s_pdedup_shared = v; }
-
 // Append-compress a .bin file: compress the current tail into a zstd frame and
 // concatenate it onto X.bin.zst (zstd streams concatenate, so zstd -d yields the
 // full history), then remove the tail.  Never overwrites X.bin.zst, so earlier

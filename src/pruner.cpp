@@ -32,9 +32,9 @@ std::atomic<int64_t> g_wl_hash_hits{0};
 std::atomic<int64_t> g_wl_collisions{0};
 std::atomic<int64_t> g_solutions_match_calls{0};
 std::atomic<int> g_wl_max_iters{0};
-bool g_compress_pruner_outputs = true;  // compress eupruned/euraw rolling outputs by default
+bool g_compress_pruner_outputs = true;  // compress rolling pruner output by default
 
-// Compress euraw.txt/eupruned.txt "on the go" instead of only once at the
+// Compress eupruned.txt on the go instead of only once at the
 // end: these are opened once per combo_code and streamed to for the whole
 // run, so left alone they can grow very large before ever getting
 // compressed. Neither file is ever read back within this program, so we
@@ -193,10 +193,8 @@ static std::tuple<bool, int, int> decipher_edge(const std::string& text) {
 // =============================================================================
 // Cycle final writer  (ConwayCycleWriter.write_cycle_final)
 // =============================================================================
-void write_cycle_final(const State& st, std::ostream& out,
-                        TesStore& tes_store, const std::string& combo,
-                        const std::string& tes_filename,
-                        const std::string& solution_label) {
+CanonicalTilingOutput build_canonical_tiling_output(const State& st) {
+    CanonicalTilingOutput output;
     int n = (int)st.darts.size();
     std::vector<int> seen(n, 0);
     std::vector<std::string> mainst_list;
@@ -257,18 +255,16 @@ void write_cycle_final(const State& st, std::ostream& out,
     for (int m = 0; m < (int)mainst_list.size(); ++m) {
         int sub = sublist[m];
         if (sub == 0) {
-            out << m << ": " << mainst_list[m];
+            output.cycle_lines.push_back(std::to_string(m) + ": " + mainst_list[m]);
         } else if (sub == 1) {
             std::string hdr = ultra_chiral ? std::to_string(m/2) + ": "
                                            : std::to_string(m) + "/" + std::to_string(m+1) + ": ";
             subheader = std::string(hdr.size(), ' ');
-            out << hdr << mainst_list[m];
+            output.cycle_lines.push_back(hdr + mainst_list[m]);
         } else {
-            out << subheader << mainst_list[m];
+            output.cycle_lines.push_back(subheader + mainst_list[m]);
         }
-        out << "\n";
     }
-    out << "---\n";
 
     // Build assembled Conway string
     bool is_chiral = ultra_chiral;
@@ -351,13 +347,26 @@ void write_cycle_final(const State& st, std::ostream& out,
             edges.erase(edges.begin());
         }
     }
-    out << conway_str << "\n";
+    output.conway = conway_str;
+    output.geometry = mortier_geometry::make_tiling_description(
+        poly_size_list, work_reps, conway_str);
+    return output;
+}
+
+void write_cycle_final(const State& st, std::ostream& out,
+                        TesStore* tes_store, const std::string& combo,
+                        const std::string& tes_filename,
+                        const std::string& solution_label) {
+    CanonicalTilingOutput output = build_canonical_tiling_output(st);
+    for (const std::string& line : output.cycle_lines) out << line << "\n";
+    out << "---\n" << output.conway << "\n";
+    if (!tes_store) return;
 
     std::ostringstream tes;
     tes << "## Euclidean, " << solution_label << "\n";
     tes << "e2.\n";
     tes << "angleunit(deg)\n";
-    for (int sz : poly_size_list) {
+    for (int sz : output.geometry.polygon_sides) {
         int angle = 180 - 360 / sz;
         std::string angles;
         for (int k = 0; k < sz; ++k) {
@@ -366,11 +375,11 @@ void write_cycle_final(const State& st, std::ostream& out,
         }
         tes << "unittile(" << angles << ")\n";
     }
-    tes << "conway(\"" << conway_str << "\")\n";
-    for (size_t i = 0; i < work_reps.size(); ++i)
-        if (work_reps[i] > 1)
-            tes << "repeat(" << i << "," << work_reps[i] << ")\n";
-    tes_store.add(combo, solution_label, tes_filename, tes.str());
+    tes << "conway(\"" << output.conway << "\")\n";
+    for (size_t i = 0; i < output.geometry.repeats.size(); ++i)
+        if (output.geometry.repeats[i] > 1)
+            tes << "repeat(" << i << "," << output.geometry.repeats[i] << ")\n";
+    tes_store->add(combo, solution_label, tes_filename, tes.str());
 }
 
 // =============================================================================
@@ -920,80 +929,6 @@ std::string wl_hash_2(const State& st, int iterations) {
     return out;
 }
 
-// =============================================================================
-// Orbit filter for partial states during search
-// =============================================================================
-std::vector<bool> compute_orbit_canonicals(const State& st, bool mirrored) {
-    int n = (int)st.darts.size();
-    int nw = (n + 63) / 64;
-
-    // Run bit-set alias refinement to find automorphism orbits
-    static thread_local std::vector<BS4> alias_small;
-    static thread_local std::vector<uint64_t> alias_large;
-    AliasRows alias = alias_rows(n, nw, alias_small, alias_large);
-
-    for (int i = 0; i < n; ++i) {
-        for (int w = 0; w < nw; ++w) alias[i][w] = ~0ULL;
-        int rem = n & 63;
-        if (rem) alias[i][nw-1] &= (1ULL << rem) - 1;
-    }
-
-    static thread_local std::vector<uint8_t> dirty;
-    static thread_local std::vector<int> worklist;
-    if ((int)dirty.size() < n)  dirty.resize(n, 0);
-    if ((int)worklist.size() < n) worklist.resize(n);
-    int wl = n;
-    for (int i = 0; i < n; ++i) { dirty[i] = 1; worklist[i] = i; }
-
-    while (wl > 0) {
-        int nwl = 0;
-        for (int wi = 0; wi < wl; ++wi) {
-            int i = worklist[wi]; dirty[i] = 0;
-            for (int w = 0; w < nw; ++w) {
-                uint64_t bits = alias[i][w];
-                while (bits) {
-                    int bit = __builtin_ctzll(bits); bits &= bits - 1;
-                    int j = w * 64 + bit; if (j == i) continue;
-                    int gi = st.darts[i].glue, gj = st.darts[j].glue;
-                    bool glue_matches = (gi == -1 && gj == -1)
-                        || (gi != -1 && gj != -1 && alias_get(alias, gi, gj));
-                    if (st.darts[i].polygon_size != st.darts[j].polygon_size
-                        || !alias_get(alias, j, i)
-                        || !alias_get(alias, st.darts[i].mirro, st.darts[j].mirro)
-                        || !glue_matches
-                        || !alias_get(alias, st.darts[i].rneig, st.darts[j].rneig)
-                        || !alias_get(alias, st.darts[i].lneig, st.darts[j].lneig))
-                    {
-                        alias[i][w] &= ~(1ULL << bit);
-                        if (!dirty[j]) { dirty[j] = 1; worklist[nwl++] = j; }
-                        if (!dirty[i]) { dirty[i] = 1; worklist[nwl++] = i; }
-                        goto next_orbit;
-                    }
-                }
-            }
-            next_orbit:;
-        }
-        wl = nwl;
-    }
-
-    // Now find canonical representatives among FREE edges with matching mirror type
-    std::vector<bool> canonical(n, false);
-    for (int i = 0; i < n; ++i) {
-        if (st.darts[i].glue != -1) continue;
-        if ((st.darts[i].mirro == i) != mirrored) continue;
-        // Check if any j < i in the same orbit is also free and matching
-        bool has_earlier = false;
-        for (int j = 0; j < i; ++j) {
-            if (st.darts[j].glue != -1) continue;
-            if ((st.darts[j].mirro == j) != mirrored) continue;
-            if (alias_get(alias, i, j)) { has_earlier = true; break; }
-        }
-        if (!has_earlier) canonical[i] = true;
-    }
-    return canonical;
-}
-
-// =============================================================================
 // DiskWordIndex — exact disk-backed canonical-word set
 // =============================================================================
 static uint64_t word_hash(const std::vector<int>& w) {
@@ -1037,10 +972,15 @@ bool DiskWordIndex::contains(const std::vector<int>& w) {
 // =============================================================================
 // WLPruner
 // =============================================================================
-WLPruner::WLPruner(const std::string& output_dir, int num_workers)
+WLPruner::WLPruner(const std::string& output_dir, int num_workers,
+                   FinalOutputFormat format)
     : SolutionPruner(output_dir), solutions_words_(output_dir + "/words.bin"),
-      tes_store_(output_dir + "/tilings.sqlite3.tmp"),
-      num_workers_(num_workers) {}
+      num_workers_(num_workers), format_(format) {
+    if (format_ == FinalOutputFormat::Tes)
+        tes_store_ = std::make_unique<TesStore>(output_dir + "/tilings.sqlite3.tmp");
+    else if (format_ == FinalOutputFormat::Mortier)
+        mortier_store_ = std::make_unique<MortierStore>(output_dir + "/tilings.sqlite3.tmp");
+}
 
 void WLPruner::run(const std::vector<std::string>& listfile_paths) {
     fs::create_directories(output_dir_);
@@ -1058,8 +998,14 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
         }
         process_file_wl(listfile_paths[i]);
     }
-    tes_store_.finish();
-    fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
+    if (tes_store_) {
+        tes_store_->finish();
+        fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
+    }
+    if (mortier_store_) {
+        mortier_store_->finish();
+        fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
+    }
     if (!g_keep_pruner_inputs) {
         for (const auto& path : listfile_paths) {
             std::error_code ec;
@@ -1083,7 +1029,7 @@ WLPruner::CanonicalResult WLPruner::compute_canonical_and_wl(const State& st) co
     CanonicalResult r;
     auto [ok, log] = is_canonical_labeling(st);
     r.is_canonical = ok;
-    r.canon_log = log;
+    (void)log;
     if (ok) {
         if (g_use_bfl)
             r.bfl_word = bfl_word_signature(st);
@@ -1246,8 +1192,25 @@ void WLPruner::process_file_wl(const std::string& path) {
             pruned_out << "Count type: " << rec2.count_signature << "\n";
             pruned_out << rec2.tes_line << "\n";
             pruned_out << rec2.conway_line << "\n";
-            write_cycle_final(rec2.state, pruned_out.stream(), tes_store_, combo_code,
-                              tes_filename, sig_raw);
+            if (mortier_store_) {
+                CanonicalTilingOutput output = build_canonical_tiling_output(rec2.state);
+                mortier_geometry::DevelopmentResult developed;
+                try {
+                    developed = mortier_geometry::develop_exact_geometry(output.geometry);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error("Mortier export failed for " + sig_raw
+                                             + ": " + error.what());
+                }
+                std::string hash = bfl_canonical_hash(rec2.state);
+                mortier_store_->add(std::vector<uint8_t>(hash.begin(), hash.end()), k,
+                                    developed.record, sig_raw);
+                for (const std::string& line : output.cycle_lines)
+                    pruned_out << line << "\n";
+                pruned_out << "---\n" << output.conway << "\n";
+            } else {
+                write_cycle_final(rec2.state, pruned_out.stream(), tes_store_.get(), combo_code,
+                                  tes_filename, sig_raw);
+            }
             pruned_out << "\n";
         }
 

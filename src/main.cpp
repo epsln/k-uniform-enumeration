@@ -289,7 +289,8 @@ static void compress_merged_solutions(const std::string& output_dir) {
 	}
 }
 
-static std::map<int,int> run_pruner(const std::string& output_dir, int num_workers) {
+static std::map<int,int> run_pruner(const std::string& output_dir, int num_workers,
+                                    FinalOutputFormat format) {
 	std::vector<std::string> solution_files;
 	for (const auto& entry : fs::directory_iterator(output_dir)) {
 		if (!entry.is_regular_file()) continue;
@@ -305,7 +306,8 @@ static std::map<int,int> run_pruner(const std::string& output_dir, int num_worke
 		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-journal");
 		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-wal");
 		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-shm");
-		WLPruner pruner(pruned_dir, num_workers);
+		if (format == FinalOutputFormat::Raw) fs::remove(pruned_dir + "/tilings.sqlite3");
+		WLPruner pruner(pruned_dir, num_workers, format);
 		pruner.run(solution_files);
 		int total = 0;
 		for (const auto& [k, count] : pruner.solutions_per_k()) {
@@ -335,15 +337,18 @@ int main(int argc, char** argv) {
 	if (num_workers < 1) num_workers = 4;
 	std::string output_dir = "solutions";
 	std::string mode = "memory";
+	FinalOutputFormat output_format = FinalOutputFormat::Tes;
 	int fanout_target = 0;    // 0 = auto-scale
 	int spill_threshold = 0;  // 0 = auto-scale
 	int chunks_user = 0;      // 0 = auto (num_workers * 32)
-	int pdedup_mode = 0;  // 0=per-worker, 1=global shared
 	std::string dedup_mode  = "wl";
 	int64_t sol_dedup_cap_user = 0;  // 0 = auto-scale
 	int max_ram_gb = 0;  // 0 = auto (k-based formula)
 	bool resume = false;
 	std::string extract_database, extract_output;
+	std::string export_mortier_database, export_mortier_json_path, mortier_stable_id;
+	std::string import_mortier_json_path, import_mortier_database;
+	int64_t mortier_id = 0;
 	bool prune_only = false;
 	int64_t extract_id = 0;
 	std::string telegram_token, telegram_chat;
@@ -356,9 +361,15 @@ int main(int argc, char** argv) {
 		else if (arg == "--workers" && i + 1 < argc) num_workers = std::stoi(argv[++i]);
 		else if (arg == "--output" && i + 1 < argc) output_dir = argv[++i];
 		else if (arg == "--mode" && i + 1 < argc) mode = argv[++i];
+		else if (arg == "--format" && i + 1 < argc) {
+			std::string value = argv[++i];
+			if (value == "raw") output_format = FinalOutputFormat::Raw;
+			else if (value == "tes") output_format = FinalOutputFormat::Tes;
+			else if (value == "mortier") output_format = FinalOutputFormat::Mortier;
+			else { std::cerr << "--format must be raw, tes, or mortier\n"; return 1; }
+		}
 		else if (arg == "--wl-dim" && i + 1 < argc) { int d = std::stoi(argv[++i]); g_wl_dim = (d == 2 ? 2 : 1); }
 		else if (arg == "--wl-iters" && i + 1 < argc) g_wl_iters = std::stoi(argv[++i]);
-		else if (arg == "--pdedup" && i + 1 < argc) { std::string v = argv[++i]; pdedup_mode = (v == "shared" ? 1 : 0); }
 		else if (arg == "--dedup" && i + 1 < argc) {
 			std::string v = argv[++i];
 			if (v == "bfl") { dedup_mode = "bfl"; g_use_bfl = true; }
@@ -368,7 +379,6 @@ int main(int argc, char** argv) {
 		else if (arg == "--prune-only") { prune_only = true; }
 		else if (arg == "--keep-pruner-inputs") { g_keep_pruner_inputs = true; }
 		else if (arg == "--profile-pruner") { g_profile_pruner = true; }
-		else if (arg == "--propagate") { g_propagate = true; }
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
 		else if (arg == "--fanout" && i + 1 < argc) fanout_target = std::stoi(argv[++i]);
@@ -380,6 +390,12 @@ int main(int argc, char** argv) {
 		else if (arg == "--extract-tes" && i + 1 < argc) extract_database = argv[++i];
 		else if (arg == "--extract-output" && i + 1 < argc) extract_output = argv[++i];
 		else if (arg == "--tes-id" && i + 1 < argc) extract_id = std::stoll(argv[++i]);
+		else if (arg == "--export-mortier-json" && i + 1 < argc) export_mortier_database = argv[++i];
+		else if (arg == "--json-output" && i + 1 < argc) export_mortier_json_path = argv[++i];
+		else if (arg == "--mortier-id" && i + 1 < argc) mortier_id = std::stoll(argv[++i]);
+		else if (arg == "--mortier-stable-id" && i + 1 < argc) mortier_stable_id = argv[++i];
+		else if (arg == "--import-mortier-json" && i + 1 < argc) import_mortier_json_path = argv[++i];
+		else if (arg == "--mortier-database" && i + 1 < argc) import_mortier_database = argv[++i];
 		else if (arg == "--compress-solutions") { g_compress_solutions = true; g_compress_pruner_outputs = true;}
 		else if (arg == "--compress-threshold-mb" && i + 1 < argc)
 			g_compress_threshold = (int64_t)std::stoll(argv[++i]) * 1024 * 1024;
@@ -387,15 +403,19 @@ int main(int argc, char** argv) {
 		else if (arg == "--telegram-chat" && i + 1 < argc) telegram_chat = argv[++i];
 		else if (arg == "--notify-minutes" && i + 1 < argc) notify_minutes = std::stoi(argv[++i]);
 		else if (arg == "--telegram-dry-run") { g_telegram_dry_run = true; }
+		else if (arg == "--version") {
+			std::cout << "eusolver 1.0.0\n";
+			return 0;
+		}
 		else if (arg == "--help") {
 			std::cout << "Usage: eusolver [options]\n"
 				<< "  --max-polygons N   max vertex types (default: 5)\n"
 				<< "  --workers N        number of threads (default: hw)\n"
 				<< "  --output DIR       output directory (default: solutions)\n"
 				<< "  --mode memory|disk solver mode (default: memory)\n"
+				<< "  --format raw|tes|mortier  final output format (default: tes)\n"
 				<< "  --wl-dim 1|2       WL hash dimension (default: 1)\n"
 				<< "  --wl-iters N       WL iteration cap (default: 0 = iterate to convergence)\n"
-				<< "  --pdedup local|shared  partial dedup scope (default: local)\n"
 				<< "  --dedup wl|bfl       online solver dedup mode (default: wl)\n"
 				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
 				<< "  --prune-only        prune existing eusolver_* files in --output\n"
@@ -413,10 +433,17 @@ int main(int argc, char** argv) {
 				<< "  --extract-tes DB   extract .tes records from a pruner SQLite database\n"
 				<< "  --extract-output DIR  extraction directory (required with --extract-tes)\n"
 				<< "  --tes-id N         extract only this database entry id (default: all)\n"
+				<< "  --export-mortier-json DB  convert a Mortier SQLite database to JSON\n"
+				<< "  --json-output FILE  JSON path required with --export-mortier-json\n"
+				<< "  --mortier-id N      export only this numeric Mortier entry id\n"
+				<< "  --mortier-stable-id HEX  export only this stable Mortier id\n"
+				<< "  --import-mortier-json FILE  convert generated Mortier JSON to SQLite\n"
+				<< "  --mortier-database DB  SQLite path required with --import-mortier-json\n"
 				<< "  --telegram-token T  Telegram bot token for progress updates\n"
 				<< "  --telegram-chat C   Telegram chat id to message\n"
 				<< "  --notify-minutes N  interval between Telegram updates (default 30)\n"
 				<< "  --telegram-dry-run  print messages to stderr instead of sending\n"
+				<< "  --version          show program version\n"
 				<< "  --help             show this help\n";
 			return 0;
 		}
@@ -428,6 +455,18 @@ int main(int argc, char** argv) {
 	if (num_workers < 1) num_workers = 1;
 	if (num_workers > MAX_WORKERS) {
 		std::cerr << "--workers must not exceed " << MAX_WORKERS << "\n";
+		return 1;
+	}
+	bool tes_operation = !extract_database.empty();
+	bool export_operation = !export_mortier_database.empty();
+	bool import_operation = !import_mortier_json_path.empty();
+	if ((tes_operation + export_operation + import_operation) > 1
+			|| (!tes_operation && (!extract_output.empty() || extract_id != 0))
+			|| (!export_operation
+				&& (!export_mortier_json_path.empty() || mortier_id != 0
+					|| !mortier_stable_id.empty()))
+			|| (!import_operation && !import_mortier_database.empty())) {
+		std::cerr << "invalid or conflicting extraction/conversion options\n";
 		return 1;
 	}
 	if (!extract_database.empty()) {
@@ -445,10 +484,45 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 	}
+	if (!export_mortier_database.empty()) {
+		if (export_mortier_json_path.empty()) {
+			std::cerr << "--json-output is required with --export-mortier-json\n";
+			return 1;
+		}
+		try {
+			auto stable_id = mortier_stable_id.empty()
+				? std::vector<uint8_t>{} : parse_hex_id(mortier_stable_id);
+			int64_t count = export_mortier_json(export_mortier_database,
+				export_mortier_json_path, mortier_id, stable_id);
+			std::cout << "Exported " << count << " Mortier record"
+			          << (count == 1 ? "" : "s") << " to " << export_mortier_json_path << "\n";
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "Mortier JSON export failed: " << e.what() << "\n";
+			return 1;
+		}
+	}
+	if (!import_mortier_json_path.empty()) {
+		if (import_mortier_database.empty()) {
+			std::cerr << "--mortier-database is required with --import-mortier-json\n";
+			return 1;
+		}
+		try {
+			int64_t count = import_mortier_json(import_mortier_json_path,
+			                                           import_mortier_database);
+			std::cout << "Imported " << count << " Mortier record"
+			          << (count == 1 ? "" : "s") << " to " << import_mortier_database << "\n";
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "Mortier JSON import failed: " << e.what() << "\n";
+			return 1;
+		}
+	}
+	if (output_format == FinalOutputFormat::Raw) g_keep_pruner_inputs = true;
 	if (prune_only) {
 		try {
 			auto start = std::chrono::steady_clock::now();
-			run_pruner(output_dir, num_workers);
+			run_pruner(output_dir, num_workers, output_format);
 			auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 			std::cout << "Pruner phase:  " << std::fixed << std::setprecision(1) << elapsed << "s\n";
 			return 0;
@@ -544,7 +618,6 @@ int main(int argc, char** argv) {
 	auto t0 = std::chrono::steady_clock::now();
 
 	if (mode == "disk") {
-		set_pdedup_shared(pdedup_mode == 1);
 		fs::create_directories(output_dir);
 
 		std::vector<std::string> chunk_paths;
@@ -789,7 +862,7 @@ int main(int argc, char** argv) {
 		compress_merged_solutions(output_dir);
 
 		std::cout << "Pruner phase starting...\n";
-		auto counts = run_pruner(output_dir, num_workers);
+		auto counts = run_pruner(output_dir, num_workers, output_format);
 		std::cout << "\nPruner phase:  " << std::fixed << std::setprecision(1)
 		          << std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count() << "s\n";
 		finish_notify(counts, output_dir, telegram_token, telegram_chat);
@@ -816,7 +889,7 @@ int main(int argc, char** argv) {
 
 			// Shared counters (updated by workers, read by progress thread)
 			std::atomic<int64_t> total_partials{0}, total_solutions{0};
-			std::atomic<int64_t> total_deduped{0}, total_sol_deduped{0};
+			std::atomic<int64_t> total_sol_deduped{0};
 			std::atomic<bool> solver_running{true};
 
 			std::thread progress(progress_thread_fn, std::ref(sq),
@@ -840,7 +913,6 @@ int main(int argc, char** argv) {
 						std::map<std::string,int> rt;
 						std::map<std::string,std::string> sf;
 						HistogramMap vc;
-						int64_t pd_seen = 0, pd_deduped = 0;
 						int64_t solutions = 0, sol_accepted = 0;
 						std::vector<PackedState> local_batch;
 						std::vector<PackedState> packed_work;
@@ -866,7 +938,6 @@ int main(int argc, char** argv) {
 								EuclideanSolver::write_solution_static(cand, wdir, mu,
 										rt, sf, vc);
 								} else {
-								++pd_seen;
 								local_batch.push_back(EuclideanSolver::pack_state(cand));
 								}
 								}, max_polygons);
@@ -875,12 +946,10 @@ int main(int argc, char** argv) {
 						total_partials.fetch_add(nb);
 						total_solutions.fetch_add(sol_accepted);
 						total_sol_deduped.fetch_add(solutions - sol_accepted);
-						total_deduped.fetch_add(pd_deduped);
-						solutions = 0; sol_accepted = 0; pd_deduped = 0;
+						solutions = 0; sol_accepted = 0;
 						}
 						total_solutions.fetch_add(sol_accepted);
 						total_sol_deduped.fetch_add(solutions - sol_accepted);
-						total_deduped.fetch_add(pd_deduped);
 				});
 			}
 			for (auto& t : threads) t.join();
@@ -889,21 +958,20 @@ int main(int argc, char** argv) {
 
 			int64_t tp = total_partials.load();
 			int64_t ts = total_solutions.load();
-			int64_t td = total_deduped.load();
 			int64_t tsd = total_sol_deduped.load();
 
 			auto t1 = std::chrono::steady_clock::now();
 			std::cout << "\nSolver phase: " << std::fixed << std::setprecision(1)
 				<< std::chrono::duration<double>(t1 - t0).count() << "s  ("
 				<< tp << " partials, " << ts
-				<< " sols, dd " << td << "/" << tsd << ")\n";
+				<< " sols, deduped " << tsd << ")\n";
 
 			merge_worker_outputs(output_dir, worker_dirs);
 			for (const auto& wd : worker_dirs) fs::remove_all(wd);
 			compress_merged_solutions(output_dir);
 
 			std::cout << "Pruner phase starting...\n";
-			auto counts = run_pruner(output_dir, num_workers);
+			auto counts = run_pruner(output_dir, num_workers, output_format);
 			auto t2 = std::chrono::steady_clock::now();
 			std::cout << "\nPruner phase:  " << std::fixed << std::setprecision(1)
 				<< std::chrono::duration<double>(t2 - t1).count() << "s\n";

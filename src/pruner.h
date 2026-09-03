@@ -2,20 +2,31 @@
 #include "state.h"
 #include "bfl.h"
 #include "tes_store.h"
+#include "mortier_geometry.h"
 #include <array>
 #include <cstdint>
 #include <istream>
 #include <map>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+struct CanonicalTilingOutput {
+    std::vector<std::string> cycle_lines;
+    mortier_geometry::TilingDescription geometry;
+    std::string conway;
+};
+
+CanonicalTilingOutput build_canonical_tiling_output(const State& st);
 void write_cycle_final(const State& st, std::ostream& out,
-                       TesStore& tes_store, const std::string& combo,
+                       TesStore* tes_store, const std::string& combo,
                        const std::string& tes_filename,
                        const std::string& sig_raw);
+
+enum class FinalOutputFormat { Raw, Tes, Mortier };
 
 class SolutionPruner {
 public:
@@ -118,19 +129,21 @@ inline std::string wl_hash_dispatch(const State& st, int iters = 0) {
 
 class WLPruner : public SolutionPruner {
 public:
-    explicit WLPruner(const std::string& output_dir, int num_workers = 1);
+    explicit WLPruner(const std::string& output_dir, int num_workers = 1,
+                      FinalOutputFormat format = FinalOutputFormat::Tes);
     void run(const std::vector<std::string>& listfile_paths);
 
 private:
     void process_file_wl(const std::string& path);
     std::map<std::string, std::vector<PackedState>> solutions_by_hash_;
     DiskWordIndex solutions_words_;  // used when g_use_bfl
-    TesStore tes_store_;
+    std::unique_ptr<TesStore> tes_store_;
+    std::unique_ptr<MortierStore> mortier_store_;
     int num_workers_;
+    FinalOutputFormat format_;
 
     struct CanonicalResult {
         bool is_canonical;
-        std::string canon_log;
         std::string wl_hash;
         std::vector<int> bfl_word;
     };

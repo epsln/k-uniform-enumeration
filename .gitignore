@@ -4,6 +4,7 @@
 eusolver
 eusolver_*
 /tests/high_k_safety
+/tests/mortier_export
 
 # Python
 __pycache__/
