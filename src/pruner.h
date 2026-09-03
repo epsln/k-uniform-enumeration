@@ -34,6 +34,7 @@ public:
         std::string conway_line;
         State state;
         std::string count_signature;
+        int solution_index = 0;
     };
 
 protected:
@@ -104,6 +105,8 @@ extern int g_wl_iters;
 extern bool g_use_bfl;
 extern bool g_no_iso_check;
 extern bool g_compress_pruner_outputs;
+extern bool g_keep_pruner_inputs;
+extern bool g_profile_pruner;
 std::string wl_hash  (const State& st, int iterations = 3);
 std::string wl_hash_2(const State& st, int iterations = 3);
 std::string wl_hash_partial(const State& st, int iterations = 0);

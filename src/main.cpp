@@ -338,6 +338,7 @@ int main(int argc, char** argv) {
 	int max_ram_gb = 0;  // 0 = auto (k-based formula)
 	bool resume = false;
 	std::string extract_database, extract_output;
+	bool prune_only = false;
 	int64_t extract_id = 0;
 	std::string telegram_token, telegram_chat;
 	int notify_minutes = 30;
@@ -358,6 +359,9 @@ int main(int argc, char** argv) {
 			else { dedup_mode = "wl"; g_use_bfl = false; }
 		}
 		else if (arg == "--no-iso-check") { g_no_iso_check = true; }
+		else if (arg == "--prune-only") { prune_only = true; }
+		else if (arg == "--keep-pruner-inputs") { g_keep_pruner_inputs = true; }
+		else if (arg == "--profile-pruner") { g_profile_pruner = true; }
 		else if (arg == "--propagate") { g_propagate = true; }
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
@@ -388,6 +392,9 @@ int main(int argc, char** argv) {
 				<< "  --pdedup local|shared  partial dedup scope (default: local)\n"
 				<< "  --dedup wl|bfl       online solver dedup mode (default: wl)\n"
 				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
+				<< "  --prune-only        prune existing eusolver_* files in --output\n"
+				<< "  --keep-pruner-inputs preserve raw solution files after pruning\n"
+				<< "  --profile-pruner     report per-file pruner stage timings\n"
 				<< "  --fanout N         BFS fan-out target (0=auto, default: 40000)\n"
 				<< "  --spill N          disk spill threshold (0=auto, default: 50000)\n"
 				<< "  --chunks N         number of frontier chunks (0=auto, default: workers*32)\n"
@@ -425,6 +432,18 @@ int main(int argc, char** argv) {
 			return 0;
 		} catch (const std::exception& e) {
 			std::cerr << "TES extraction failed: " << e.what() << "\n";
+			return 1;
+		}
+	}
+	if (prune_only) {
+		try {
+			auto start = std::chrono::steady_clock::now();
+			run_pruner(output_dir, num_workers);
+			auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+			std::cout << "Pruner phase:  " << std::fixed << std::setprecision(1) << elapsed << "s\n";
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "Pruner failed: " << e.what() << "\n";
 			return 1;
 		}
 	}
