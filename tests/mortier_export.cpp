@@ -1,5 +1,7 @@
 #include "mortier_geometry.h"
 #include "mortier_store.h"
+#include "bfl.h"
+#include "solver.h"
 
 #include <cassert>
 #include <filesystem>
@@ -32,6 +34,13 @@ static void test_codec() {
     try { (void)decode_mortier_record(encoded); }
     catch (const std::runtime_error&) { rejected = true; }
     assert(rejected);
+}
+
+static void test_stable_hash_encoding() {
+    std::string hash = bfl_canonical_hash(EuclideanSolver::make_initial(0));
+    const std::string expected =
+        "8f9e3b66cd530bb42e0fd8c91f3d4d70942b11e52933f27bfb49408e956a94de";
+    assert(format_hex_id(std::vector<uint8_t>(hash.begin(), hash.end())) == expected);
 }
 
 static void test_regular_tilings() {
@@ -106,6 +115,7 @@ static void test_store_and_json() {
 
 int main() {
     test_codec();
+    test_stable_hash_encoding();
     test_regular_tilings();
     test_store_and_json();
 }

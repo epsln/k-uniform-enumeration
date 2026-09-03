@@ -32,9 +32,9 @@ std::atomic<int64_t> g_wl_hash_hits{0};
 std::atomic<int64_t> g_wl_collisions{0};
 std::atomic<int64_t> g_solutions_match_calls{0};
 std::atomic<int> g_wl_max_iters{0};
-bool g_compress_pruner_outputs = true;  // compress eupruned/euraw rolling outputs by default
+bool g_compress_pruner_outputs = true;  // compress rolling pruner output by default
 
-// Compress euraw.txt/eupruned.txt "on the go" instead of only once at the
+// Compress eupruned.txt on the go instead of only once at the
 // end: these are opened once per combo_code and streamed to for the whole
 // run, so left alone they can grow very large before ever getting
 // compressed. Neither file is ever read back within this program, so we
@@ -929,80 +929,6 @@ std::string wl_hash_2(const State& st, int iterations) {
     return out;
 }
 
-// =============================================================================
-// Orbit filter for partial states during search
-// =============================================================================
-std::vector<bool> compute_orbit_canonicals(const State& st, bool mirrored) {
-    int n = (int)st.darts.size();
-    int nw = (n + 63) / 64;
-
-    // Run bit-set alias refinement to find automorphism orbits
-    static thread_local std::vector<BS4> alias_small;
-    static thread_local std::vector<uint64_t> alias_large;
-    AliasRows alias = alias_rows(n, nw, alias_small, alias_large);
-
-    for (int i = 0; i < n; ++i) {
-        for (int w = 0; w < nw; ++w) alias[i][w] = ~0ULL;
-        int rem = n & 63;
-        if (rem) alias[i][nw-1] &= (1ULL << rem) - 1;
-    }
-
-    static thread_local std::vector<uint8_t> dirty;
-    static thread_local std::vector<int> worklist;
-    if ((int)dirty.size() < n)  dirty.resize(n, 0);
-    if ((int)worklist.size() < n) worklist.resize(n);
-    int wl = n;
-    for (int i = 0; i < n; ++i) { dirty[i] = 1; worklist[i] = i; }
-
-    while (wl > 0) {
-        int nwl = 0;
-        for (int wi = 0; wi < wl; ++wi) {
-            int i = worklist[wi]; dirty[i] = 0;
-            for (int w = 0; w < nw; ++w) {
-                uint64_t bits = alias[i][w];
-                while (bits) {
-                    int bit = __builtin_ctzll(bits); bits &= bits - 1;
-                    int j = w * 64 + bit; if (j == i) continue;
-                    int gi = st.darts[i].glue, gj = st.darts[j].glue;
-                    bool glue_matches = (gi == -1 && gj == -1)
-                        || (gi != -1 && gj != -1 && alias_get(alias, gi, gj));
-                    if (st.darts[i].polygon_size != st.darts[j].polygon_size
-                        || !alias_get(alias, j, i)
-                        || !alias_get(alias, st.darts[i].mirro, st.darts[j].mirro)
-                        || !glue_matches
-                        || !alias_get(alias, st.darts[i].rneig, st.darts[j].rneig)
-                        || !alias_get(alias, st.darts[i].lneig, st.darts[j].lneig))
-                    {
-                        alias[i][w] &= ~(1ULL << bit);
-                        if (!dirty[j]) { dirty[j] = 1; worklist[nwl++] = j; }
-                        if (!dirty[i]) { dirty[i] = 1; worklist[nwl++] = i; }
-                        goto next_orbit;
-                    }
-                }
-            }
-            next_orbit:;
-        }
-        wl = nwl;
-    }
-
-    // Now find canonical representatives among FREE edges with matching mirror type
-    std::vector<bool> canonical(n, false);
-    for (int i = 0; i < n; ++i) {
-        if (st.darts[i].glue != -1) continue;
-        if ((st.darts[i].mirro == i) != mirrored) continue;
-        // Check if any j < i in the same orbit is also free and matching
-        bool has_earlier = false;
-        for (int j = 0; j < i; ++j) {
-            if (st.darts[j].glue != -1) continue;
-            if ((st.darts[j].mirro == j) != mirrored) continue;
-            if (alias_get(alias, i, j)) { has_earlier = true; break; }
-        }
-        if (!has_earlier) canonical[i] = true;
-    }
-    return canonical;
-}
-
-// =============================================================================
 // DiskWordIndex — exact disk-backed canonical-word set
 // =============================================================================
 static uint64_t word_hash(const std::vector<int>& w) {
@@ -1103,7 +1029,7 @@ WLPruner::CanonicalResult WLPruner::compute_canonical_and_wl(const State& st) co
     CanonicalResult r;
     auto [ok, log] = is_canonical_labeling(st);
     r.is_canonical = ok;
-    r.canon_log = log;
+    (void)log;
     if (ok) {
         if (g_use_bfl)
             r.bfl_word = bfl_word_signature(st);

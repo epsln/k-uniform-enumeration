@@ -18,7 +18,10 @@ from typing import Iterable, Optional
 
 
 REFERENCE_COUNTS = {1: 10, 2: 20, 3: 61, 4: 151, 5: 332, 6: 673,
-                    7: 1472, 8: 2849}
+                    7: 1472, 8: 2849, 9: 5959, 10: 11866,
+                    11: 24459, 12: 49793, 13: 103080, 14: 212630,
+                    15: 445289, 16: 933636, 17: 1972148, 18: 4177505,
+                    19: 8896553, 20: 18992613}
 
 
 @dataclass(frozen=True)
@@ -138,7 +141,7 @@ def select_solutions(solutions: dict[int, frozenset[str]], max_k: int) -> set[tu
     return {(k, digest) for k, values in solutions.items() if k <= max_k for digest in values}
 
 
-def parse_k_spec(spec: str, maximum: int = 8) -> list[int]:
+def parse_k_spec(spec: str, maximum: int = 20) -> list[int]:
     values: set[int] = set()
     for item in spec.split(","):
         item = item.strip()

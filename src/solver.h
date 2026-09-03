@@ -140,17 +140,9 @@ public:
     static std::pair<int,int> analyze_cycles(const State& st);
     static bool propagate_forced(std::vector<Dart>& darts);
 
-    // Partial dedup and helpers (capped per worker, disabled by default)
-    static bool partial_dedup_check(const State& cand, int max_polygons);
-    static void set_pdedup_cap(int cap);
-
     // Canonical labeling check for partial states (glue[i]==-1 handled).
     // Returns true if this partial state's labeling is canonical — skip otherwise.
     static bool is_canonical_partial(const State& st);
-
-    // Lexicographic edge ordering: deterministic, enables canonical pruning.
-    // Returns -1 if no free edges.
-    static int first_free_lex(const State& st);
 
     // Helpers needed by extend_into template (must be declared before use)
     static int neighbors_len(int gr);

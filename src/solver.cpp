@@ -393,13 +393,6 @@ bool EuclideanSolver::propagate_forced(std::vector<Dart>& darts) {
 }
 
 // =============================================================================
-// Partial dedup — disabled (net negative for performance at tested k)
-// =============================================================================
-void EuclideanSolver::set_pdedup_cap(int) {}
-
-bool EuclideanSolver::partial_dedup_check(const State&, int) { return true; }
-
-// =============================================================================
 // Canonical labeling filter for partial states.
 // Adapted from SolutionPruner::is_canonical_labeling — handles glue[i]==-1.
 // Non-canonical partials are skipped: some other construction order will
@@ -472,33 +465,6 @@ bool EuclideanSolver::is_canonical_partial(const State& st) {
     for (int i = 0; i < n; ++i)
         if (!unique[i]) return false;
     return true;
-}
-
-// =============================================================================
-// Helper (kept for possible future partial dedup)
-// =============================================================================
-static inline uint64_t fnv64(uint64_t h, uint64_t x) { return (h ^ x) * 1099511628211ULL; }
-
-// =============================================================================
-// Lexicographic edge ordering — deterministic, enables canonical pruning.
-// =============================================================================
-int EuclideanSolver::first_free_lex(const State& st) {
-    int best = -1;
-    int n = (int)st.darts.size();
-    for (int i = 0; i < n; ++i) {
-        if (st.darts[i].glue != -1) continue;
-        if (best == -1) { best = i; continue; }
-        int ki = st.darts[i].is_mirror_edge ? st.darts[i].mirro : i;
-        int kb = st.darts[best].is_mirror_edge ? st.darts[best].mirro : best;
-        int si = st.darts[ki].polygon_size;
-        int sb = st.darts[kb].polygon_size;
-        if (si < sb) best = i;
-        else if (si == sb) {
-            if (!st.darts[i].is_mirror_edge && st.darts[best].is_mirror_edge) best = i;
-            else if (st.darts[i].is_mirror_edge == st.darts[best].is_mirror_edge && i < best) best = i;
-        }
-    }
-    return best;
 }
 
 // =============================================================================

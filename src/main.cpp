@@ -341,7 +341,6 @@ int main(int argc, char** argv) {
 	int fanout_target = 0;    // 0 = auto-scale
 	int spill_threshold = 0;  // 0 = auto-scale
 	int chunks_user = 0;      // 0 = auto (num_workers * 32)
-	int pdedup_mode = 0;  // 0=per-worker, 1=global shared
 	std::string dedup_mode  = "wl";
 	int64_t sol_dedup_cap_user = 0;  // 0 = auto-scale
 	int max_ram_gb = 0;  // 0 = auto (k-based formula)
@@ -371,7 +370,6 @@ int main(int argc, char** argv) {
 		}
 		else if (arg == "--wl-dim" && i + 1 < argc) { int d = std::stoi(argv[++i]); g_wl_dim = (d == 2 ? 2 : 1); }
 		else if (arg == "--wl-iters" && i + 1 < argc) g_wl_iters = std::stoi(argv[++i]);
-		else if (arg == "--pdedup" && i + 1 < argc) { std::string v = argv[++i]; pdedup_mode = (v == "shared" ? 1 : 0); }
 		else if (arg == "--dedup" && i + 1 < argc) {
 			std::string v = argv[++i];
 			if (v == "bfl") { dedup_mode = "bfl"; g_use_bfl = true; }
@@ -381,7 +379,6 @@ int main(int argc, char** argv) {
 		else if (arg == "--prune-only") { prune_only = true; }
 		else if (arg == "--keep-pruner-inputs") { g_keep_pruner_inputs = true; }
 		else if (arg == "--profile-pruner") { g_profile_pruner = true; }
-		else if (arg == "--propagate") { g_propagate = true; }
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
 		else if (arg == "--fanout" && i + 1 < argc) fanout_target = std::stoi(argv[++i]);
@@ -406,6 +403,10 @@ int main(int argc, char** argv) {
 		else if (arg == "--telegram-chat" && i + 1 < argc) telegram_chat = argv[++i];
 		else if (arg == "--notify-minutes" && i + 1 < argc) notify_minutes = std::stoi(argv[++i]);
 		else if (arg == "--telegram-dry-run") { g_telegram_dry_run = true; }
+		else if (arg == "--version") {
+			std::cout << "eusolver 1.0.0\n";
+			return 0;
+		}
 		else if (arg == "--help") {
 			std::cout << "Usage: eusolver [options]\n"
 				<< "  --max-polygons N   max vertex types (default: 5)\n"
@@ -415,7 +416,6 @@ int main(int argc, char** argv) {
 				<< "  --format raw|tes|mortier  final output format (default: tes)\n"
 				<< "  --wl-dim 1|2       WL hash dimension (default: 1)\n"
 				<< "  --wl-iters N       WL iteration cap (default: 0 = iterate to convergence)\n"
-				<< "  --pdedup local|shared  partial dedup scope (default: local)\n"
 				<< "  --dedup wl|bfl       online solver dedup mode (default: wl)\n"
 				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
 				<< "  --prune-only        prune existing eusolver_* files in --output\n"
@@ -443,6 +443,7 @@ int main(int argc, char** argv) {
 				<< "  --telegram-chat C   Telegram chat id to message\n"
 				<< "  --notify-minutes N  interval between Telegram updates (default 30)\n"
 				<< "  --telegram-dry-run  print messages to stderr instead of sending\n"
+				<< "  --version          show program version\n"
 				<< "  --help             show this help\n";
 			return 0;
 		}
@@ -617,7 +618,6 @@ int main(int argc, char** argv) {
 	auto t0 = std::chrono::steady_clock::now();
 
 	if (mode == "disk") {
-		set_pdedup_shared(pdedup_mode == 1);
 		fs::create_directories(output_dir);
 
 		std::vector<std::string> chunk_paths;
@@ -889,7 +889,7 @@ int main(int argc, char** argv) {
 
 			// Shared counters (updated by workers, read by progress thread)
 			std::atomic<int64_t> total_partials{0}, total_solutions{0};
-			std::atomic<int64_t> total_deduped{0}, total_sol_deduped{0};
+			std::atomic<int64_t> total_sol_deduped{0};
 			std::atomic<bool> solver_running{true};
 
 			std::thread progress(progress_thread_fn, std::ref(sq),
@@ -913,7 +913,6 @@ int main(int argc, char** argv) {
 						std::map<std::string,int> rt;
 						std::map<std::string,std::string> sf;
 						HistogramMap vc;
-						int64_t pd_seen = 0, pd_deduped = 0;
 						int64_t solutions = 0, sol_accepted = 0;
 						std::vector<PackedState> local_batch;
 						std::vector<PackedState> packed_work;
@@ -939,7 +938,6 @@ int main(int argc, char** argv) {
 								EuclideanSolver::write_solution_static(cand, wdir, mu,
 										rt, sf, vc);
 								} else {
-								++pd_seen;
 								local_batch.push_back(EuclideanSolver::pack_state(cand));
 								}
 								}, max_polygons);
@@ -948,12 +946,10 @@ int main(int argc, char** argv) {
 						total_partials.fetch_add(nb);
 						total_solutions.fetch_add(sol_accepted);
 						total_sol_deduped.fetch_add(solutions - sol_accepted);
-						total_deduped.fetch_add(pd_deduped);
-						solutions = 0; sol_accepted = 0; pd_deduped = 0;
+						solutions = 0; sol_accepted = 0;
 						}
 						total_solutions.fetch_add(sol_accepted);
 						total_sol_deduped.fetch_add(solutions - sol_accepted);
-						total_deduped.fetch_add(pd_deduped);
 				});
 			}
 			for (auto& t : threads) t.join();
@@ -962,14 +958,13 @@ int main(int argc, char** argv) {
 
 			int64_t tp = total_partials.load();
 			int64_t ts = total_solutions.load();
-			int64_t td = total_deduped.load();
 			int64_t tsd = total_sol_deduped.load();
 
 			auto t1 = std::chrono::steady_clock::now();
 			std::cout << "\nSolver phase: " << std::fixed << std::setprecision(1)
 				<< std::chrono::duration<double>(t1 - t0).count() << "s  ("
 				<< tp << " partials, " << ts
-				<< " sols, dd " << td << "/" << tsd << ")\n";
+				<< " sols, deduped " << tsd << ")\n";
 
 			merge_worker_outputs(output_dir, worker_dirs);
 			for (const auto& wd : worker_dirs) fs::remove_all(wd);

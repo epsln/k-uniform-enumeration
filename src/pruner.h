@@ -144,7 +144,6 @@ private:
 
     struct CanonicalResult {
         bool is_canonical;
-        std::string canon_log;
         std::string wl_hash;
         std::vector<int> bfl_word;
     };
