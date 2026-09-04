@@ -1,3 +1,36 @@
+# eusolver 1.0.1
+
+Hotfix release for exact Mortier conversion and interoperability.
+
+## Fixes
+
+- Replaced depth-limited translation discovery with a finite affine-voltage
+  traversal, eliminating failures when a second period appears beyond an
+  arbitrary search depth.
+- Added a regression for the high-k `(3,3,3,4,4)Ax3` / triangular family that
+  previously failed at depth 24.
+- Added strict generated-TES parsing and direct, resumable TES SQLite to Mortier
+  SQLite conversion with full logical SHA-256 source identity.
+- Added schema-v2 conversion provenance, atomic checkpoints, retryable failures,
+  source-ID/chunk reconciliation, and schema-v1 read compatibility.
+- Added legacy Mortier JSON support for `eu_raw_*`/`eu_*` names with exact `k`
+  decoding from catalogue multiplicities.
+- Legacy `_failures` diagnostics are persisted and keep imported databases
+  explicitly incomplete; incomplete databases cannot be exported as complete
+  JSON catalogues.
+- Hardened TES/Conway integer parsing, chunk allocation bounds, duplicate seed
+  residue checks, and JSON temporary-file cleanup.
+
+## Validation
+
+- All 11 `k=13` records of the originally failing signature converted to valid
+  26-seed Mortier records.
+- All 30 `k<=2` native records still match unique Galebach catalogue entries.
+- The 1,302 valid records in Mortier's legacy `tilings.json` import successfully;
+  its 237 recorded failures remain persisted with `complete=0`.
+- Exact TES baseline, memory/disk equivalence, full unit suite, and UBSan checks
+  pass.
+
 # eusolver 1.0.0
 
 Initial stable release of the C++ k-uniform Euclidean tiling enumerator.
@@ -27,7 +60,7 @@ Initial stable release of the C++ k-uniform Euclidean tiling enumerator.
 
 ## Compatibility
 
-- Mortier SQLite schema version: 1.
+- Mortier SQLite schema version: 2; version 1 remains readable.
 - Mortier binary codec version: 1.
 - Raw binary state record version: 2; legacy records remain readable.
 - Stable BFL hash lanes are serialized little-endian.

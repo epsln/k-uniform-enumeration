@@ -19,3 +19,4 @@ __pycache__/
 solutions/
 solutions_*/
 /tilings_*.sqlite3
+/*.json.tmp

@@ -33,12 +33,13 @@ struct MortierStoredEntry {
     int k = 0;
     int64_t seed_count = 0;
     std::optional<std::string> signature;
+    std::optional<int64_t> source_entry_id;
     MortierRecord record;
 };
 
 class MortierStore {
 public:
-    static constexpr int SCHEMA_VERSION = 1;
+    static constexpr int SCHEMA_VERSION = 2;
     static constexpr int CODEC_VERSION = 1;
     static constexpr size_t DEFAULT_CHUNK_TARGET = 8 * 1024 * 1024;
     static constexpr const char* DEFAULT_Z4_BASIS = "e0,e1,e2,e3";
@@ -55,8 +56,10 @@ public:
     void add(const std::vector<uint8_t>& stable_id, int k,
              const MortierRecord& record,
              std::optional<std::string> signature = std::nullopt);
+    void add_import_failure(const std::string& name, const std::string& message);
     void checkpoint();
     void finish();
+    void finish_incomplete();
 
     // Readers accept both checkpointed and finished databases. Call
     // is_complete() when publication completeness is required.
@@ -80,6 +83,7 @@ private:
     };
 
     void flush();
+    void finish_with_status(bool complete);
 
     sqlite3* db_ = nullptr;
     size_t chunk_target_;
@@ -95,6 +99,19 @@ int64_t export_mortier_json(const std::string& database_path,
                             const std::vector<uint8_t>& stable_id = {});
 int64_t import_mortier_json(
     const std::string& json_path, const std::string& database_path,
+    size_t chunk_target = MortierStore::DEFAULT_CHUNK_TARGET);
+
+enum class ConversionErrorMode { Fail, Continue };
+
+struct TesMortierConversionResult {
+    int64_t converted_count = 0;
+    int64_t failure_count = 0;
+    bool complete = false;
+};
+
+TesMortierConversionResult convert_tes_to_mortier(
+    const std::string& tes_database, const std::string& mortier_database,
+    bool resume = false, ConversionErrorMode errors = ConversionErrorMode::Fail,
     size_t chunk_target = MortierStore::DEFAULT_CHUNK_TARGET);
 std::vector<uint8_t> parse_hex_id(const std::string& text);
 std::string format_hex_id(const std::vector<uint8_t>& id);
