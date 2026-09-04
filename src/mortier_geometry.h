@@ -41,6 +41,10 @@ struct TilingDescription {
     std::vector<std::vector<ConwayAdjacency>> adjacency;
 };
 
+// Parses the strict TES subset emitted by the solver. Throws
+// std::invalid_argument for malformed or unsupported input.
+TilingDescription parse_generated_tes(const std::string& document);
+
 // Parses forms such as "(0 1')[2](3@4 0)". Parentheses reverse the
 // neighbour's directed entry edge; brackets preserve it.
 std::vector<std::vector<ConwayAdjacency>> parse_conway_adjacency(
@@ -61,6 +65,8 @@ TilingDescription make_tiling_description(
 void validate_tiling_description(TilingDescription& description);
 
 struct DevelopmentOptions {
+    // Retained for source compatibility. Finite voltage-graph development does
+    // not use spatial search limits.
     size_t max_tiles = 50000;
     size_t max_depth = 24;
     size_t max_quotient_tiles = 100000;
@@ -68,6 +74,8 @@ struct DevelopmentOptions {
 
 struct DevelopmentResult {
     MortierRecord record;
+    // Reachable finite control classes. These counts are equal now that no
+    // separate spatial quotient traversal is performed.
     size_t developed_tiles = 0;
     size_t quotient_tiles = 0;
     size_t translation_candidates = 0;
@@ -92,7 +100,6 @@ void validate_mortier_record(const MortierRecord& record);
 
 // Limitations: only unit-edge regular 3-, 4-, 6-, and 12-gons embed in this
 // 12-direction ring. The input must describe a connected, edge-to-edge,
-// translation-periodic Euclidean tiling; disconnected types and tilings whose
-// period is not exposed before DevelopmentOptions limits are rejected.
+// translation-periodic Euclidean tiling.
 
 } // namespace mortier_geometry

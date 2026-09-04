@@ -1,6 +1,7 @@
 #include "mortier_geometry.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <deque>
 #include <limits>
@@ -44,19 +45,6 @@ struct Control {
     int orientation = 0; // Direction of physical edge zero.
     bool reflected = false;
     Z4Point anchor;       // Start of physical edge zero.
-    size_t depth = 0;
-};
-
-struct ControlKey {
-    int tile;
-    int orientation;
-    bool reflected;
-    Z4Point anchor;
-
-    bool operator<(const ControlKey& other) const {
-        return std::tie(tile, orientation, reflected, anchor)
-             < std::tie(other.tile, other.orientation, other.reflected, other.anchor);
-    }
 };
 
 struct ControlClass {
@@ -234,7 +222,24 @@ Control neighbour_control(const TilingDescription& description,
     for (int edge = 0; edge < entry; ++edge)
         anchor = anchor - direction_step(orientation
             + (reflected ? edge : -edge) * neighbour_turn);
-    return {adjacent.tile, orientation, reflected, anchor, current.depth + 1};
+    return {adjacent.tile, orientation, reflected, anchor};
+}
+
+void validate_transition_geometry(const TilingDescription& description,
+                                  const Control& current, int physical_edge,
+                                  const std::vector<Z4Point>& vertices,
+                                  const Control& neighbour) {
+    int pattern = description.physical_to_pattern[current.tile][physical_edge];
+    const ConwayAdjacency& adjacent = description.adjacency[current.tile][pattern];
+    int entry = first_physical_edge(description, adjacent.tile, adjacent.pattern_edge);
+    std::vector<Z4Point> neighbour_vertices = polygon_vertices(
+        neighbour, description.polygon_sides[neighbour.tile]);
+    Z4Point expected_start = vertices[physical_edge];
+    Z4Point expected_end = vertices[(physical_edge + 1) % vertices.size()];
+    if (!adjacent.mirrored) std::swap(expected_start, expected_end);
+    if (neighbour_vertices[entry] != expected_start
+        || neighbour_vertices[(entry + 1) % neighbour_vertices.size()] != expected_end)
+        throw std::runtime_error("adjacent polygon edge has inconsistent exact geometry");
 }
 
 void add_unique_nonzero(std::vector<Z4Point>& values, const Z4Point& value) {
@@ -389,7 +394,10 @@ std::pair<int, int> parse_reference(const std::string& text, size_t base_offset)
         throw std::invalid_argument(ref_error(base_offset, "expected edge number"));
     int edge = 0;
     while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
-        edge = edge * 10 + text[i] - '0';
+        int digit = text[i] - '0';
+        if (edge > (std::numeric_limits<int>::max() - digit) / 10)
+            throw std::invalid_argument(ref_error(base_offset + i, "edge number is out of range"));
+        edge = edge * 10 + digit;
         ++i;
     }
     int tile = 0;
@@ -398,7 +406,10 @@ std::pair<int, int> parse_reference(const std::string& text, size_t base_offset)
         if (i == text.size() || text[i] < '0' || text[i] > '9')
             throw std::invalid_argument(ref_error(base_offset + i, "expected tile number"));
         while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
-            tile = tile * 10 + text[i] - '0';
+            int digit = text[i] - '0';
+            if (tile > (std::numeric_limits<int>::max() - digit) / 10)
+                throw std::invalid_argument(ref_error(base_offset + i, "tile number is out of range"));
+            tile = tile * 10 + digit;
             ++i;
         }
     } else {
@@ -411,6 +422,178 @@ std::pair<int, int> parse_reference(const std::string& text, size_t base_offset)
         throw std::invalid_argument(ref_error(base_offset + i, "unexpected character in edge reference"));
     return {tile, edge};
 }
+
+class GeneratedTesParser {
+public:
+    explicit GeneratedTesParser(const std::string& document) : text_(document) {}
+
+    TilingDescription parse() {
+        while (skip_ignored()) {
+            size_t directive_offset = cursor_;
+            std::string directive = identifier("expected TES directive");
+            if (directive == "e2") {
+                if (saw_e2_) fail(directive_offset, "duplicate e2 directive");
+                expect('.', "expected '.' after e2");
+                saw_e2_ = true;
+            } else if (directive == "angleunit") {
+                parse_angleunit();
+            } else if (directive == "unittile") {
+                parse_unittile();
+            } else if (directive == "conway") {
+                if (saw_conway_) fail(directive_offset, "duplicate conway directive");
+                parse_conway();
+                saw_conway_ = true;
+            } else if (directive == "repeat") {
+                parse_repeat(directive_offset);
+            } else {
+                fail(directive_offset, "unsupported directive '" + directive + "'");
+            }
+        }
+
+        if (!saw_e2_) fail(cursor_, "missing e2 directive");
+        if (!saw_angleunit_) fail(cursor_, "missing angleunit(deg) directive");
+        if (polygon_sides_.empty()) fail(cursor_, "missing unittile directive");
+        if (!saw_conway_) fail(cursor_, "missing conway directive");
+
+        std::vector<int> repeats(polygon_sides_.size(), 1);
+        for (const auto& repeat : repeats_) {
+            if (repeat.first >= polygon_sides_.size())
+                fail(repeat.second.offset, "repeat tile index is out of range");
+            repeats[repeat.first] = repeat.second.count;
+        }
+        return make_tiling_description(std::move(polygon_sides_),
+                                       std::move(repeats), conway_);
+    }
+
+private:
+    struct RepeatValue {
+        int count;
+        size_t offset;
+    };
+
+    const std::string& text_;
+    size_t cursor_ = 0;
+    bool saw_e2_ = false;
+    bool saw_angleunit_ = false;
+    bool saw_conway_ = false;
+    std::vector<int> polygon_sides_;
+    std::map<size_t, RepeatValue> repeats_;
+    std::string conway_;
+
+    [[noreturn]] void fail(size_t offset, const std::string& reason) const {
+        throw std::invalid_argument("invalid generated TES at byte "
+                                    + std::to_string(offset) + ": " + reason);
+    }
+
+    bool skip_ignored() {
+        for (;;) {
+            while (cursor_ < text_.size()
+                   && std::isspace(static_cast<unsigned char>(text_[cursor_])))
+                ++cursor_;
+            if (cursor_ + 1 >= text_.size() || text_[cursor_] != '#'
+                || text_[cursor_ + 1] != '#')
+                return cursor_ < text_.size();
+            cursor_ += 2;
+            while (cursor_ < text_.size() && text_[cursor_] != '\n') ++cursor_;
+        }
+    }
+
+    void expect(char expected, const char* reason) {
+        skip_ignored();
+        if (cursor_ == text_.size() || text_[cursor_] != expected)
+            fail(cursor_, reason);
+        ++cursor_;
+    }
+
+    std::string identifier(const char* reason) {
+        skip_ignored();
+        size_t start = cursor_;
+        while (cursor_ < text_.size()
+               && (std::isalnum(static_cast<unsigned char>(text_[cursor_]))
+                   || text_[cursor_] == '_'))
+            ++cursor_;
+        if (start == cursor_ || !std::isalpha(static_cast<unsigned char>(text_[start])))
+            fail(start, reason);
+        return text_.substr(start, cursor_ - start);
+    }
+
+    int integer(const char* reason) {
+        skip_ignored();
+        size_t start = cursor_;
+        int value = 0;
+        if (cursor_ == text_.size()
+            || !std::isdigit(static_cast<unsigned char>(text_[cursor_])))
+            fail(cursor_, reason);
+        while (cursor_ < text_.size()
+               && std::isdigit(static_cast<unsigned char>(text_[cursor_]))) {
+            int digit = text_[cursor_] - '0';
+            if (value > (std::numeric_limits<int>::max() - digit) / 10)
+                fail(start, "integer is out of range");
+            value = value * 10 + digit;
+            ++cursor_;
+        }
+        return value;
+    }
+
+    void parse_angleunit() {
+        if (saw_angleunit_) fail(cursor_, "duplicate angleunit directive");
+        expect('(', "expected '(' after angleunit");
+        size_t unit_offset = cursor_;
+        if (identifier("expected angle unit") != "deg")
+            fail(unit_offset, "only angleunit(deg) is supported");
+        expect(')', "expected ')' after angleunit");
+        saw_angleunit_ = true;
+    }
+
+    void parse_unittile() {
+        expect('(', "expected '(' after unittile");
+        std::vector<int> angles{integer("expected integer tile angle")};
+        for (;;) {
+            skip_ignored();
+            if (cursor_ < text_.size() && text_[cursor_] == ',') {
+                ++cursor_;
+                angles.push_back(integer("expected integer tile angle"));
+            } else {
+                break;
+            }
+        }
+        expect(')', "expected ')' after unittile angles");
+        int sides = static_cast<int>(angles.size());
+        if (sides != 3 && sides != 4 && sides != 6 && sides != 12)
+            fail(cursor_, "unittile is not a supported regular polygon");
+        int expected_angle = 180 - 360 / sides;
+        if (!std::all_of(angles.begin(), angles.end(),
+                         [expected_angle](int angle) { return angle == expected_angle; }))
+            fail(cursor_, "unittile angles do not describe a regular polygon");
+        polygon_sides_.push_back(sides);
+    }
+
+    void parse_conway() {
+        expect('(', "expected '(' after conway");
+        expect('"', "expected quoted Conway string");
+        size_t start = cursor_;
+        while (cursor_ < text_.size() && text_[cursor_] != '"') {
+            if (text_[cursor_] == '\\')
+                fail(cursor_, "escapes are not supported in Conway strings");
+            ++cursor_;
+        }
+        if (cursor_ == text_.size()) fail(start, "unterminated Conway string");
+        conway_ = text_.substr(start, cursor_ - start);
+        ++cursor_;
+        expect(')', "expected ')' after Conway string");
+    }
+
+    void parse_repeat(size_t directive_offset) {
+        expect('(', "expected '(' after repeat");
+        int tile = integer("expected repeat tile index");
+        expect(',', "expected ',' in repeat directive");
+        int count = integer("expected repeat count");
+        expect(')', "expected ')' after repeat directive");
+        size_t tile_index = static_cast<size_t>(tile);
+        if (!repeats_.emplace(tile_index, RepeatValue{count, directive_offset}).second)
+            fail(directive_offset, "duplicate repeat for tile index");
+    }
+};
 
 void validate_face_geometry(const MortierRecord& record) {
     std::set<Z4Point> seeds(record.seeds.begin(), record.seeds.end());
@@ -500,6 +683,10 @@ std::pair<long double, long double> cartesian(const Z4Point& point) {
 bool cartesian_independent(const Z4Point& first, const Z4Point& second) {
     Quadratic d = determinant(first, second);
     return d.rational != 0 || d.radical != 0;
+}
+
+TilingDescription parse_generated_tes(const std::string& document) {
+    return GeneratedTesParser(document).parse();
 }
 
 void validate_tiling_description(TilingDescription& description) {
@@ -669,48 +856,55 @@ void normalize_basis(Z4Point& t1, Z4Point& t2) {
 }
 
 DevelopmentResult develop_exact_geometry(TilingDescription description,
-                                         const DevelopmentOptions& options) {
+                                          const DevelopmentOptions& options) {
     validate_tiling_description(description);
-    if (options.max_tiles == 0 || options.max_quotient_tiles == 0)
-        throw std::invalid_argument("development limits must be nonzero");
+    (void)options;
 
-    std::deque<Control> queue{{Control{0, 0, false, Z4Point{}, 0}}};
-    std::set<ControlKey> visited;
-    std::map<ControlClass, Z4Point> origins;
+    Control initial{0, 0, false, Z4Point{}};
+    std::deque<ControlClass> queue{{ControlClass{0, 0, false}}};
+    std::map<ControlClass, Control> controls{{queue.front(), initial}};
     std::vector<Z4Point> candidates;
-    while (!queue.empty() && visited.size() < options.max_tiles) {
-        Control control = queue.front();
+    std::vector<Z4Point> transition_voltages;
+    while (!queue.empty()) {
+        ControlClass control_class = queue.front();
         queue.pop_front();
-        ControlKey key{control.tile, control.orientation, control.reflected, control.anchor};
-        if (!visited.insert(key).second) continue;
-        auto inserted = origins.emplace(ControlClass{control.tile, control.orientation,
-                                                     control.reflected},
-                                         control.anchor);
-        if (!inserted.second)
-            add_unique_nonzero(candidates, control.anchor - inserted.first->second);
-        if (control.depth >= options.max_depth) continue;
+        const Control control = controls.at(control_class);
         int sides = description.polygon_sides[control.tile];
         std::vector<Z4Point> vertices = polygon_vertices(control, sides);
-        for (int edge = 0; edge < sides; ++edge)
-            queue.push_back(neighbour_control(description, control, edge, vertices));
+        for (int edge = 0; edge < sides; ++edge) {
+            Control neighbour = neighbour_control(description, control, edge, vertices);
+            validate_transition_geometry(description, control, edge, vertices, neighbour);
+            ControlClass neighbour_class{neighbour.tile, neighbour.orientation,
+                                         neighbour.reflected};
+            auto inserted = controls.emplace(neighbour_class, neighbour);
+            if (inserted.second) {
+                queue.push_back(neighbour_class);
+            } else {
+                Z4Point voltage = neighbour.anchor - inserted.first->second.anchor;
+                transition_voltages.push_back(voltage);
+                add_unique_nonzero(candidates, voltage);
+            }
+        }
     }
-    if (visited.size() == options.max_tiles && !queue.empty() && candidates.size() < 2)
-        throw std::runtime_error("max_tiles reached before translations were discovered");
+    std::vector<bool> reached(description.polygon_sides.size(), false);
+    for (const auto& assigned : controls) reached[assigned.first.tile] = true;
+    for (size_t tile = 0; tile < reached.size(); ++tile) {
+        if (!reached[tile])
+            throw std::runtime_error("tiling description is disconnected at polygon type "
+                                     + std::to_string(tile));
+    }
     auto basis = choose_basis(candidates);
+    Quadratic basis_determinant = determinant(basis.first, basis.second);
+    for (const Z4Point& voltage : transition_voltages) {
+        if (!wide_integral_ratio(determinant(voltage, basis.second), basis_determinant)
+            || !wide_integral_ratio(determinant(basis.first, voltage), basis_determinant))
+            throw std::runtime_error("transition voltage is outside the derived lattice");
+    }
 
-    // Close the exact labelled tile development on the quotient lattice.
-    std::deque<Control> quotient_queue{{Control{0, 0, false, Z4Point{}, 0}}};
-    std::set<ControlKey> quotient_controls;
     std::set<Z4Point> seed_set;
     std::map<Z4Point, std::set<int>> expected_stars;
-    while (!quotient_queue.empty()) {
-        Control control = quotient_queue.front();
-        quotient_queue.pop_front();
-        control.anchor = reduce_mod_lattice(control.anchor, basis.first, basis.second);
-        ControlKey key{control.tile, control.orientation, control.reflected, control.anchor};
-        if (!quotient_controls.insert(key).second) continue;
-        if (quotient_controls.size() > options.max_quotient_tiles)
-            throw std::runtime_error("quotient development exceeded max_quotient_tiles");
+    for (const auto& assigned : controls) {
+        const Control& control = assigned.second;
         int sides = description.polygon_sides[control.tile];
         std::vector<Z4Point> vertices = polygon_vertices(control, sides);
         for (const Z4Point& vertex : vertices)
@@ -724,8 +918,6 @@ DevelopmentResult develop_exact_geometry(TilingDescription description,
             expected_stars[start].insert(direction);
             expected_stars[end].insert(mod12(direction + 6));
         }
-        for (int edge = 0; edge < sides; ++edge)
-            quotient_queue.push_back(neighbour_control(description, control, edge, vertices));
     }
 
     for (const Z4Point& seed : seed_set) {
@@ -743,7 +935,7 @@ DevelopmentResult develop_exact_geometry(TilingDescription description,
     MortierRecord record{basis.first, basis.second,
                          std::vector<Z4Point>(seed_set.begin(), seed_set.end())};
     validate_mortier_record(record);
-    return {std::move(record), visited.size(), quotient_controls.size(), candidates.size()};
+    return {std::move(record), controls.size(), controls.size(), candidates.size()};
 }
 
 void validate_mortier_record(const MortierRecord& record) {
