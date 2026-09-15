@@ -1,10 +1,47 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 struct sqlite3;
+
+struct TesEntry {
+    int64_t id = 0;
+    std::string combo;
+    std::string signature;
+    std::string legacy_filename;
+    std::string document;
+};
+
+struct TesSourceIdentity {
+    std::string canonical_path;
+    uintmax_t file_size = 0;
+    int64_t entry_count = 0;
+    int64_t max_id = 0;
+    int schema_version = 0;
+    std::string fingerprint;
+};
+
+class TesReader {
+public:
+    // Opening a reader scans and decompresses the complete source once to compute
+    // its logical SHA-256 fingerprint. Entry iteration remains streaming.
+    explicit TesReader(const std::string& path);
+    ~TesReader();
+
+    TesReader(const TesReader&) = delete;
+    TesReader& operator=(const TesReader&) = delete;
+
+    const TesSourceIdentity& identity() const { return identity_; }
+    void for_each_after(int64_t start_id,
+                        const std::function<void(const TesEntry&)>& visitor) const;
+
+private:
+    sqlite3* db_ = nullptr;
+    TesSourceIdentity identity_;
+};
 
 class TesStore {
 public:

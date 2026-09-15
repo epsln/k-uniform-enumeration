@@ -348,6 +348,7 @@ int main(int argc, char** argv) {
 	std::string extract_database, extract_output;
 	std::string export_mortier_database, export_mortier_json_path, mortier_stable_id;
 	std::string import_mortier_json_path, import_mortier_database;
+	std::string convert_tes_database, conversion_errors = "fail";
 	int64_t mortier_id = 0;
 	bool prune_only = false;
 	int64_t extract_id = 0;
@@ -395,6 +396,8 @@ int main(int argc, char** argv) {
 		else if (arg == "--mortier-id" && i + 1 < argc) mortier_id = std::stoll(argv[++i]);
 		else if (arg == "--mortier-stable-id" && i + 1 < argc) mortier_stable_id = argv[++i];
 		else if (arg == "--import-mortier-json" && i + 1 < argc) import_mortier_json_path = argv[++i];
+		else if (arg == "--convert-tes-to-mortier" && i + 1 < argc) convert_tes_database = argv[++i];
+		else if (arg == "--conversion-errors" && i + 1 < argc) conversion_errors = argv[++i];
 		else if (arg == "--mortier-database" && i + 1 < argc) import_mortier_database = argv[++i];
 		else if (arg == "--compress-solutions") { g_compress_solutions = true; g_compress_pruner_outputs = true;}
 		else if (arg == "--compress-threshold-mb" && i + 1 < argc)
@@ -404,7 +407,7 @@ int main(int argc, char** argv) {
 		else if (arg == "--notify-minutes" && i + 1 < argc) notify_minutes = std::stoi(argv[++i]);
 		else if (arg == "--telegram-dry-run") { g_telegram_dry_run = true; }
 		else if (arg == "--version") {
-			std::cout << "eusolver 1.0.0\n";
+			std::cout << "eusolver 1.0.1\n";
 			return 0;
 		}
 		else if (arg == "--help") {
@@ -437,8 +440,11 @@ int main(int argc, char** argv) {
 				<< "  --json-output FILE  JSON path required with --export-mortier-json\n"
 				<< "  --mortier-id N      export only this numeric Mortier entry id\n"
 				<< "  --mortier-stable-id HEX  export only this stable Mortier id\n"
-				<< "  --import-mortier-json FILE  convert generated Mortier JSON to SQLite\n"
-				<< "  --mortier-database DB  SQLite path required with --import-mortier-json\n"
+				<< "  --import-mortier-json FILE  convert generated or legacy Mortier JSON to SQLite\n"
+				<< "  --convert-tes-to-mortier DB  convert a TES SQLite database to Mortier\n"
+				<< "  --mortier-database DB  destination for Mortier import or conversion\n"
+				<< "  --resume           retry saved failures, then resume after the watermark\n"
+				<< "  --conversion-errors fail|continue  TES conversion policy (default: fail)\n"
 				<< "  --telegram-token T  Telegram bot token for progress updates\n"
 				<< "  --telegram-chat C   Telegram chat id to message\n"
 				<< "  --notify-minutes N  interval between Telegram updates (default 30)\n"
@@ -460,12 +466,14 @@ int main(int argc, char** argv) {
 	bool tes_operation = !extract_database.empty();
 	bool export_operation = !export_mortier_database.empty();
 	bool import_operation = !import_mortier_json_path.empty();
-	if ((tes_operation + export_operation + import_operation) > 1
+	bool convert_operation = !convert_tes_database.empty();
+	if ((tes_operation + export_operation + import_operation + convert_operation) > 1
 			|| (!tes_operation && (!extract_output.empty() || extract_id != 0))
 			|| (!export_operation
 				&& (!export_mortier_json_path.empty() || mortier_id != 0
 					|| !mortier_stable_id.empty()))
-			|| (!import_operation && !import_mortier_database.empty())) {
+			|| (!(import_operation || convert_operation) && !import_mortier_database.empty())
+			|| (!convert_operation && conversion_errors != "fail")) {
 		std::cerr << "invalid or conflicting extraction/conversion options\n";
 		return 1;
 	}
@@ -515,6 +523,33 @@ int main(int argc, char** argv) {
 			return 0;
 		} catch (const std::exception& e) {
 			std::cerr << "Mortier JSON import failed: " << e.what() << "\n";
+			return 1;
+		}
+	}
+	if (!convert_tes_database.empty()) {
+		if (import_mortier_database.empty()) {
+			std::cerr << "--mortier-database is required with --convert-tes-to-mortier\n";
+			return 1;
+		}
+		if (conversion_errors != "fail" && conversion_errors != "continue") {
+			std::cerr << "--conversion-errors must be fail or continue\n";
+			return 1;
+		}
+		try {
+			auto result = convert_tes_to_mortier(convert_tes_database,
+				import_mortier_database, resume,
+				conversion_errors == "continue" ? ConversionErrorMode::Continue
+				                                : ConversionErrorMode::Fail);
+			std::cout << "Converted " << result.converted_count << " Mortier record"
+			          << (result.converted_count == 1 ? "" : "s");
+			if (result.failure_count)
+				std::cout << "; " << result.failure_count << " failure"
+				          << (result.failure_count == 1 ? "" : "s")
+				          << " retained in " << import_mortier_database << ".partial";
+			std::cout << "\n";
+			return result.complete ? 0 : 1;
+		} catch (const std::exception& e) {
+			std::cerr << "TES to Mortier conversion failed: " << e.what() << "\n";
 			return 1;
 		}
 	}

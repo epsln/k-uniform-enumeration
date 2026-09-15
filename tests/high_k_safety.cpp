@@ -42,6 +42,20 @@ static void test_large_canonical_refinement() {
     (void)SolutionPruner::is_canonical_labeling(complete);
 }
 
+static void test_a2_attachment_orbits() {
+    int a2 = -1;
+    for (int vt = 0; vt < NUM_VERTEX_TYPES; ++vt) {
+        if (symbols[vt] == "(4,4,4,4)A2") {
+            a2 = vt;
+            break;
+        }
+    }
+    assert(a2 >= 0);
+    assert(attachment_limit(a2) == 2);
+    assert(mirrors[a2][0] == 1);
+    assert(mirrors[a2][1] == 0);
+}
+
 static void test_v2_round_trip() {
     State original = large_state(false);
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
@@ -109,6 +123,7 @@ static void test_invalid_packed_state() {
 }
 
 int main() {
+    test_a2_attachment_orbits();
     test_large_canonical_refinement();
     test_v2_round_trip();
     test_v2_large_vertex_count();

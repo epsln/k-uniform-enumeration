@@ -1,6 +1,6 @@
 # Implementation Guide
 
-This document describes the C++ implementation shipped in release 1.0.0. See
+This document describes the C++ implementation shipped in release 1.0.x. See
 `ALGORITHM.md` for the combinatorial search itself.
 
 ## Build
@@ -131,9 +131,13 @@ python3 scripts/validate_mortier.py \
   --reference ../mortier/data/database.json
 ```
 
-JSON import is intentionally restricted to generated `kNN_<stable-id>` keys.
-The validator matches periodic point sets under translation-basis changes,
-origin shifts, rotations, and reflections.
+JSON import accepts generated `kNN_<stable-id>` keys and legacy solver names
+such as `eu_raw_4u_5d2_6h_1`. Legacy names are decoded against the vertex
+catalogue, retained as aliases, and assigned deterministic IDs from alias plus
+normalized geometry. `_failures` diagnostics are persisted and keep the
+database incomplete. The validator matches
+periodic point sets under translation-basis changes, origin shifts, rotations,
+and reflections.
 
 ## Durability
 

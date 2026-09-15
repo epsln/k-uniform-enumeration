@@ -1,7 +1,10 @@
 #include "mortier_store.h"
 #include "mortier_geometry.h"
+#include "vertex_catalog.h"
+#include "tes_store.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +25,77 @@ namespace {
 constexpr size_t MAX_ENCODED_RECORD_SIZE = 256 * 1024 * 1024;
 constexpr uint64_t MAX_SEEDS = 10'000'000;
 constexpr uint64_t MAX_CHUNK_SIZE = 512 * 1024 * 1024;
+constexpr const char* TES_CONVERSION_PRODUCER = "eusolver-tes-converter-v1";
+constexpr const char* TES_STABLE_ID_POLICY = "tes-source-v1";
+
+std::vector<uint8_t> legacy_json_stable_id(const std::string& name,
+                                           const MortierRecord* record = nullptr) {
+    static constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+    std::array<uint64_t, 4> hash{{
+        14695981039346656037ULL, 0x9ae16a3b2f90404fULL,
+        0xd6e8feb86659fd93ULL, 0xa0761d6478bd642fULL
+    }};
+    std::string input("eusolver/mortier-legacy-json/v1\0", 33);
+    input += name;
+    if (record) {
+        std::vector<uint8_t> encoded = encode_mortier_record(*record);
+        input.append(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+    }
+    for (unsigned char byte : input) {
+        for (size_t lane = 0; lane < hash.size(); ++lane) {
+            hash[lane] ^= static_cast<uint64_t>(byte) + lane * 0x9d;
+            hash[lane] *= FNV_PRIME;
+        }
+    }
+    std::vector<uint8_t> result(32);
+    for (size_t lane = 0; lane < hash.size(); ++lane)
+        for (int byte = 0; byte < 8; ++byte)
+            result[lane * 8 + byte] = static_cast<uint8_t>(hash[lane] >> (byte * 8));
+    return result;
+}
+
+int legacy_json_k(const std::string& name) {
+    size_t prefix;
+    if (name.rfind("eu_raw_", 0) == 0) prefix = 7;
+    else if (name.rfind("eu_", 0) == 0) prefix = 3;
+    else throw std::invalid_argument("legacy Mortier name must start with eu_raw_ or eu_");
+
+    std::vector<std::string> tokens;
+    size_t start = prefix;
+    while (start <= name.size()) {
+        size_t end = name.find('_', start);
+        tokens.push_back(name.substr(start, end == std::string::npos ? end : end - start));
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    if (tokens.size() < 2 || tokens.back().empty()
+            || !std::all_of(tokens.back().begin(), tokens.back().end(),
+                            [](unsigned char value) { return std::isdigit(value); }))
+        throw std::invalid_argument("legacy Mortier name has no numeric solution index");
+    tokens.pop_back();
+
+    int k = 0;
+    for (const std::string& token : tokens) {
+        if (token.size() < 2)
+            throw std::invalid_argument("invalid legacy Mortier catalogue token");
+        std::string code = token.substr(0, 2);
+        if (std::find(catalog::codes.begin(), catalog::codes.end(), code)
+                == catalog::codes.end())
+            throw std::invalid_argument("unknown legacy Mortier catalogue code " + code);
+        int multiplicity = 1;
+        if (token.size() > 2) {
+            if (!std::all_of(token.begin() + 2, token.end(),
+                             [](unsigned char value) { return std::isdigit(value); }))
+                throw std::invalid_argument("invalid legacy Mortier multiplicity");
+            multiplicity = std::stoi(token.substr(2));
+            if (multiplicity < 1) throw std::invalid_argument("invalid legacy Mortier multiplicity");
+        }
+        if (k > std::numeric_limits<int>::max() - multiplicity)
+            throw std::overflow_error("legacy Mortier k is out of range");
+        k += multiplicity;
+    }
+    return k;
+}
 
 void check_sqlite(int rc, sqlite3* db, const char* operation) {
     if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW)
@@ -67,6 +141,63 @@ void bind_blob(sqlite3* db, sqlite3_stmt* stmt, int column,
     check_sqlite(sqlite3_bind_blob(stmt, column, value.data(),
                                   static_cast<int>(value.size()), SQLITE_TRANSIENT),
                  db, "bind Mortier blob");
+}
+
+void set_metadata(sqlite3* db, const std::string& key, const std::string& value) {
+    Statement statement(db,
+        "INSERT INTO metadata(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value;");
+    bind_text(db, statement.get(), 1, key);
+    bind_text(db, statement.get(), 2, value);
+    check_sqlite(sqlite3_step(statement.get()), db, "set Mortier metadata");
+}
+
+std::string get_metadata(sqlite3* db, const std::string& key) {
+    Statement statement(db, "SELECT value FROM metadata WHERE key=?;");
+    bind_text(db, statement.get(), 1, key);
+    if (sqlite3_step(statement.get()) != SQLITE_ROW)
+        throw std::runtime_error("missing Mortier conversion metadata: " + key);
+    const auto* value = sqlite3_column_text(statement.get(), 0);
+    int size = sqlite3_column_bytes(statement.get(), 0);
+    return value ? std::string(reinterpret_cast<const char*>(value), size) : std::string();
+}
+
+std::vector<uint8_t> tes_stable_id(const std::string& source_fingerprint,
+                                   int64_t source_entry_id) {
+    std::array<uint64_t, 4> hash{{
+        14695981039346656037ULL, 0x9ae16a3b2f90404fULL,
+        0xd6e8feb86659fd93ULL, 0xa0761d6478bd642fULL
+    }};
+    const std::string input = std::string(TES_STABLE_ID_POLICY) + ':'
+        + source_fingerprint + ':' + std::to_string(source_entry_id);
+    for (unsigned char byte : input) {
+        for (size_t lane = 0; lane < hash.size(); ++lane) {
+            hash[lane] ^= static_cast<uint64_t>(byte) + lane * 0x9d;
+            hash[lane] *= 1099511628211ULL;
+        }
+    }
+    std::vector<uint8_t> result(32);
+    for (size_t lane = 0; lane < hash.size(); ++lane)
+        for (size_t byte = 0; byte < 8; ++byte)
+            result[lane * 8 + byte] = static_cast<uint8_t>(hash[lane] >> (byte * 8));
+    return result;
+}
+
+int k_from_combo(const std::string& combo) {
+    size_t separator = combo.find('_');
+    if (separator == 0 || separator == std::string::npos)
+        throw std::invalid_argument("TES combo has no k prefix: " + combo);
+    int value = 0;
+    for (size_t i = 0; i < separator; ++i) {
+        if (combo[i] < '0' || combo[i] > '9')
+            throw std::invalid_argument("invalid k prefix in TES combo: " + combo);
+        int digit = combo[i] - '0';
+        if (value > (std::numeric_limits<int>::max() - digit) / 10)
+            throw std::invalid_argument("TES combo k is too large: " + combo);
+        value = value * 10 + digit;
+    }
+    if (value <= 0) throw std::invalid_argument("TES combo k must be positive: " + combo);
+    return static_cast<int>(value);
 }
 
 std::string column_text(sqlite3_stmt* stmt, int column) {
@@ -186,9 +317,33 @@ struct ReadDatabase {
         return result;
     }
 
+    bool has_metadata(const char* key) {
+        Statement statement(db, "SELECT 1 FROM metadata WHERE key=?;");
+        check_sqlite(sqlite3_bind_text(statement.get(), 1, key, -1, SQLITE_STATIC),
+                     db, "bind Mortier metadata key");
+        return sqlite3_step(statement.get()) == SQLITE_ROW;
+    }
+
+    bool has_source_entry_id() {
+        Statement statement(db, "PRAGMA table_info(entries);");
+        while (sqlite3_step(statement.get()) == SQLITE_ROW) {
+            if (column_text(statement.get(), 1) == "source_entry_id") return true;
+        }
+        return false;
+    }
+
     void validate() {
-        if (metadata("schema_version") != std::to_string(MortierStore::SCHEMA_VERSION))
+        std::string schema = metadata("schema_version");
+        if (schema != "1" && schema != std::to_string(MortierStore::SCHEMA_VERSION))
             throw std::runtime_error("unsupported Mortier database schema");
+        if (!has_metadata("codec_version")) {
+            if (has_metadata("compression") && !has_metadata("z4_basis"))
+                throw std::runtime_error(
+                    "input is a TES database, not a Mortier database; "
+                    "generate it with --format mortier, or rerun --prune-only "
+                    "--format mortier while the raw eusolver_* inputs are available");
+            throw std::runtime_error("missing Mortier metadata: codec_version");
+        }
         if (metadata("codec_version") != std::to_string(MortierStore::CODEC_VERSION))
             throw std::runtime_error("unsupported Mortier codec version");
         if (metadata("compression") != "zstd")
@@ -208,9 +363,12 @@ using RowBinder = std::function<void(sqlite3*, sqlite3_stmt*)>;
 void read_rows(const std::string& path, const char* where, const RowBinder& binder,
                const std::function<void(const MortierStoredEntry&)>& visitor) {
     ReadDatabase database(path);
+    bool has_source_entry_id = database.has_source_entry_id();
     std::string sql =
         "SELECT e.id,e.stable_id,e.k,e.seed_count,e.signature,e.chunk_id,"
-        "e.byte_offset,e.byte_length,c.uncompressed_size,c.compressed_size,c.data "
+        "e.byte_offset,e.byte_length,c.uncompressed_size,c.compressed_size,c.data,";
+    sql += has_source_entry_id ? "e.source_entry_id " : "NULL ";
+    sql +=
         "FROM entries e JOIN chunks c ON c.id=e.chunk_id ";
     sql += where;
     sql += " ORDER BY e.id;";
@@ -266,6 +424,8 @@ void read_rows(const std::string& path, const char* where, const RowBinder& bind
         entry.k = static_cast<int>(k);
         if (sqlite3_column_type(rows.get(), 4) != SQLITE_NULL)
             entry.signature = column_text(rows.get(), 4);
+        if (sqlite3_column_type(rows.get(), 11) != SQLITE_NULL)
+            entry.source_entry_id = sqlite3_column_int64(rows.get(), 11);
         entry.record = decode_mortier_record(
             decompressed.data() + static_cast<size_t>(offset),
             static_cast<size_t>(length));
@@ -294,10 +454,17 @@ public:
         while (true) {
             std::string name = string();
             if (!names.insert(name).second) fail("duplicate JSON object key");
+            if (name == "_failures") {
+                expect(':');
+                failures_object(store);
+                skip_space();
+                if (consume('}')) break;
+                expect(',');
+                continue;
+            }
             int k = 0;
-            std::vector<uint8_t> stable_id = record_name(name, k);
-            if (!stable_ids.insert(stable_id).second)
-                fail("duplicate Mortier stable id");
+            bool legacy = false;
+            std::vector<uint8_t> stable_id = record_name(name, k, legacy);
             expect(':');
             MortierRecord record = record_object();
             if (record.seeds.empty()) fail("Mortier Seed array is empty");
@@ -314,10 +481,15 @@ public:
             for (Z4Point& seed : record.seeds)
                 seed = mortier_geometry::reduce_mod_lattice(seed, record.t1, record.t2);
             std::sort(record.seeds.begin(), record.seeds.end());
-            record.seeds.erase(std::unique(record.seeds.begin(), record.seeds.end()),
-                               record.seeds.end());
+            if (std::adjacent_find(record.seeds.begin(), record.seeds.end())
+                    != record.seeds.end())
+                fail("duplicate Mortier seed residue modulo translation lattice");
             mortier_geometry::validate_mortier_record(record);
-            store.add(stable_id, k, record);
+            if (legacy) stable_id = legacy_json_stable_id(name, &record);
+            if (!stable_ids.insert(stable_id).second)
+                fail("duplicate Mortier stable id");
+            store.add(stable_id, k, record, legacy ? std::optional<std::string>(name)
+                                                   : std::nullopt);
             ++count;
 
             skip_space();
@@ -327,6 +499,8 @@ public:
         require_end();
         return count;
     }
+
+    int64_t failure_count() const { return failure_count_; }
 
 private:
     [[noreturn]] void fail(const std::string& message) const {
@@ -391,6 +565,53 @@ private:
                 fail("non-ASCII byte in Mortier JSON key");
             result.push_back(static_cast<char>(value));
             if (result.size() > 128) fail("Mortier JSON key is too long");
+        }
+    }
+
+    std::string ignored_string() {
+        skip_space();
+        if (take() != '"') fail("expected JSON string");
+        size_t length = 0;
+        std::string result;
+        while (true) {
+            unsigned char value = static_cast<unsigned char>(take());
+            if (value == '"') return result;
+            if (value < 0x20) fail("control byte in JSON string");
+            if (value == '\\') {
+                char escape = take();
+                if (escape == 'u') {
+                    for (int i = 0; i < 4; ++i) {
+                        unsigned char digit = static_cast<unsigned char>(take());
+                        if (!std::isxdigit(digit)) fail("invalid Unicode escape");
+                    }
+                    result += "?";
+                } else if (std::string("\"\\/bfnrt").find(escape) == std::string::npos) {
+                    fail("invalid JSON escape");
+                } else {
+                    result += escape;
+                }
+            } else {
+                result += static_cast<char>(value);
+            }
+            if (++length > 4096) fail("failure message is too long");
+        }
+    }
+
+    void failures_object(MortierStore& store) {
+        expect('{');
+        skip_space();
+        if (consume('}')) return;
+        std::set<std::string> failure_names;
+        while (true) {
+            std::string name = string();
+            if (!failure_names.insert(name).second) fail("duplicate failure name");
+            expect(':');
+            std::string message = ignored_string();
+            store.add_import_failure(name, message);
+            ++failure_count_;
+            skip_space();
+            if (consume('}')) return;
+            expect(',');
         }
     }
 
@@ -486,7 +707,17 @@ private:
         return result;
     }
 
-    std::vector<uint8_t> record_name(const std::string& name, int& k) {
+    std::vector<uint8_t> record_name(const std::string& name, int& k, bool& legacy) {
+        if (name.rfind("eu_raw_", 0) == 0 || name.rfind("eu_", 0) == 0) {
+            legacy = true;
+            try {
+                k = legacy_json_k(name);
+            } catch (const std::exception& error) {
+                fail(std::string("invalid legacy Mortier record name: ") + error.what());
+            }
+            return legacy_json_stable_id(name);
+        }
+        legacy = false;
         if (name.size() < 6 || name[0] != 'k' || name[1] < '0' || name[1] > '9'
                 || name[2] < '0' || name[2] > '9' || name[3] != '_')
             fail("invalid Mortier record name");
@@ -505,6 +736,7 @@ private:
 
     std::istream& input_;
     size_t offset_ = 0;
+    int64_t failure_count_ = 0;
 };
 
 } // namespace
@@ -604,11 +836,14 @@ MortierStore::MortierStore(const std::string& path, const std::string& z4_basis,
              " compressed_size INTEGER NOT NULL CHECK(compressed_size>=0),data BLOB NOT NULL);"
              "CREATE TABLE entries("
              " id INTEGER PRIMARY KEY,stable_id BLOB NOT NULL UNIQUE,k INTEGER NOT NULL CHECK(k>=0),"
+             " source_entry_id INTEGER UNIQUE,"
              " chunk_id INTEGER NOT NULL REFERENCES chunks(id),"
              " byte_offset INTEGER NOT NULL CHECK(byte_offset>=0),"
              " byte_length INTEGER NOT NULL CHECK(byte_length>0),"
              " seed_count INTEGER NOT NULL CHECK(seed_count>=0),signature TEXT);"
-             "CREATE INDEX entries_chunk ON entries(chunk_id,id);");
+             "CREATE INDEX entries_chunk ON entries(chunk_id,id);"
+             "CREATE TABLE import_failures("
+             " name TEXT PRIMARY KEY,message TEXT NOT NULL);");
         Statement metadata(db_, "INSERT INTO metadata(key,value) VALUES(?,?);");
         const std::pair<const char*, std::string> values[] = {
             {"schema_version", std::to_string(SCHEMA_VERSION)},
@@ -646,9 +881,19 @@ void MortierStore::add(const std::vector<uint8_t>& stable_id, int k,
     std::vector<uint8_t> encoded = encode_mortier_record(record);
     if (!entries_.empty() && chunk_.size() + encoded.size() > chunk_target_) flush();
     entries_.push_back({stable_id, k, static_cast<int64_t>(chunk_.size()),
-                        static_cast<int64_t>(encoded.size()),
-                        static_cast<int64_t>(record.seeds.size()), std::move(signature)});
+                         static_cast<int64_t>(encoded.size()),
+                         static_cast<int64_t>(record.seeds.size()), std::move(signature)});
     chunk_.insert(chunk_.end(), encoded.begin(), encoded.end());
+}
+
+void MortierStore::add_import_failure(const std::string& name,
+                                      const std::string& message) {
+    if (finished_) throw std::runtime_error("cannot add to a finished Mortier store");
+    Statement statement(db_,
+        "INSERT INTO import_failures(name,message) VALUES(?,?);");
+    bind_text(db_, statement.get(), 1, name);
+    bind_text(db_, statement.get(), 2, message);
+    check_sqlite(sqlite3_step(statement.get()), db_, "insert Mortier import failure");
 }
 
 void MortierStore::flush() {
@@ -679,8 +924,8 @@ void MortierStore::flush() {
         int64_t chunk_id = sqlite3_last_insert_rowid(db_);
 
         Statement entry_statement(db_,
-            "INSERT INTO entries(stable_id,k,chunk_id,byte_offset,byte_length,seed_count,signature)"
-            " VALUES(?,?,?,?,?,?,?);");
+            "INSERT INTO entries(stable_id,k,source_entry_id,chunk_id,byte_offset,byte_length,seed_count,signature)"
+            " VALUES(?,?,NULL,?,?,?,?,?);");
         sqlite3_stmt* entry = entry_statement.get();
         for (const PendingEntry& pending : entries_) {
             bind_blob(db_, entry, 1, pending.stable_id);
@@ -716,19 +961,25 @@ void MortierStore::checkpoint() {
     flush();
 }
 
-void MortierStore::finish() {
+void MortierStore::finish() { finish_with_status(true); }
+
+void MortierStore::finish_incomplete() { finish_with_status(false); }
+
+void MortierStore::finish_with_status(bool complete) {
     if (finished_) return;
     flush();
     exec(db_, "PRAGMA optimize;");
-    exec(db_, "BEGIN IMMEDIATE;");
-    try {
-        exec(db_, "UPDATE metadata SET value='1' WHERE key='complete' AND value='0';");
-        if (sqlite3_changes(db_) != 1)
-            throw std::runtime_error("cannot mark Mortier database complete");
-        exec(db_, "COMMIT;");
-    } catch (...) {
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        throw;
+    if (complete) {
+        exec(db_, "BEGIN IMMEDIATE;");
+        try {
+            exec(db_, "UPDATE metadata SET value='1' WHERE key='complete' AND value='0';");
+            if (sqlite3_changes(db_) != 1)
+                throw std::runtime_error("cannot mark Mortier database complete");
+            exec(db_, "COMMIT;");
+        } catch (...) {
+            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+            throw;
+        }
     }
     int rc = sqlite3_close(db_);
     if (rc != SQLITE_OK)
@@ -806,6 +1057,9 @@ int64_t export_mortier_json(const std::string& database_path,
                             const std::vector<uint8_t>& stable_id) {
     if (id != 0 && !stable_id.empty())
         throw std::invalid_argument("select a Mortier record by id or stable id, not both");
+    if (!MortierStore::is_complete(database_path))
+        throw std::runtime_error(
+            "refusing to export an incomplete Mortier database; resolve its stored failures first");
     std::error_code path_error;
     fs::path database_canonical = fs::weakly_canonical(database_path, path_error);
     if (path_error) throw std::runtime_error("resolve Mortier database path: " + path_error.message());
@@ -819,8 +1073,9 @@ int64_t export_mortier_json(const std::string& database_path,
     std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("cannot open Mortier JSON output: " + temporary);
     int64_t count = 0;
-    out << "{\n";
-    auto write = [&](const MortierStoredEntry& entry) {
+    try {
+        out << "{\n";
+        auto write = [&](const MortierStoredEntry& entry) {
         if (count++) out << ",\n";
         out << "  \"k" << std::setw(2) << std::setfill('0') << entry.k << "_"
             << format_hex_id(entry.stable_id) << "\": {\n";
@@ -840,24 +1095,26 @@ int64_t export_mortier_json(const std::string& database_path,
             point(entry.record.seeds[i]);
         }
         out << "]\n  }";
-    };
-    if (id != 0) {
-        auto entry = MortierStore::read_by_id(database_path, id);
-        if (!entry) throw std::runtime_error("Mortier entry id not found");
-        write(*entry);
-    } else if (!stable_id.empty()) {
-        auto entry = MortierStore::read_by_stable_id(database_path, stable_id);
-        if (!entry) throw std::runtime_error("Mortier stable id not found");
-        write(*entry);
-    } else {
-        MortierStore::for_each(database_path, write);
-    }
-    out << "\n}\n";
-    out.close();
-    if (!out) {
+        };
+        if (id != 0) {
+            auto entry = MortierStore::read_by_id(database_path, id);
+            if (!entry) throw std::runtime_error("Mortier entry id not found");
+            write(*entry);
+        } else if (!stable_id.empty()) {
+            auto entry = MortierStore::read_by_stable_id(database_path, stable_id);
+            if (!entry) throw std::runtime_error("Mortier stable id not found");
+            write(*entry);
+        } else {
+            MortierStore::for_each(database_path, write);
+        }
+        out << "\n}\n";
+        out.close();
+        if (!out) throw std::runtime_error("failed to write Mortier JSON output");
+    } catch (...) {
+        out.close();
         std::error_code ignored;
         fs::remove(temporary, ignored);
-        throw std::runtime_error("failed to write Mortier JSON output");
+        throw;
     }
     std::error_code ec;
     fs::rename(temporary, json_path, ec);
@@ -881,12 +1138,15 @@ int64_t import_mortier_json(const std::string& json_path,
     bool temporary_created = false;
     try {
         int64_t count;
+        int64_t failure_count;
         {
             MortierStore store(temporary, chunk_target);
             temporary_created = true;
             MortierJsonParser parser(input);
             count = parser.parse(store);
-            store.finish();
+            failure_count = parser.failure_count();
+            if (failure_count == 0) store.finish();
+            else store.finish_incomplete();
         }
         if (fs::exists(database_path))
             throw std::runtime_error("Mortier database already exists: " + database_path);
@@ -895,12 +1155,417 @@ int64_t import_mortier_json(const std::string& json_path,
         if (ec)
             throw std::runtime_error("publish Mortier database: " + ec.message());
         temporary_created = false;
+        if (failure_count != 0)
+            throw std::runtime_error("Mortier JSON contains "
+                + std::to_string(failure_count)
+                + " failed source record(s); validated records remain in " + database_path);
         return count;
     } catch (...) {
-        if (temporary_created) {
+        if (temporary_created && fs::exists(temporary)) {
             std::error_code ignored;
             fs::remove(temporary, ignored);
         }
+        throw;
+    }
+}
+
+TesMortierConversionResult convert_tes_to_mortier(
+        const std::string& tes_database, const std::string& mortier_database,
+        bool resume, ConversionErrorMode errors, size_t chunk_target) {
+    if (chunk_target == 0 || chunk_target > MAX_CHUNK_SIZE)
+        throw std::invalid_argument("invalid Mortier conversion chunk target");
+    TesReader reader(tes_database);
+    const TesSourceIdentity& source = reader.identity();
+    fs::path partial = mortier_database + ".partial";
+    std::error_code ec;
+    fs::path destination_canonical = fs::weakly_canonical(mortier_database, ec);
+    if (ec) throw std::runtime_error("resolve Mortier destination path: " + ec.message());
+    fs::path partial_canonical = fs::weakly_canonical(partial, ec);
+    if (ec) throw std::runtime_error("resolve Mortier partial path: " + ec.message());
+    bool partial_alias = false;
+    if (fs::exists(partial)) {
+        partial_alias = fs::equivalent(fs::path(source.canonical_path), partial, ec);
+        if (ec) throw std::runtime_error("compare TES and Mortier paths: " + ec.message());
+    }
+    bool destination_alias = false;
+    if (fs::exists(mortier_database)) {
+        destination_alias = fs::equivalent(
+            fs::path(source.canonical_path), mortier_database, ec);
+        if (ec) throw std::runtime_error("compare TES and Mortier paths: " + ec.message());
+    }
+    if (fs::path(source.canonical_path) == destination_canonical
+            || fs::path(source.canonical_path) == partial_canonical
+            || partial_alias || destination_alias)
+        throw std::invalid_argument("TES source and Mortier destination must differ");
+    if (fs::exists(mortier_database))
+        throw std::runtime_error("Mortier database already exists: " + mortier_database);
+    if (resume && !fs::exists(partial))
+        throw std::runtime_error("Mortier partial database does not exist: " + partial.string());
+    if (!resume && fs::exists(partial))
+        throw std::runtime_error("Mortier partial database already exists; use --resume: "
+                                 + partial.string());
+
+    if (!resume) {
+        MortierStore store(partial.string(), chunk_target);
+    }
+
+    sqlite3* db = nullptr;
+    int rc = sqlite3_open_v2(partial.string().c_str(), &db, SQLITE_OPEN_READWRITE, nullptr);
+    if (rc != SQLITE_OK) {
+        std::string message = db ? sqlite3_errmsg(db) : "cannot allocate SQLite handle";
+        if (db) sqlite3_close(db);
+        throw std::runtime_error("open Mortier conversion database: " + message);
+    }
+    try {
+        exec(db, "PRAGMA foreign_keys=ON;");
+        if (!resume) {
+            exec(db,
+                "CREATE TABLE conversion_state("
+                " id INTEGER PRIMARY KEY CHECK(id=1),last_source_id INTEGER NOT NULL,"
+                " converted_count INTEGER NOT NULL,failure_count INTEGER NOT NULL);"
+                "INSERT INTO conversion_state VALUES(1,0,0,0);"
+                "CREATE TABLE conversion_failures("
+                " source_entry_id INTEGER PRIMARY KEY,error TEXT NOT NULL);"
+                "CREATE INDEX conversion_failures_source ON conversion_failures(source_entry_id);");
+            set_metadata(db, "producer", TES_CONVERSION_PRODUCER);
+            set_metadata(db, "stable_id_policy", TES_STABLE_ID_POLICY);
+            set_metadata(db, "source_canonical_path", source.canonical_path);
+            set_metadata(db, "source_size", std::to_string(source.file_size));
+            set_metadata(db, "source_entry_count", std::to_string(source.entry_count));
+            set_metadata(db, "source_max_id", std::to_string(source.max_id));
+            set_metadata(db, "source_schema", std::to_string(source.schema_version));
+            set_metadata(db, "source_fingerprint", source.fingerprint);
+        } else {
+            const std::pair<std::string, std::string> expected[] = {
+                {"schema_version", std::to_string(MortierStore::SCHEMA_VERSION)},
+                {"codec_version", std::to_string(MortierStore::CODEC_VERSION)},
+                {"compression", "zstd"},
+                {"producer", TES_CONVERSION_PRODUCER},
+                {"stable_id_policy", TES_STABLE_ID_POLICY},
+                {"source_canonical_path", source.canonical_path},
+                {"source_size", std::to_string(source.file_size)},
+                {"source_entry_count", std::to_string(source.entry_count)},
+                {"source_max_id", std::to_string(source.max_id)},
+                {"source_schema", std::to_string(source.schema_version)},
+                {"source_fingerprint", source.fingerprint}
+            };
+            for (const auto& item : expected) {
+                if (get_metadata(db, item.first) != item.second)
+                    throw std::runtime_error("TES source identity changed: " + item.first);
+            }
+            std::string complete = get_metadata(db, "complete");
+            if (complete != "0" && complete != "1")
+                throw std::runtime_error("invalid Mortier completion marker");
+        }
+
+        int64_t last_source_id = 0;
+        int64_t converted_count = 0;
+        int64_t failure_count = 0;
+        {
+            Statement state(db,
+                "SELECT last_source_id,converted_count,failure_count "
+                "FROM conversion_state WHERE id=1;");
+            if (sqlite3_step(state.get()) != SQLITE_ROW)
+                throw std::runtime_error("missing Mortier conversion state");
+            last_source_id = sqlite3_column_int64(state.get(), 0);
+            converted_count = sqlite3_column_int64(state.get(), 1);
+            failure_count = sqlite3_column_int64(state.get(), 2);
+            if (converted_count < 0 || failure_count < 0)
+                throw std::runtime_error("invalid Mortier conversion counts");
+        }
+
+        if (resume) {
+            Statement actual(db,
+                "SELECT COUNT(*),COALESCE(MAX(source_entry_id),0) FROM entries "
+                "WHERE source_entry_id IS NOT NULL;");
+            check_sqlite(sqlite3_step(actual.get()), db, "reconcile converted entries");
+            int64_t actual_count = sqlite3_column_int64(actual.get(), 0);
+            int64_t actual_max_source = sqlite3_column_int64(actual.get(), 1);
+            if (actual_count != converted_count || actual_max_source > last_source_id)
+                throw std::runtime_error("inconsistent Mortier conversion entry state");
+
+            Statement bad_chunks(db,
+                "SELECT COUNT(*) FROM chunks c LEFT JOIN entries e ON e.chunk_id=c.id "
+                "GROUP BY c.id HAVING COUNT(e.id)!=c.record_count "
+                "OR MIN(e.byte_offset)<0 "
+                "OR MAX(e.byte_offset+e.byte_length)>c.uncompressed_size;");
+            if (sqlite3_step(bad_chunks.get()) == SQLITE_ROW)
+                throw std::runtime_error("inconsistent Mortier conversion chunk state");
+
+            Statement foreign_keys(db, "PRAGMA foreign_key_check;");
+            if (sqlite3_step(foreign_keys.get()) == SQLITE_ROW)
+                throw std::runtime_error("invalid Mortier conversion foreign key state");
+        }
+
+        std::set<int64_t> failed_source_ids;
+        {
+            Statement rows(db,
+                "SELECT source_entry_id FROM conversion_failures ORDER BY source_entry_id;");
+            int step;
+            while ((step = sqlite3_step(rows.get())) == SQLITE_ROW)
+                failed_source_ids.insert(sqlite3_column_int64(rows.get(), 0));
+            check_sqlite(step, db, "read Mortier conversion failures");
+            if (static_cast<int64_t>(failed_source_ids.size()) != failure_count)
+                throw std::runtime_error("inconsistent Mortier conversion failure count");
+            if (!failed_source_ids.empty() && *failed_source_ids.rbegin() > source.max_id)
+                throw std::runtime_error("Mortier conversion failure id exceeds source range");
+        }
+
+        auto validate_persisted_conversion = [&]() {
+            Statement overlap(db,
+                "SELECT 1 FROM entries e JOIN conversion_failures f "
+                "ON f.source_entry_id=e.source_entry_id LIMIT 1;");
+            if (sqlite3_step(overlap.get()) == SQLITE_ROW)
+                throw std::runtime_error("source id is both converted and failed");
+
+            Statement invalid_ids(db,
+                "SELECT 1 FROM ("
+                " SELECT source_entry_id AS id FROM entries WHERE source_entry_id IS NOT NULL"
+                " UNION ALL SELECT source_entry_id FROM conversion_failures"
+                ") WHERE id<=0 OR id>? LIMIT 1;");
+            check_sqlite(sqlite3_bind_int64(invalid_ids.get(), 1, source.max_id), db,
+                         "bind TES maximum source id");
+            if (sqlite3_step(invalid_ids.get()) == SQLITE_ROW)
+                throw std::runtime_error("Mortier conversion source id is outside source range");
+
+            Statement attach(db, "ATTACH DATABASE ? AS tes_source;");
+            bind_text(db, attach.get(), 1, source.canonical_path);
+            check_sqlite(sqlite3_step(attach.get()), db, "attach TES source for reconciliation");
+            try {
+                Statement missing(db,
+                    "SELECT id FROM tes_source.entries WHERE id<=? EXCEPT "
+                    "SELECT source_entry_id FROM entries WHERE source_entry_id IS NOT NULL "
+                    "EXCEPT SELECT source_entry_id FROM conversion_failures LIMIT 1;");
+                check_sqlite(sqlite3_bind_int64(missing.get(), 1, last_source_id), db,
+                             "bind conversion reconciliation watermark");
+                if (sqlite3_step(missing.get()) == SQLITE_ROW)
+                    throw std::runtime_error("Mortier conversion is missing a processed source id");
+
+                Statement extra(db,
+                    "SELECT id FROM ("
+                    " SELECT source_entry_id AS id FROM entries WHERE source_entry_id IS NOT NULL"
+                    " UNION ALL SELECT source_entry_id FROM conversion_failures"
+                    ") WHERE id<=? EXCEPT "
+                    "SELECT id FROM tes_source.entries WHERE id<=? LIMIT 1;");
+                check_sqlite(sqlite3_bind_int64(extra.get(), 1, last_source_id), db,
+                             "bind conversion entry watermark");
+                check_sqlite(sqlite3_bind_int64(extra.get(), 2, last_source_id), db,
+                             "bind TES reconciliation watermark");
+                if (sqlite3_step(extra.get()) == SQLITE_ROW)
+                    throw std::runtime_error("Mortier conversion contains an unknown source id");
+                exec(db, "DETACH DATABASE tes_source;");
+            } catch (...) {
+                sqlite3_exec(db, "DETACH DATABASE tes_source;", nullptr, nullptr, nullptr);
+                throw;
+            }
+
+            Statement bad_chunk(db,
+                "SELECT 1 FROM chunks c LEFT JOIN entries e ON e.chunk_id=c.id "
+                "GROUP BY c.id HAVING COUNT(e.id)!=c.record_count "
+                "OR c.uncompressed_size<=0 OR c.compressed_size!=length(c.data) "
+                "OR MIN(e.byte_offset)!=0 OR MIN(e.byte_length)<=0 "
+                "OR MAX(e.byte_offset+e.byte_length)>c.uncompressed_size "
+                "OR SUM(e.byte_length)!=c.uncompressed_size LIMIT 1;");
+            if (sqlite3_step(bad_chunk.get()) == SQLITE_ROW)
+                throw std::runtime_error("inconsistent Mortier conversion chunk state");
+
+            int64_t decoded = 0;
+            MortierStore::for_each(partial.string(),
+                [&](const MortierStoredEntry&) { ++decoded; });
+            if (decoded != converted_count)
+                throw std::runtime_error("Mortier conversion decoded count is inconsistent");
+        };
+        if (resume) validate_persisted_conversion();
+
+        struct Converted {
+            int64_t source_id;
+            std::vector<uint8_t> stable_id;
+            int k;
+            int64_t offset;
+            int64_t length;
+            int64_t seed_count;
+            std::string signature;
+        };
+        std::vector<Converted> converted;
+        std::vector<uint8_t> chunk;
+        std::vector<std::pair<int64_t, std::string>> failures;
+
+        auto flush = [&](int64_t watermark) {
+            if (converted.empty() && failures.empty() && watermark == last_source_id) return;
+            int64_t resolved_failures = 0;
+            for (const Converted& value : converted)
+                resolved_failures += failed_source_ids.count(value.source_id) != 0;
+            int64_t new_failures = 0;
+            for (const auto& value : failures)
+                new_failures += failed_source_ids.count(value.first) == 0;
+            std::vector<uint8_t> compressed;
+            if (!converted.empty()) {
+                compressed.resize(ZSTD_compressBound(chunk.size()));
+                size_t size = ZSTD_compress(compressed.data(), compressed.size(),
+                                            chunk.data(), chunk.size(), 3);
+                if (ZSTD_isError(size))
+                    throw std::runtime_error(std::string("compress Mortier conversion chunk: ")
+                                             + ZSTD_getErrorName(size));
+                compressed.resize(size);
+            }
+            exec(db, "BEGIN IMMEDIATE;");
+            try {
+                int64_t chunk_id = 0;
+                if (!converted.empty()) {
+                    Statement chunk_row(db,
+                        "INSERT INTO chunks(record_count,uncompressed_size,compressed_size,data)"
+                        " VALUES(?,?,?,?);");
+                    check_sqlite(sqlite3_bind_int64(chunk_row.get(), 1, converted.size()), db,
+                                 "bind converted record count");
+                    check_sqlite(sqlite3_bind_int64(chunk_row.get(), 2, chunk.size()), db,
+                                 "bind converted chunk size");
+                    check_sqlite(sqlite3_bind_int64(chunk_row.get(), 3, compressed.size()), db,
+                                 "bind converted compressed size");
+                    bind_blob(db, chunk_row.get(), 4, compressed);
+                    check_sqlite(sqlite3_step(chunk_row.get()), db, "insert converted chunk");
+                    chunk_id = sqlite3_last_insert_rowid(db);
+                    Statement row(db,
+                        "INSERT INTO entries(stable_id,k,source_entry_id,chunk_id,byte_offset,"
+                        "byte_length,seed_count,signature) VALUES(?,?,?,?,?,?,?,?);");
+                    for (const Converted& value : converted) {
+                        bind_blob(db, row.get(), 1, value.stable_id);
+                        check_sqlite(sqlite3_bind_int(row.get(), 2, value.k), db, "bind converted k");
+                        check_sqlite(sqlite3_bind_int64(row.get(), 3, value.source_id), db,
+                                     "bind source entry id");
+                        check_sqlite(sqlite3_bind_int64(row.get(), 4, chunk_id), db,
+                                     "bind converted chunk id");
+                        check_sqlite(sqlite3_bind_int64(row.get(), 5, value.offset), db,
+                                     "bind converted offset");
+                        check_sqlite(sqlite3_bind_int64(row.get(), 6, value.length), db,
+                                     "bind converted length");
+                        check_sqlite(sqlite3_bind_int64(row.get(), 7, value.seed_count), db,
+                                     "bind converted seed count");
+                        bind_text(db, row.get(), 8, value.signature);
+                        check_sqlite(sqlite3_step(row.get()), db, "insert converted entry");
+                        check_sqlite(sqlite3_reset(row.get()), db, "reset converted entry insert");
+                        check_sqlite(sqlite3_clear_bindings(row.get()), db,
+                                     "clear converted entry bindings");
+                    }
+                }
+                Statement failure(db,
+                    "INSERT INTO conversion_failures(source_entry_id,error) VALUES(?,?) "
+                    "ON CONFLICT(source_entry_id) DO UPDATE SET error=excluded.error;");
+                for (const auto& value : failures) {
+                    check_sqlite(sqlite3_bind_int64(failure.get(), 1, value.first), db,
+                                 "bind failed source id");
+                    bind_text(db, failure.get(), 2, value.second);
+                    check_sqlite(sqlite3_step(failure.get()), db, "record conversion failure");
+                    check_sqlite(sqlite3_reset(failure.get()), db, "reset conversion failure");
+                    check_sqlite(sqlite3_clear_bindings(failure.get()), db,
+                                 "clear conversion failure bindings");
+                }
+                Statement clear_failure(db,
+                    "DELETE FROM conversion_failures WHERE source_entry_id=?;");
+                for (const Converted& value : converted) {
+                    check_sqlite(sqlite3_bind_int64(clear_failure.get(), 1, value.source_id), db,
+                                 "bind resolved source id");
+                    check_sqlite(sqlite3_step(clear_failure.get()), db,
+                                 "clear resolved conversion failure");
+                    check_sqlite(sqlite3_reset(clear_failure.get()), db,
+                                 "reset resolved conversion failure");
+                }
+                Statement update(db,
+                    "UPDATE conversion_state SET last_source_id=?,"
+                    "converted_count=converted_count+?,failure_count=failure_count+? WHERE id=1;");
+                check_sqlite(sqlite3_bind_int64(update.get(), 1, watermark), db,
+                             "bind conversion watermark");
+                check_sqlite(sqlite3_bind_int64(update.get(), 2, converted.size()), db,
+                             "bind converted count increment");
+                check_sqlite(sqlite3_bind_int64(
+                                 update.get(), 3, new_failures - resolved_failures),
+                             db, "bind failure count increment");
+                check_sqlite(sqlite3_step(update.get()), db, "update conversion state");
+                exec(db, "COMMIT;");
+            } catch (...) {
+                sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+                throw;
+            }
+            last_source_id = watermark;
+            converted_count += static_cast<int64_t>(converted.size());
+            failure_count += new_failures - resolved_failures;
+            for (const Converted& value : converted)
+                failed_source_ids.erase(value.source_id);
+            for (const auto& value : failures)
+                failed_source_ids.insert(value.first);
+            converted.clear();
+            failures.clear();
+            chunk.clear();
+        };
+
+        auto convert_entry = [&](const TesEntry& entry, bool advance_watermark) {
+            int k = 0;
+            MortierRecord record;
+            try {
+                k = k_from_combo(entry.combo);
+                auto description = mortier_geometry::parse_generated_tes(entry.document);
+                record = mortier_geometry::develop_exact_geometry(std::move(description)).record;
+            } catch (const std::exception& error) {
+                if (!converted.empty())
+                    flush(advance_watermark ? converted.back().source_id : last_source_id);
+                failures.emplace_back(entry.id, error.what());
+                if (errors == ConversionErrorMode::Continue) {
+                    flush(advance_watermark ? entry.id : last_source_id);
+                } else {
+                    flush(last_source_id);
+                    throw std::runtime_error("TES entry " + std::to_string(entry.id)
+                                             + " conversion failed: " + error.what());
+                }
+                return;
+            }
+            std::vector<uint8_t> encoded = encode_mortier_record(record);
+            if (!converted.empty() && chunk.size() + encoded.size() > chunk_target)
+                flush(advance_watermark ? converted.back().source_id : last_source_id);
+            converted.push_back({entry.id, tes_stable_id(source.fingerprint, entry.id), k,
+                static_cast<int64_t>(chunk.size()), static_cast<int64_t>(encoded.size()),
+                static_cast<int64_t>(record.seeds.size()), entry.signature});
+            chunk.insert(chunk.end(), encoded.begin(), encoded.end());
+        };
+
+        const int64_t resume_watermark = last_source_id;
+        if (resume && !failed_source_ids.empty()) {
+            reader.for_each_after(0, [&](const TesEntry& entry) {
+                if (entry.id <= resume_watermark && failed_source_ids.count(entry.id))
+                    convert_entry(entry, false);
+            });
+            if (!converted.empty()) flush(last_source_id);
+        }
+        reader.for_each_after(resume_watermark, [&](const TesEntry& entry) {
+            convert_entry(entry, true);
+        });
+        if (!converted.empty()) flush(converted.back().source_id);
+
+        TesMortierConversionResult result;
+        int64_t final_watermark = last_source_id;
+        result.converted_count = converted_count;
+        result.failure_count = failure_count;
+        result.complete = result.failure_count == 0
+            && final_watermark == source.max_id
+            && result.converted_count == source.entry_count;
+        if (result.complete) {
+            validate_persisted_conversion();
+            set_metadata(db, "complete", "1");
+            exec(db, "PRAGMA optimize;");
+        }
+        rc = sqlite3_close(db);
+        db = nullptr;
+        if (rc != SQLITE_OK)
+            throw std::runtime_error(std::string("close Mortier conversion database: ")
+                                     + sqlite3_errstr(rc));
+        if (result.complete) {
+            if (fs::exists(mortier_database))
+                throw std::runtime_error("Mortier database appeared during conversion: "
+                                         + mortier_database);
+            fs::rename(partial, mortier_database, ec);
+            if (ec) throw std::runtime_error("publish Mortier database: " + ec.message());
+        }
+        return result;
+    } catch (...) {
+        if (db) sqlite3_close_v2(db);
         throw;
     }
 }

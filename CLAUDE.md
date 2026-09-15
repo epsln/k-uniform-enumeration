@@ -57,13 +57,13 @@ C++ sources live in `src/`.
 
 - `propagate_forced` in `solver.cpp` is **fixed and enabled** (was broken); reduces search space ~23% at k=2, ~41% at k=3
 - Missing (4,8,8) vertex type from catalogue → k=1 count is 10 instead of 11.
-- Higher-k generated counts are not independently proven solely by the result database.
+- Counts through k=16 agree with the independent Tiling Atlas enumeration after fixing the `(4,4,4,4)A2` attachment orbit.
+- The existing k=20 result database predates that fix, so its k=17 through k=20 counts are stale.
 
 ## Generated Counts
 
-Counts through `k=8` agree with the existing reference set. Values above that
-come from the internally consistent `k<=20` result database and are not an
-independent completeness proof.
+Counts through `k=16` agree with the Tiling Atlas reference. The catalogue still
+omits `(4,8,8)`, accounting for the intentional difference at `k=1`.
 
 | k | Unique tilings |
 |---|---------------|
@@ -74,16 +74,12 @@ independent completeness proof.
 | 5 | 332 |
 | 6 | 673 |
 | 7 | 1,472 |
-| 8 | 2,849 |
-| 9 | 5,959 |
+| 8 | 2,850 |
+| 9 | 5,960 |
 | 10 | 11,866 |
 | 11 | 24,459 |
-| 12 | 49,793 |
-| 13 | 103,080 |
-| 14 | 212,630 |
+| 12 | 49,794 |
+| 13 | 103,082 |
+| 14 | 212,631 |
 | 15 | 445,289 |
-| 16 | 933,636 |
-| 17 | 1,972,148 |
-| 18 | 4,177,505 |
-| 19 | 8,896,553 |
-| 20 | 18,992,613 |
+| 16 | 933,637 |
