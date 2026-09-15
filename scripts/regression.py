@@ -17,7 +17,7 @@ def main() -> int:
     parser.add_argument("--candidate", default="./eusolver")
     parser.add_argument("--baseline", help="executable whose exact canonical set is expected")
     parser.add_argument("--max-k", type=int, default=1,
-                        help="enumeration limit; 1 is fast, generated counts are stored through 20")
+                        help="enumeration limit; 1 is fast, verified counts are stored through 16")
     parser.add_argument("--reference-k",
                         help="counts to check, e.g. 1-3,5 (default: 1 through max-k)")
     parser.add_argument("--workers", type=int, default=1)
@@ -27,8 +27,8 @@ def main() -> int:
     parser.add_argument("--work-dir", type=pathlib.Path,
                         help="retain outputs under this new/empty directory")
     args = parser.parse_args()
-    if not 1 <= args.max_k <= 20:
-        parser.error("--max-k must be in 1..20")
+    if not 1 <= args.max_k <= max(REFERENCE_COUNTS):
+        parser.error(f"--max-k must be in 1..{max(REFERENCE_COUNTS)}")
     if args.workers < 1 or args.exact_workers < 1:
         parser.error("--workers and --exact-workers must be positive")
     try:

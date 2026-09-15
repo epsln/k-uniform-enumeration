@@ -241,10 +241,10 @@ brackets for mirror edges.
 
 ## Generated counts
 
-Counts in the checked local `k<=20` result database (unique after
-deduplication, excluding the `(4,8,8)` vertex type not in the catalogue).
-Counts through `k=8` agree with existing references; higher values are solver
-results rather than an independent proof:
+Regenerated counts after correcting the `(4,4,4,4)A2` attachment-slot orbits.
+They agree with the Tiling Atlas through `k=16`, excluding the `(4,8,8)`
+vertex type not in this catalogue. The older `k<=20` database predates the
+correction, so its higher counts are not listed as references:
 
 | k | Unique tilings |
 |---|---------------|
@@ -255,16 +255,12 @@ results rather than an independent proof:
 | 5 | 332 |
 | 6 | 673 |
 | 7 | 1,472 |
-| 8 | 2,849 |
-| 9 | 5,959 |
+| 8 | 2,850 |
+| 9 | 5,960 |
 | 10 | 11,866 |
 | 11 | 24,459 |
-| 12 | 49,793 |
-| 13 | 103,080 |
-| 14 | 212,630 |
+| 12 | 49,794 |
+| 13 | 103,082 |
+| 14 | 212,631 |
 | 15 | 445,289 |
-| 16 | 933,636 |
-| 17 | 1,972,148 |
-| 18 | 4,177,505 |
-| 19 | 8,896,553 |
-| 20 | 18,992,613 |
+| 16 | 933,637 |

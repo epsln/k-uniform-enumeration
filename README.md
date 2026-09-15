@@ -130,10 +130,12 @@ architecture overview and `IMPLEMENTATION.md` for implementation details.
 
 # Generated Counts
 
-The following counts come from the internally consistent 35,831,099-entry
-`tilings_k20.sqlite3` result database. Counts through `k=8` agree with the
-repository regression references. The `(4,8,8)` omission applies to this whole
-catalogue, and the database contains no source-commit or completion manifest.
+The following counts through `k=16` were regenerated after correcting the
+`(4,4,4,4)A2` attachment-slot orbits and agree with the Tiling Atlas reference.
+The `(4,8,8)` omission applies to this whole catalogue, so `k=1` remains 10
+rather than the literature count of 11. The older `tilings_k20.sqlite3`
+database predates the correction and is not an authoritative source for
+`k=17` through `k=20`.
 
 | k | Unique tilings |
 |---:|---------------:|
@@ -144,20 +146,16 @@ catalogue, and the database contains no source-commit or completion manifest.
 | 5 | 332 |
 | 6 | 673 |
 | 7 | 1,472 |
-| 8 | 2,849 |
-| 9 | 5,959 |
+| 8 | 2,850 |
+| 9 | 5,960 |
 | 10 | 11,866 |
 | 11 | 24,459 |
-| 12 | 49,793 |
-| 13 | 103,080 |
-| 14 | 212,630 |
+| 12 | 49,794 |
+| 13 | 103,082 |
+| 14 | 212,631 |
 | 15 | 445,289 |
-| 16 | 933,636 |
-| 17 | 1,972,148 |
-| 18 | 4,177,505 |
-| 19 | 8,896,553 |
-| 20 | 18,992,613 |
-| **Total** | **35,831,099** |
+| 16 | 933,637 |
+| **Total** | **1,792,287** |
 
 # Regression Tests And Benchmarks
 
