@@ -1,4 +1,7 @@
 #include "disk_solver.h"
+#include "dfs_engine.h"
+#include "canonical.h"
+#include <array>
 #include "solver.h"
 #include "pruner.h"
 #include "vertex_catalog.h"
@@ -155,6 +158,7 @@ std::atomic<int64_t> g_disk_queue[MAX_WORKERS];
 std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];
 std::atomic<bool> g_disk_running{false};
 bool g_compress_solutions = false;
+bool g_legacy_solver = false;
 int64_t g_compress_threshold = 256LL * 1024 * 1024;
 // Append-compress a .bin file: compress the current tail into a zstd frame and
 // concatenate it onto X.bin.zst (zstd streams concatenate, so zstd -d yields the
@@ -340,7 +344,56 @@ DiskSolverStats disk_solver_worker(
         return true;
     };
 
-    // Pre-load first chunk
+    if (!g_legacy_solver) {
+        // In-place DFS: each chunk root is explored depth-first to completion,
+        // so memory is bounded by search depth and no spilling is needed.
+        // Leaf filter: drop non-minimal (covering) representations -- the
+        // pruner discards them anyway -- and exact-dedup the rest on the
+        // 128-bit hash of their canonical code within a capped window.
+        std::unordered_set<std::array<uint64_t, 2>, Hash128> seen;
+        int64_t seen_cap = std::max<int64_t>(1, sol_dedup_cap);
+        auto emit = [&](const State& sol) {
+            ++stats.raw_leaves;
+            auto cf = canon::canonical_form(sol);
+            if (!cf.minimal) return;
+            if ((int64_t)seen.size() >= seen_cap) seen.clear();
+            if (!seen.insert(cf.hash).second) return;
+            ++stats.solutions_found;
+            EuclideanSolver::write_solution_static(sol, out_dir, mu,
+                run_totals, solution_files, vertex_combos);
+        };
+        int64_t roots_left = 0;
+        auto on_node = [&]() {
+            ++stats.partials_checked;
+            if (++report_counter >= 256) {
+                report_counter = 0;
+                g_disk_partials[worker_id].store(stats.partials_checked, std::memory_order_relaxed);
+                g_disk_solutions[worker_id].store(stats.solutions_found, std::memory_order_relaxed);
+                g_disk_queue[worker_id].store(roots_left, std::memory_order_relaxed);
+            }
+        };
+        DfsEngine engine(max_polygons, emit, on_node);
+        int compress_counter = 0;
+        while (true) {
+            int ci = next_chunk.fetch_add(1);
+            if (ci >= (int)chunk_paths.size()) break;
+            auto roots = read_packed_states_bin(chunk_paths[ci]);
+            roots_left = (int64_t)roots.size();
+            for (auto& p : roots) {
+                engine.run(EuclideanSolver::unpack_state(p));
+                --roots_left;
+                if (g_compress_solutions && ++compress_counter >= 64) {
+                    compress_counter = 0;
+                    for (const auto& entry : fs::directory_iterator(out_dir)) {
+                        if (entry.is_regular_file() && entry.path().extension() == ".bin"
+                            && (int64_t)entry.file_size() >= g_compress_threshold)
+                            append_compress(entry.path().string());
+                    }
+                }
+            }
+        }
+    } else {
+    // Legacy path: copy-per-child FIFO queue with disk spill.
     pull_chunk();
 
     int spill_check_counter = 0;
@@ -404,6 +457,8 @@ DiskSolverStats disk_solver_worker(
             g_disk_spilled[worker_id].store(spilled, std::memory_order_relaxed);
         }
     }
+
+    }  // legacy path
 
     if (spill_has_data) fs::remove(spill_path);
 

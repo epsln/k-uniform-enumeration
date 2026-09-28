@@ -1,5 +1,6 @@
 #pragma once
 #include "state.h"
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <fstream>
@@ -90,6 +91,11 @@ struct DiskSolverStats {
     int64_t partials_checked = 0;
     int64_t solutions_found = 0;
     int64_t partials_deduped = 0;
+    int64_t raw_leaves = 0;        // leaves reached before canonical filtering
+};
+
+struct Hash128 {
+    size_t operator()(const std::array<uint64_t, 2>& a) const { return (size_t)(a[0] ^ (a[1] * 0x9e3779b97f4a7c15ULL)); }
 };
 
 DiskSolverStats disk_solver_worker(
@@ -114,4 +120,5 @@ extern std::atomic<int64_t> g_disk_queue[MAX_WORKERS];        // in-RAM queue si
 extern std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];      // states spilled to disk
 extern std::atomic<bool> g_disk_running;
 extern bool g_compress_solutions;
+extern bool g_legacy_solver;  // use the copy-per-child queue solver instead of DfsEngine
 extern int64_t g_compress_threshold;  // bytes; .bin files above this size are compressed mid-run

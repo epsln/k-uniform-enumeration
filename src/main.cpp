@@ -5,6 +5,7 @@
 #include "metrics.h"
 #include "zstd_stream.h"
 #include "tes_store.h"
+#include "canonical.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -346,6 +347,7 @@ int main(int argc, char** argv) {
 	int max_ram_gb = 0;  // 0 = auto (k-based formula)
 	bool resume = false;
 	std::string extract_database, extract_output;
+	std::string canonical_hashes_dir;
 	std::string export_mortier_database, export_mortier_json_path, mortier_stable_id;
 	std::string import_mortier_json_path, import_mortier_database;
 	std::string convert_tes_database, conversion_errors = "fail";
@@ -382,12 +384,14 @@ int main(int argc, char** argv) {
 		else if (arg == "--profile-pruner") { g_profile_pruner = true; }
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
+		else if (arg == "--legacy-solver") { g_legacy_solver = true; }
 		else if (arg == "--fanout" && i + 1 < argc) fanout_target = std::stoi(argv[++i]);
 		else if (arg == "--spill" && i + 1 < argc) spill_threshold = std::stoi(argv[++i]);
 		else if (arg == "--chunks" && i + 1 < argc) chunks_user = std::stoi(argv[++i]);
 		else if (arg == "--sol-dedup-cap" && i + 1 < argc) sol_dedup_cap_user = std::stoll(argv[++i]);
 		else if (arg == "--max-ram-gb" && i + 1 < argc) max_ram_gb = std::stoi(argv[++i]);
 		else if (arg == "--resume") { resume = true; }
+		else if (arg == "--canonical-hashes" && i + 1 < argc) canonical_hashes_dir = argv[++i];
 		else if (arg == "--extract-tes" && i + 1 < argc) extract_database = argv[++i];
 		else if (arg == "--extract-output" && i + 1 < argc) extract_output = argv[++i];
 		else if (arg == "--tes-id" && i + 1 < argc) extract_id = std::stoll(argv[++i]);
@@ -431,8 +435,10 @@ int main(int argc, char** argv) {
 				<< "  --max-ram-gb N     RAM budget for queue spill/dedup auto-scaling (0=auto: 70% of free RAM)\n"
 				<< "  --binary-solutions write solutions as binary .bin files\n"
 				<< "  --no-spill          keep all partial states in RAM (no disk spill)\n"
+				<< "  --legacy-solver     disk mode: use the old copy-per-child queue solver\n"
 				<< "  --compress-solutions  compress worker .bin output with zstd\n"
 				<< "  --compress-threshold-mb N  mid-run compression threshold (default 256)\n"
+				<< "  --canonical-hashes DIR  print 'k hash' per solution in raw eupruned/eusolver text files\n"
 				<< "  --extract-tes DB   extract .tes records from a pruner SQLite database\n"
 				<< "  --extract-output DIR  extraction directory (required with --extract-tes)\n"
 				<< "  --tes-id N         extract only this database entry id (default: all)\n"
@@ -476,6 +482,46 @@ int main(int argc, char** argv) {
 			|| (!convert_operation && conversion_errors != "fail")) {
 		std::cerr << "invalid or conflicting extraction/conversion options\n";
 		return 1;
+	}
+	if (!canonical_hashes_dir.empty()) {
+		// Isomorphism-invariant identity of every solution in text solution
+		// files, for comparing runs whose kept representatives differ.
+		try {
+			for (const auto& entry : fs::recursive_directory_iterator(canonical_hashes_dir)) {
+				if (!entry.is_regular_file()) continue;
+				std::string name = entry.path().filename().string();
+				if (name.rfind("eupruned.txt", 0) != 0 && name.rfind("eusolver_", 0) != 0) continue;
+				if (name.find(".txt") == std::string::npos) continue;
+				auto in = open_solution_istream(entry.path().string());
+				auto emit = [](const State& st) {
+					auto cf = canon::canonical_form(st);
+					std::printf("%zu %d %016llx%016llx\n", st.vertype.size(), cf.minimal ? 1 : 0,
+					            (unsigned long long)cf.hash[0], (unsigned long long)cf.hash[1]);
+				};
+				if (name.rfind("eusolver_", 0) == 0) {
+					SolutionPruner::SolutionRecord rec;
+					while (read_next_solution(*in, rec)) emit(rec.state);
+					continue;
+				}
+				// Pruned record: vertex, signature, "Count type", TES, Conway,
+				// cycle lines, "---", assembled Conway, blank.
+				std::string line;
+				while (std::getline(*in, line)) {
+					if (line.empty()) continue;
+					std::string vertex_line = line, skip, conway_line;
+					if (!std::getline(*in, skip) || !std::getline(*in, skip) || !std::getline(*in, skip)
+							|| !std::getline(*in, conway_line))
+						throw std::runtime_error("truncated pruned record in " + entry.path().string());
+					while (std::getline(*in, skip) && skip != "---") {}
+					std::getline(*in, skip);
+					emit(SolutionPruner::decode_solution(vertex_line, conway_line));
+				}
+			}
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "canonical hashing failed: " << e.what() << "\n";
+			return 1;
+		}
 	}
 	if (!extract_database.empty()) {
 		if (extract_output.empty()) {
