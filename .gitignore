@@ -20,3 +20,6 @@ solutions/
 solutions_*/
 /tilings_*.sqlite3
 /*.json.tmp
+src/*.d
+/tests/dfs_engine_equiv
+/tests/canonical_equiv
