@@ -1122,7 +1122,7 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
                                const std::function<void()>& maybe_compress) {
     if (!fs::exists(path)) throw std::runtime_error("solution input disappeared: " + path);
 
-    static constexpr int BATCH = 2000;
+    static constexpr int BATCH = 16384;
     std::vector<SolutionRecord> batch;
     batch.reserve(BATCH);
     std::vector<CanonicalResult> results;
@@ -1139,6 +1139,7 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
     std::chrono::nanoseconds decode_time{0};
     std::chrono::nanoseconds compute_time{0};
     std::chrono::nanoseconds consume_time{0};
+    std::chrono::nanoseconds format_time{0}, write_time{0};
     int64_t records = 0;
 
     while (true) {
@@ -1238,6 +1239,7 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
             std::string error;
         };
         std::vector<Formatted> formatted(unique_idx.size());
+        auto format_start = Clock::now();
         parallel_for((int)unique_idx.size(), [&](int u) {
             auto& rec2 = batch[unique_idx[u]];
             auto& f = formatted[u];
@@ -1278,7 +1280,9 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
             }
         });
 
+        format_time += Clock::now() - format_start;
         // Stage 4 (sequential): write in input order.
+        auto write_start = Clock::now();
         for (size_t u = 0; u < unique_idx.size(); ++u) {
             auto& f = formatted[u];
             if (!f.error.empty()) throw std::runtime_error(f.error);
@@ -1290,6 +1294,7 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
                 tes_store_->add(combo_code, f.sig_raw, f.tes_filename, f.tes_doc);
         }
 
+        write_time += Clock::now() - write_start;
         // Once per batch (not per line) is plenty granular given batches are
         // up to 2000 solutions — keeps the stat()+possible zstd spawn rare.
         maybe_compress();
@@ -1302,6 +1307,8 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
         std::cerr << "  pruner profile " << combo_code << ": records=" << records
                   << " decode=" << millis(decode_time) << "ms"
                   << " compute=" << millis(compute_time) << "ms"
-                  << " consume=" << millis(consume_time) << "ms\n";
+                  << " consume=" << millis(consume_time) << "ms"
+                  << " format=" << millis(format_time) << "ms"
+                  << " write=" << millis(write_time) << "ms\n";
     }
 }
