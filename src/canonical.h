@@ -21,7 +21,14 @@ struct Result {
     std::array<uint64_t, 2> hash{};       // 128-bit hash of the canonical code (minimal only)
 };
 
+// Structure-of-arrays view of a complete solution.
+struct DartView {
+    int n;
+    const int *R, *L, *M, *G, *P;
+};
+
 // `code` (optional) receives the full canonical code for exact comparisons.
 Result canonical_form(const State& st, std::vector<int32_t>* code = nullptr);
+Result canonical_form(const DartView& v, std::vector<int32_t>* code = nullptr);
 
 } // namespace canon

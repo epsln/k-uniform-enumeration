@@ -514,6 +514,17 @@ DiskSolverStats disk_solver_worker(
             }
         };
         DfsEngine engine(max_polygons, emit, on_node);
+        engine.on_leaf = [&](const DfsEngine& e) {
+            ++stats.raw_leaves;
+            auto v = e.view();
+            auto cf = canon::canonical_form(canon::DartView{v.n, v.R, v.L, v.M, v.G, v.P});
+            if (!cf.minimal) return;
+            if ((int64_t)seen.size() >= seen_cap) seen.clear();
+            if (!seen.insert(cf.hash).second) return;
+            ++stats.solutions_found;
+            EuclideanSolver::write_solution_static(e.to_state(), out_dir, mu,
+                run_totals, solution_files, vertex_combos);
+        };
         int current_chunk = -1;
         engine.should_donate = [&] { return pool.hungry(); };
         engine.donate = [&](PackedState&& p) { pool.donate(std::move(p), current_chunk); };

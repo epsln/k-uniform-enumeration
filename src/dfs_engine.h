@@ -39,6 +39,14 @@ public:
     std::function<void(PackedState&&)> donate;
     PackedState pack() const;
 
+    // Optional leaf hook: receives the engine at a complete leaf (use view()
+    // and to_state()); when set, it replaces on_solution. Lets the caller
+    // filter leaves without materialising a State for each.
+    std::function<void(const DfsEngine&)> on_leaf;
+    struct View { int n; const int *R, *L, *M, *G, *P; };
+    View view() const { return {n_, R_.data(), L_.data(), M_.data(), G_.data(), P_.data()}; }
+    State to_state() const;
+
     // Testing aid: when set, run() expands only the root and passes every
     // child (complete or not) to this callback instead of recursing.
     std::function<void(const State&)> child_hook;
@@ -62,7 +70,6 @@ private:
     uint32_t epoch_ = 0;
 
     void load(const State& st);
-    State to_state() const;
 
     void attach(int gr);
     void detach(int gr);

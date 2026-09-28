@@ -269,7 +269,7 @@ bool DfsEngine::finish_child() {
 
 void DfsEngine::visit_child() {
     if (child_hook) child_hook(to_state());
-    else if (nfree_ == 0) on_solution_(to_state());
+    else if (nfree_ == 0) { if (on_leaf) on_leaf(*this); else on_solution_(to_state()); }
     else if (should_donate && should_donate()) donate(pack());
     else dfs();
 }
