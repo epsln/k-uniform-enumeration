@@ -4,6 +4,7 @@
 #include "tes_store.h"
 #include "mortier_geometry.h"
 #include <array>
+#include <functional>
 #include <cstdint>
 #include <istream>
 #include <map>
@@ -21,6 +22,7 @@ struct CanonicalTilingOutput {
 };
 
 CanonicalTilingOutput build_canonical_tiling_output(const State& st);
+std::string tes_document(const CanonicalTilingOutput& output, const std::string& solution_label);
 void write_cycle_final(const State& st, std::ostream& out,
                        TesStore* tes_store, const std::string& combo,
                        const std::string& tes_filename,
@@ -114,6 +116,7 @@ bool read_next_solution_bin(std::istream& in, SolutionPruner::SolutionRecord& re
 extern int g_wl_dim;
 extern int g_wl_iters;
 extern bool g_use_bfl;
+extern bool g_dedup_canon;   // pruner: exact canonical-form dedup (default)
 extern bool g_no_iso_check;
 extern bool g_compress_pruner_outputs;
 extern bool g_keep_pruner_inputs;
@@ -134,8 +137,19 @@ public:
     void run(const std::vector<std::string>& listfile_paths);
 
 private:
-    void process_file_wl(const std::string& path);
+    void process_file_wl(const std::string& path, const std::string& combo_code,
+                         std::ostream& pruned_out, const std::function<void()>& maybe_compress);
     std::map<std::string, std::vector<PackedState>> solutions_by_hash_;
+    // Per-combo exact dedup table of 128-bit canonical-code hashes. Combos
+    // (k + polygon-size set) are isomorphism invariants, so dedup state never
+    // needs to span combos; memory is bounded by the largest combo.
+    struct HashSet128 {
+        std::vector<std::array<uint64_t, 2>> slots;
+        size_t used = 0;
+        bool insert(std::array<uint64_t, 2> h);
+        void clear() { std::vector<std::array<uint64_t, 2>>().swap(slots); used = 0; }
+    };
+    HashSet128 canon_seen_;
     DiskWordIndex solutions_words_;  // used when g_use_bfl
     std::unique_ptr<TesStore> tes_store_;
     std::unique_ptr<MortierStore> mortier_store_;
@@ -144,8 +158,10 @@ private:
 
     struct CanonicalResult {
         bool is_canonical;
+        std::array<uint64_t, 2> canon_hash{};
         std::string wl_hash;
         std::vector<int> bfl_word;
     };
     CanonicalResult compute_canonical_and_wl(const State& st) const;
+    void parallel_for(int n, const std::function<void(int)>& fn) const;
 };
