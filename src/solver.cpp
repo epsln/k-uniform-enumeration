@@ -361,7 +361,10 @@ bool EuclideanSolver::propagate_forced(std::vector<Dart>& darts) {
                 int nxt = G(r);
                 if (nxt == -1) { free_r = r; break; }
                 ++segs;
-                if (nxt == start) { free_r = -2; break; }
+                // Closed iff we return to the chain start `beg`. (Comparing
+                // against `start` misclassified open chains entered mid-way
+                // as closed and silently skipped their forced closure.)
+                if (nxt == beg) { free_r = -2; break; }
                 if (segs > sz || segs > n) return false;
                 cur = nxt;
             }
