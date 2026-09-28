@@ -384,6 +384,7 @@ DiskSolverStats disk_solver_worker(
                 --roots_left;
                 if (g_compress_solutions && ++compress_counter >= 64) {
                     compress_counter = 0;
+                    EuclideanSolver::close_solution_streams();
                     for (const auto& entry : fs::directory_iterator(out_dir)) {
                         if (entry.is_regular_file() && entry.path().extension() == ".bin"
                             && (int64_t)entry.file_size() >= g_compress_threshold)
@@ -442,6 +443,7 @@ DiskSolverStats disk_solver_worker(
         // overwrites X.bin.zst, so earlier solutions are preserved.
         if (g_compress_solutions && (++compress_check_counter >= 500)) {
             compress_check_counter = 0;
+            EuclideanSolver::close_solution_streams();
             for (const auto& entry : fs::directory_iterator(out_dir)) {
                 if (entry.is_regular_file() && entry.path().extension() == ".bin"
                     && (int64_t)entry.file_size() >= g_compress_threshold)
@@ -461,6 +463,7 @@ DiskSolverStats disk_solver_worker(
     }  // legacy path
 
     if (spill_has_data) fs::remove(spill_path);
+    EuclideanSolver::close_solution_streams();
 
     // Compress any remaining uncompressed tails once the worker has finished writing.
     if (g_compress_solutions) {

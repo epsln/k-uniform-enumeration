@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <mutex>
@@ -495,6 +496,35 @@ void EuclideanSolver::write_solution(const State& st) {
 // =============================================================================
 // Summary output
 // =============================================================================
+// Per-thread cache of open solution files. Every output path is written by a
+// single thread, so reopening the file for each solution was pure overhead.
+namespace {
+struct SolutionStreams {
+    std::map<std::string, std::unique_ptr<std::ofstream>> open;
+    ~SolutionStreams() { close_all(); }
+    void close_all() {
+        for (auto& [path, f] : open) {
+            f->close();
+            if (!*f) std::cerr << "\nERROR: failed writing solution file " << path << "\n";
+        }
+        open.clear();
+    }
+};
+thread_local SolutionStreams g_solution_streams;
+
+std::ofstream& solution_stream(const std::string& path, bool truncate, bool binary) {
+    auto it = g_solution_streams.open.find(path);
+    if (it != g_solution_streams.open.end()) return *it->second;
+    auto mode = (truncate ? std::ios::out : std::ios::app);
+    if (binary) mode |= std::ios::binary;
+    auto f = std::make_unique<std::ofstream>(path, mode);
+    if (!*f) throw std::runtime_error("cannot open solution file " + path);
+    return *g_solution_streams.open.emplace(path, std::move(f)).first->second;
+}
+} // namespace
+
+void EuclideanSolver::close_solution_streams() { g_solution_streams.close_all(); }
+
 void EuclideanSolver::write_solution_static(const State& st, const std::string& output_dir,
                                               std::mutex& mu,
                                               std::map<std::string,int>& run_totals,
@@ -528,12 +558,12 @@ void EuclideanSolver::write_solution_static(const State& st, const std::string& 
         g_raw_per_k[st.vertype.size()].fetch_add(1);
 
     if (g_binary_solutions) {
-        std::ofstream bout(path, std::ios::binary | (is_new ? std::ios::out : std::ios::app));
+        std::ofstream& bout = solution_stream(path, is_new, true);
         write_state_bin(bout, st);
         return;
     }
 
-    std::ofstream out(path, is_new ? std::ios::out : std::ios::app);
+    std::ofstream& out = solution_stream(path, is_new, false);
     out << "Number of polygons: " << st.vertype.size() << "\n";
     out << verbal_vertices(st.vertype) << "\n";
     out << sig << "\n";
@@ -635,5 +665,6 @@ void EuclideanSolver::run() {
     std::cerr << "\r  [" << output_dir_ << "] done: " << partials_checked_
               << " partials, " << solutions_found_ << " sols                            \n";
     if (log_.is_open()) log_.close();
+    close_solution_streams();
     write_summary();
 }

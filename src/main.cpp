@@ -342,7 +342,7 @@ int main(int argc, char** argv) {
 	int fanout_target = 0;    // 0 = auto-scale
 	int spill_threshold = 0;  // 0 = auto-scale
 	int chunks_user = 0;      // 0 = auto (num_workers * 32)
-	std::string dedup_mode  = "wl";
+	std::string dedup_mode  = "canon";
 	int64_t sol_dedup_cap_user = 0;  // 0 = auto-scale
 	int max_ram_gb = 0;  // 0 = auto (k-based formula)
 	bool resume = false;
@@ -375,8 +375,10 @@ int main(int argc, char** argv) {
 		else if (arg == "--wl-iters" && i + 1 < argc) g_wl_iters = std::stoi(argv[++i]);
 		else if (arg == "--dedup" && i + 1 < argc) {
 			std::string v = argv[++i];
-			if (v == "bfl") { dedup_mode = "bfl"; g_use_bfl = true; }
-			else { dedup_mode = "wl"; g_use_bfl = false; }
+			if (v == "bfl") { dedup_mode = "bfl"; g_use_bfl = true; g_dedup_canon = false; }
+			else if (v == "wl") { dedup_mode = "wl"; g_use_bfl = false; g_dedup_canon = false; }
+			else if (v == "canon") { dedup_mode = "canon"; g_use_bfl = false; g_dedup_canon = true; }
+			else { std::cerr << "--dedup must be canon, wl, or bfl\n"; return 1; }
 		}
 		else if (arg == "--no-iso-check") { g_no_iso_check = true; }
 		else if (arg == "--prune-only") { prune_only = true; }
@@ -423,7 +425,7 @@ int main(int argc, char** argv) {
 				<< "  --format raw|tes|mortier  final output format (default: tes)\n"
 				<< "  --wl-dim 1|2       WL hash dimension (default: 1)\n"
 				<< "  --wl-iters N       WL iteration cap (default: 0 = iterate to convergence)\n"
-				<< "  --dedup wl|bfl       online solver dedup mode (default: wl)\n"
+				<< "  --dedup canon|wl|bfl pruner dedup: exact canonical form (default), WL hash, or BFL word\n"
 				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
 				<< "  --prune-only        prune existing eusolver_* files in --output\n"
 				<< "  --keep-pruner-inputs preserve raw solution files after pruning\n"
@@ -729,6 +731,7 @@ int main(int argc, char** argv) {
 				HistogramMap vc;
 				for (auto& s : early_solutions)
 					EuclideanSolver::write_solution_static(s, output_dir, mu, rt, sf, vc);
+				EuclideanSolver::close_solution_streams();
 			}
 			std::cout << "  Early solutions written.\n";
 
@@ -916,10 +919,11 @@ int main(int argc, char** argv) {
 		});
 
 		std::vector<std::thread> threads;
+		std::vector<DiskSolverStats> worker_stats(num_workers);
 		for (int w = 0; w < num_workers; ++w) {
 			bool nospill = g_no_spill;
 			threads.emplace_back([&, w, nospill]() {
-				disk_solver_worker(chunk_paths, next_chunk,
+				worker_stats[w] = disk_solver_worker(chunk_paths, next_chunk,
 					worker_dirs[w], max_polygons,
 					nospill ? 0x7fffffff : spill_threshold,
 					sol_dedup_cap_user, w);
@@ -937,6 +941,11 @@ int main(int argc, char** argv) {
 		std::cout << "Solver phase: " << std::fixed << std::setprecision(1)
 		          << std::chrono::duration<double>(t2 - t1).count() << "s ("
 		          << disk_partials << " partials)\n";
+		{
+			int64_t leaves = 0, written = 0;
+			for (const auto& ws : worker_stats) { leaves += ws.raw_leaves; written += ws.solutions_found; }
+			std::cout << "  leaves: " << leaves << " raw, " << written << " written after canonical filter\n";
+		}
 
 		merge_worker_outputs(output_dir, worker_dirs);
 		for (const auto& wd : worker_dirs) fs::remove_all(wd);

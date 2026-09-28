@@ -222,6 +222,9 @@ public:
                                         std::map<std::string,int>& run_totals,
                                         std::map<std::string,std::string>& solution_files,
                                         HistogramMap& vertex_combos);
+    // Flush and close this thread's cached solution files. Must be called
+    // before anything else reads, moves or compresses them.
+    static void close_solution_streams();
 
 private:
     int max_polygons_;
