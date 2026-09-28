@@ -43,8 +43,12 @@ public:
     // and to_state()); when set, it replaces on_solution. Lets the caller
     // filter leaves without materialising a State for each.
     std::function<void(const DfsEngine&)> on_leaf;
-    struct View { int n; const int *R, *L, *M, *G, *P; };
-    View view() const { return {n_, R_.data(), L_.data(), M_.data(), G_.data(), P_.data()}; }
+    // Optional: called on entry to every interior node; returning true skips
+    // its subtree (e.g. an isomorphic partial state was already explored).
+    std::function<bool(const DfsEngine&)> prune_node;
+    int num_vertices() const { return (int)vt_.size(); }
+    struct View { int n; const int *R, *L, *M, *G, *P, *T; };   // T: vertex type per dart
+    View view() const { return {n_, R_.data(), L_.data(), M_.data(), G_.data(), P_.data(), T_.data()}; }
     State to_state() const;
 
     // Testing aid: when set, run() expands only the root and passes every
@@ -58,7 +62,7 @@ private:
     int64_t nodes_ = 0;
 
     // Structure-of-arrays dart data.
-    std::vector<int> R_, L_, P_, M_, ME_, G_;
+    std::vector<int> R_, L_, P_, M_, ME_, G_, T_;
     std::vector<int> vt_;
     int n_ = 0;
     int nfree_ = 0;

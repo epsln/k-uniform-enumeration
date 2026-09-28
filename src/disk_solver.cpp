@@ -1,6 +1,7 @@
 #include "disk_solver.h"
 #include "dfs_engine.h"
 #include "canonical.h"
+#include "transposition.h"
 #include "zstd_stream.h"
 #include <array>
 #include "solver.h"
@@ -161,6 +162,7 @@ std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];
 std::atomic<bool> g_disk_running{false};
 bool g_compress_solutions = false;
 bool g_legacy_solver = false;
+int g_tt_margin = 3;
 int64_t g_compress_threshold = 256LL * 1024 * 1024;
 // Append-compress a .bin file: compress the current tail into a zstd frame and
 // concatenate it onto X.bin.zst (zstd streams concatenate, so zstd -d yields the
@@ -285,6 +287,10 @@ WorkPool::WorkPool(std::vector<std::string> chunk_paths, std::string done_path, 
         done_file_ = std::fopen(done_path_.c_str(), "a");
         if (!done_file_) throw std::runtime_error("cannot open " + done_path_);
     }
+}
+
+void WorkPool::enable_transpositions(size_t megabytes) {
+    tt_ = std::make_unique<TranspositionTable>(megabytes);
 }
 
 WorkPool::~WorkPool() {
@@ -514,6 +520,16 @@ DiskSolverStats disk_solver_worker(
             }
         };
         DfsEngine engine(max_polygons, emit, on_node);
+        if (TranspositionTable* tt = pool.transpositions()) {
+            int max_probe_vertices = max_polygons - g_tt_margin;
+            engine.prune_node = [tt, max_probe_vertices](const DfsEngine& e) {
+                if (e.num_vertices() > max_probe_vertices) return false;
+                auto v = e.view();
+                auto cf = canon::canonical_form(
+                    canon::DartView{v.n, v.R, v.L, v.M, v.G, v.P, true, v.T});
+                return cf.minimal && tt->seen_or_insert(cf.hash);
+            };
+        }
         engine.on_leaf = [&](const DfsEngine& e) {
             ++stats.raw_leaves;
             auto v = e.view();

@@ -6,6 +6,7 @@
 #include "zstd_stream.h"
 #include "tes_store.h"
 #include "canonical.h"
+#include "transposition.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -349,6 +350,7 @@ int main(int argc, char** argv) {
 	int64_t sol_dedup_cap_user = 0;  // 0 = auto-scale
 	int max_ram_gb = 0;  // 0 = auto (k-based formula)
 	bool resume = false;
+	int64_t tt_mb = 1024;
 	std::string extract_database, extract_output;
 	std::string canonical_hashes_dir;
 	std::string export_mortier_database, export_mortier_json_path, mortier_stable_id;
@@ -390,6 +392,9 @@ int main(int argc, char** argv) {
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
 		else if (arg == "--legacy-solver") { g_legacy_solver = true; }
+		else if (arg == "--tt-mb" && i + 1 < argc) tt_mb = std::stoll(argv[++i]);
+		else if (arg == "--tt-margin" && i + 1 < argc) g_tt_margin = std::stoi(argv[++i]);
+		else if (arg == "--no-tt") { tt_mb = 0; }
 		else if (arg == "--fanout" && i + 1 < argc) fanout_target = std::stoi(argv[++i]);
 		else if (arg == "--spill" && i + 1 < argc) spill_threshold = std::stoi(argv[++i]);
 		else if (arg == "--chunks" && i + 1 < argc) chunks_user = std::stoi(argv[++i]);
@@ -441,6 +446,9 @@ int main(int argc, char** argv) {
 				<< "  --binary-solutions write solutions as binary .bin files\n"
 				<< "  --no-spill          keep all partial states in RAM (no disk spill)\n"
 				<< "  --legacy-solver     disk mode: use the old copy-per-child queue solver\n"
+				<< "  --tt-mb N           transposition table size in MB (default 1024)\n"
+				<< "  --tt-margin N       probe partial states with <= k-N vertices (default 3)\n"
+				<< "  --no-tt             disable the transposition table\n"
 				<< "  --compress-solutions  compress worker .bin output with zstd\n"
 				<< "  --compress-threshold-mb N  mid-run compression threshold (default 256)\n"
 				<< "  --canonical-hashes DIR  print 'k hash' per solution in raw eupruned/eusolver text files\n"
@@ -801,6 +809,7 @@ int main(int argc, char** argv) {
 		}
 		g_disk_running.store(true);
 		WorkPool pool(chunk_paths, done_path, num_workers);
+		if (tt_mb > 0 && !g_legacy_solver) pool.enable_transpositions((size_t)tt_mb);
 		std::atomic<int>& next_chunk = pool.next_chunk();
 
 		const std::string status_path = output_dir + "/status.json";
@@ -977,6 +986,9 @@ int main(int argc, char** argv) {
 		}
 
 		std::cout << "  work sharing: " << pool.donated() << " subtrees donated to idle workers\n";
+		if (auto* tt = pool.transpositions())
+			std::cout << "  transpositions: " << tt->hits() << " subtrees skipped of "
+			          << tt->probes() << " probes (" << tt->capacity() << " slots)\n";
 		// Merge every worker dir present: a resumed run may use fewer workers
 		// than the run that produced some of the output.
 		std::vector<std::string> all_worker_dirs;

@@ -45,21 +45,25 @@ Result canonical_form(const DartView& v, std::vector<int32_t>* code) {
 
     const int* R = v.R; const int* L = v.L; const int* M = v.M;
     const int* G = v.G; const int* P = v.P;
-    // Initial cells: counting sort by polygon size (few distinct values).
-    int count[MAX_SIZE + 2] = {};
+    // Free darts (partial states only) get a sentinel colour no cell can have.
+    auto gcol = [&](int d) -> int { return G[d] < 0 ? 4095 : col[G[d]]; };
+    // Initial cells: counting sort by (extra colour, polygon size).
+    const int* C = v.C;
+    auto init_key = [&](int i) { return (C ? C[i] : 0) * (MAX_SIZE + 1) + P[i]; };
+    const int NKEYS = (C ? 64 : 1) * (MAX_SIZE + 1);
+    static thread_local std::vector<int> count;
+    count.assign(NKEYS + 1, 0);
     for (int i = 0; i < n; ++i) {
-        if (G[i] < 0) throw std::runtime_error("canonical_form: incomplete state");
-        if (P[i] < 0 || P[i] > MAX_SIZE) throw std::runtime_error("canonical_form: polygon size out of range");
-        ++count[P[i] + 1];
+        if (G[i] < 0 && !v.partial) throw std::runtime_error("canonical_form: incomplete state");
+        if (P[i] < 0 || P[i] > MAX_SIZE || (C && (C[i] < 0 || C[i] >= 64)))
+            throw std::runtime_error("canonical_form: initial colour out of range");
+        ++count[init_key(i) + 1];
     }
-    for (int s = 1; s <= MAX_SIZE + 1; ++s) count[s] += count[s - 1];
-    for (int i = 0; i < n; ++i) {
-        int pos = count[P[i]]++;
-        perm[pos] = i;
-    }
+    for (int s = 1; s <= NKEYS; ++s) count[s] += count[s - 1];
+    for (int i = 0; i < n; ++i) perm[count[init_key(i)]++] = i;
     for (int p = 0; p < n;) {
         int q = p;
-        while (q < n && P[perm[q]] == P[perm[p]]) ++q;
+        while (q < n && init_key(perm[q]) == init_key(perm[p])) ++q;
         cend[p] = q;
         dirty[p] = (q - p) > 1;
         for (int j = p; j < q; ++j) col[perm[j]] = p;
@@ -76,7 +80,7 @@ Result canonical_form(const DartView& v, std::vector<int32_t>* code) {
             for (int j = s; j < e; ++j) {
                 int d = perm[j];
                 keyed[j] = {((uint64_t)col[R[d]] << 36) | ((uint64_t)col[L[d]] << 24) |
-                            ((uint64_t)col[M[d]] << 12) | (uint64_t)col[G[d]], d};
+                            ((uint64_t)col[M[d]] << 12) | (uint64_t)gcol(d), d};
             }
             auto* kb = keyed.data() + s;
             auto* ke = keyed.data() + e;
@@ -103,7 +107,7 @@ Result canonical_form(const DartView& v, std::vector<int32_t>* code) {
                         dirty[col[L[d]]] = 1;   // R^-1(d)
                         dirty[col[R[d]]] = 1;   // L^-1(d)
                         dirty[col[M[d]]] = 1;
-                        dirty[col[G[d]]] = 1;
+                        if (G[d] >= 0) dirty[col[G[d]]] = 1;
                     }
                 }
                 a = b;
@@ -126,15 +130,18 @@ Result canonical_form(const DartView& v, std::vector<int32_t>* code) {
     if (code) { code->clear(); code->reserve((size_t)n * 5); }
     for (int c = 0; c < n; ++c) {
         const int d = by_col[c];
-        uint64_t w = ((uint64_t)P[d] << 48) | ((uint64_t)col[R[d]] << 36) |
+        // The extra colour must be part of the code, not only of the initial
+        // partition, or differently-labelled structures could share a code.
+        uint64_t w = ((uint64_t)(C ? C[d] : 0) << 52) |
+                     ((uint64_t)P[d] << 48) | ((uint64_t)col[R[d]] << 36) |
                      ((uint64_t)col[L[d]] << 24) | ((uint64_t)col[M[d]] << 12) |
-                     (uint64_t)col[G[d]];
+                     (uint64_t)gcol(d);
         h1 = mix64(h1 ^ w) + 0x632be59bd9b4e019ULL;
         h2 = mix64(h2 + w * 0x9e3779b97f4a7c15ULL) ^ (h1 >> 17);
         if (code) {
-            code->push_back(P[d]); code->push_back(col[R[d]]);
+            code->push_back((C ? C[d] : 0) * 16 + P[d]); code->push_back(col[R[d]]);
             code->push_back(col[L[d]]); code->push_back(col[M[d]]);
-            code->push_back(col[G[d]]);
+            code->push_back(gcol(d));
         }
     }
     res.hash = {h1, h2};

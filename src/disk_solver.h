@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <cstdint>
@@ -108,6 +109,8 @@ struct Hash128 {
 // work (the chunk itself plus donations from it) are unfinished; when that
 // reaches zero every solution of the chunk has been flushed and the chunk is
 // recorded in done_path, so --resume can skip it.
+class TranspositionTable;
+
 class WorkPool {
 public:
     struct Task { PackedState state; int chunk; };
@@ -129,6 +132,8 @@ public:
     const std::vector<std::string>& chunk_paths() const { return paths_; }
     std::atomic<int>& next_chunk() { return next_chunk_; }
     int64_t donated() const { return donated_.load(); }
+    void enable_transpositions(size_t megabytes);
+    TranspositionTable* transpositions() { return tt_.get(); }
 
 private:
     std::vector<std::string> paths_;
@@ -145,6 +150,7 @@ private:
     bool finished_ = false;
     std::mutex done_mu_;
     FILE* done_file_ = nullptr;
+    std::unique_ptr<TranspositionTable> tt_;
 };
 
 // Chunk bookkeeping for --resume.
@@ -173,5 +179,6 @@ extern std::atomic<int64_t> g_disk_queue[MAX_WORKERS];        // in-RAM queue si
 extern std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];      // states spilled to disk
 extern std::atomic<bool> g_disk_running;
 extern bool g_compress_solutions;
-extern bool g_legacy_solver;  // use the copy-per-child queue solver instead of DfsEngine
+extern bool g_legacy_solver;
+extern int g_tt_margin;        // probe transpositions at nodes with <= k - margin vertices  // use the copy-per-child queue solver instead of DfsEngine
 extern int64_t g_compress_threshold;  // bytes; .bin files above this size are compressed mid-run

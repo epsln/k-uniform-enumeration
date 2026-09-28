@@ -25,6 +25,8 @@ struct Result {
 struct DartView {
     int n;
     const int *R, *L, *M, *G, *P;
+    bool partial = false;   // allow free darts (G < 0), coloured by a sentinel
+    const int* C = nullptr; // optional extra initial colour per dart (0..63)
 };
 
 // `code` (optional) receives the full canonical code for exact comparisons.

@@ -62,6 +62,9 @@ uint32_t DfsEngine::next_epoch() {
 void DfsEngine::load(const State& st) {
     n_ = (int)st.darts.size();
     R_.resize(n_); L_.resize(n_); P_.resize(n_); M_.resize(n_); ME_.resize(n_); G_.resize(n_);
+    T_.clear();
+    for (int v : st.vertype) T_.insert(T_.end(), left_neighbors[v].size(), v);
+    if ((int)T_.size() != n_) throw std::runtime_error("DfsEngine: dart count does not match vertex types");
     nfree_ = 0;
     for (int i = 0; i < n_; ++i) {
         const Dart& d = st.darts[i];
@@ -107,6 +110,7 @@ void DfsEngine::attach(int gr) {
         P_.push_back(polygon_sizes[gr][sg]);
         ME_.push_back(me[sg]);
         G_.push_back(-1);
+        T_.push_back(gr);
     }
     n_ += sl;
     nfree_ += sl;
@@ -119,6 +123,7 @@ void DfsEngine::detach(int gr) {
     n_ -= sl;
     nfree_ -= sl;
     R_.resize(n_); L_.resize(n_); M_.resize(n_); P_.resize(n_); ME_.resize(n_); G_.resize(n_);
+    T_.resize(n_);
     vt_.pop_back();
 }
 
@@ -275,6 +280,7 @@ void DfsEngine::visit_child() {
 }
 
 void DfsEngine::dfs() {
+    if (prune_node && prune_node(*this)) return;
     ++nodes_;
     if (on_node_) on_node_();
     int ff = analyze_first_free();
