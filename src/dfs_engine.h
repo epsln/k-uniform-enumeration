@@ -33,6 +33,12 @@ public:
 
     int64_t nodes() const { return nodes_; }
 
+    // Work sharing: when should_donate() returns true, a non-complete child is
+    // handed to donate() (packed) instead of being explored here.
+    std::function<bool()> should_donate;
+    std::function<void(PackedState&&)> donate;
+    PackedState pack() const;
+
     // Testing aid: when set, run() expands only the root and passes every
     // child (complete or not) to this callback instead of recursing.
     std::function<void(const State&)> child_hook;

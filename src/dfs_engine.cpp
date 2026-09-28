@@ -87,6 +87,15 @@ State DfsEngine::to_state() const {
     return s;
 }
 
+PackedState DfsEngine::pack() const {
+    PackedState p;
+    p.vertype.reserve(vt_.size());
+    for (int v : vt_) p.vertype.push_back((uint8_t)v);
+    p.glue.reserve(n_);
+    for (int i = 0; i < n_; ++i) p.glue.push_back((int16_t)G_[i]);
+    return p;
+}
+
 void DfsEngine::attach(int gr) {
     int off = n_;
     int sl = (int)left_neighbors[gr].size();
@@ -261,6 +270,7 @@ bool DfsEngine::finish_child() {
 void DfsEngine::visit_child() {
     if (child_hook) child_hook(to_state());
     else if (nfree_ == 0) on_solution_(to_state());
+    else if (should_donate && should_donate()) donate(pack());
     else dfs();
 }
 

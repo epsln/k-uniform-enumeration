@@ -21,6 +21,7 @@ using namespace catalog;
 // =============================================================================
 // Global counters
 // =============================================================================
+bool g_append_solutions = false;
 static std::mutex g_mutex;
 static std::map<int, int> g_per_k_counts;
 static std::array<std::atomic<int64_t>, 24> g_raw_per_k;  // lock-free for progress
@@ -525,6 +526,13 @@ std::ofstream& solution_stream(const std::string& path, bool truncate, bool bina
 
 void EuclideanSolver::close_solution_streams() { g_solution_streams.close_all(); }
 
+void EuclideanSolver::flush_solution_streams() {
+    for (auto& [path, f] : g_solution_streams.open) {
+        f->flush();
+        if (!*f) throw std::runtime_error("failed writing solution file " + path);
+    }
+}
+
 void EuclideanSolver::write_solution_static(const State& st, const std::string& output_dir,
                                               std::mutex& mu,
                                               std::map<std::string,int>& run_totals,
@@ -533,7 +541,7 @@ void EuclideanSolver::write_solution_static(const State& st, const std::string& 
     std::string combo = fine_name(st);
     std::string ext = g_binary_solutions ? ".bin" : ".txt";
     std::string path = output_dir + "/eusolver_" + combo + ext;
-    bool is_new = (run_totals.find(combo) == run_totals.end());
+    bool is_new = !g_append_solutions && (run_totals.find(combo) == run_totals.end());
     run_totals[combo] = (is_new ? 1 : run_totals[combo] + 1);
     solution_files[combo] = path;
 

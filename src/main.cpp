@@ -257,9 +257,10 @@ static void merge_worker_outputs(const std::string& output_dir,
 			if (!entry.is_regular_file()) continue;
 			std::string fname = entry.path().filename().string();
 			if (fname.rfind("eusolver_", 0) != 0) continue;
-			std::string base = fname;
-			if (has_zst_suffix(base)) base.resize(base.size() - 4);
-			per_combo[base].push_back(entry.path().string());
+			// Group by exact name: compressed and plain files of one combo can
+			// coexist (e.g. after an interrupted run) and must not be mixed.
+			// Plain merged files are compressed onto X.zst afterwards.
+			per_combo[fname].push_back(entry.path().string());
 		}
 	}
 	for (const auto& [base, paths] : per_combo) {
@@ -270,6 +271,8 @@ static void merge_worker_outputs(const std::string& output_dir,
 		std::ofstream out(dest, std::ios::binary | std::ios::app);
 		if (!out) throw std::runtime_error("cannot open merged output " + dest);
 		for (const auto& p : paths) {
+			// Streaming an empty file sets failbit on `out`; nothing to copy.
+			if (fs::file_size(p) == 0) continue;
 			std::ifstream in(p, std::ios::binary);
 			if (!in) throw std::runtime_error("cannot open worker output " + p);
 			out << in.rdbuf();
@@ -707,12 +710,19 @@ int main(int argc, char** argv) {
 		int n_chunks = chunks_user > 0 ? chunks_user : num_workers * 32;
 		auto t1 = std::chrono::steady_clock::now();
 
+		const std::string done_path = output_dir + "/done_chunks.txt";
+		g_append_solutions = true;   // worker output survives interruption and --resume
 		if (!resume) {
-			// Clear old solver output files
+			// Clear old solver output, chunk files, worker dirs and progress.
 			for (const auto& entry : fs::directory_iterator(output_dir)) {
-				if (entry.is_regular_file() && entry.path().filename().string().rfind("eusolver_",0)==0)
+				std::string name = entry.path().filename().string();
+				if (entry.is_regular_file() && (name.rfind("eusolver_", 0) == 0
+						|| (name.rfind("chunk_", 0) == 0 && entry.path().extension() == ".bin")))
 					fs::remove(entry.path());
+				else if (entry.is_directory() && name.rfind("_worker_", 0) == 0)
+					fs::remove_all(entry.path());
 			}
+			fs::remove(done_path);
 			// Phase 1: BFS fan-out
 			std::cout << "Phase 1: BFS fan-out to " << fanout_target << " frontier states...\n";
 			std::vector<State> early_solutions;
@@ -748,14 +758,32 @@ int main(int argc, char** argv) {
 				chunk_paths.push_back(cp);
 			}
 		} else {
-			// Resume: reuse existing chunk files
+			// Resume: reuse existing chunk files, skipping completed ones.
 			std::cout << "Resuming from " << output_dir << "...\n";
-			for (int ci = 0; ci < n_chunks; ++ci) {
-				std::string cp = output_dir + "/chunk_" + std::to_string(ci) + ".bin";
-				if (fs::exists(cp)) chunk_paths.push_back(cp);
+			auto all_chunks = list_chunk_files(output_dir);
+			auto done = read_done_chunks(done_path);
+			for (const auto& cp : all_chunks)
+				if (!done.count(fs::path(cp).filename().string())) chunk_paths.push_back(cp);
+			n_chunks = (int)chunk_paths.size();
+			// Drop partial records left at the tail of solution files by an
+			// interrupted run before appending to them.
+			int64_t repaired = 0, repaired_files = 0;
+			for (const auto& entry : fs::recursive_directory_iterator(output_dir)) {
+				if (!entry.is_regular_file()) continue;
+				std::string rel = fs::relative(entry.path(), output_dir).string();
+				if (rel.rfind("_worker_", 0) != 0 && rel.find('/') != std::string::npos) continue;
+				if (entry.path().filename().string().rfind("eusolver_", 0) != 0) continue;
+				int64_t cut = repair_solution_file(entry.path().string());
+				if (cut > 0) { repaired += cut; ++repaired_files; }
 			}
-			std::cout << "  Found " << chunk_paths.size() << " chunk files\n";
+			if (repaired_files)
+				std::cout << "  Repaired " << repaired_files << " solution file(s): dropped "
+				          << repaired << " bytes of partial trailing records\n";
+			std::cout << "  Found " << all_chunks.size() << " chunk files, "
+			          << (all_chunks.size() - chunk_paths.size()) << " already done, "
+			          << chunk_paths.size() << " to run\n";
 		}
+		n_chunks = (int)chunk_paths.size();
 
 		// Phase 2: parallel disk workers (shared atomic chunk pool)
 		std::cout << "Phase 2: " << n_chunks << " chunks, " << num_workers
@@ -772,7 +800,8 @@ int main(int argc, char** argv) {
 			g_disk_spilled[w].store(0);
 		}
 		g_disk_running.store(true);
-		std::atomic<int> next_chunk{0};
+		WorkPool pool(chunk_paths, done_path, num_workers);
+		std::atomic<int>& next_chunk = pool.next_chunk();
 
 		const std::string status_path = output_dir + "/status.json";
 		const bool is_tty = isatty(STDERR_FILENO);
@@ -923,7 +952,7 @@ int main(int argc, char** argv) {
 		for (int w = 0; w < num_workers; ++w) {
 			bool nospill = g_no_spill;
 			threads.emplace_back([&, w, nospill]() {
-				worker_stats[w] = disk_solver_worker(chunk_paths, next_chunk,
+				worker_stats[w] = disk_solver_worker(pool,
 					worker_dirs[w], max_polygons,
 					nospill ? 0x7fffffff : spill_threshold,
 					sol_dedup_cap_user, w);
@@ -932,7 +961,7 @@ int main(int argc, char** argv) {
 		for (auto& t : threads) t.join();
 		g_disk_running.store(false);
 		disk_progress.join();
-		for (const auto& cp : chunk_paths) fs::remove(cp);
+		for (const auto& cp : list_chunk_files(output_dir)) fs::remove(cp);
 
 		auto t2 = std::chrono::steady_clock::now();
 		int64_t disk_partials = 0;
@@ -947,8 +976,17 @@ int main(int argc, char** argv) {
 			std::cout << "  leaves: " << leaves << " raw, " << written << " written after canonical filter\n";
 		}
 
-		merge_worker_outputs(output_dir, worker_dirs);
-		for (const auto& wd : worker_dirs) fs::remove_all(wd);
+		std::cout << "  work sharing: " << pool.donated() << " subtrees donated to idle workers\n";
+		// Merge every worker dir present: a resumed run may use fewer workers
+		// than the run that produced some of the output.
+		std::vector<std::string> all_worker_dirs;
+		for (const auto& entry : fs::directory_iterator(output_dir))
+			if (entry.is_directory() && entry.path().filename().string().rfind("_worker_", 0) == 0)
+				all_worker_dirs.push_back(entry.path().string());
+		std::sort(all_worker_dirs.begin(), all_worker_dirs.end());
+		merge_worker_outputs(output_dir, all_worker_dirs);
+		for (const auto& wd : all_worker_dirs) fs::remove_all(wd);
+		fs::remove(done_path);
 		compress_merged_solutions(output_dir);
 
 		std::cout << "Pruner phase starting...\n";
