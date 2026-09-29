@@ -1,6 +1,9 @@
-# eusolver 1.0.1
+# eusolver 1.1.0
 
-Hotfix release for exact Mortier conversion and interoperability.
+Hotfix release for exact Mortier conversion and interoperability, and the
+`(4,4,4,4)A2` attachment-orbit fix. This is the solver (legacy copy-per-child
+search) that produced the verified `k<=20` run; later releases use the new
+in-place DFS / canonical-filter solver.
 
 ## Fixes
 
