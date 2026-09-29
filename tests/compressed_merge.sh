@@ -7,7 +7,7 @@ set -eu
 BIN=${1:-./eusolver}
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
-"$BIN" --mode disk --max-polygons 7 --workers 4 --binary-solutions \
+"$BIN" --mode disk --max-polygons 7 --workers 4 --binary-solutions --solution-files \
     --compress-solutions --compress-threshold-mb 0 --keep-pruner-inputs \
     --output "$OUT" > "$OUT.log" 2>&1 || { cat "$OUT.log"; rm -f "$OUT.log"; exit 1; }
 grep -q "k=7 -> 1472 unique tilings" "$OUT.log" || { cat "$OUT.log"; rm -f "$OUT.log"; exit 1; }

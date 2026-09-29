@@ -123,7 +123,8 @@ public:
     bool acquire(Work& out);
     // Called by the owner of `chunk` after finishing a chunk or task (after
     // flushing its solution files).
-    void finish(int chunk);
+    // Returns true when this was the chunk's last outstanding piece.
+    bool finish(int chunk);
     bool hungry() const {
         return hungry_.load(std::memory_order_relaxed) > queued_.load(std::memory_order_relaxed);
     }
@@ -180,5 +181,6 @@ extern std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];      // states spilled 
 extern std::atomic<bool> g_disk_running;
 extern bool g_compress_solutions;
 extern bool g_legacy_solver;
+extern bool g_solution_files;  // disk mode: per-combo files instead of solution databases
 extern int g_tt_margin;        // probe transpositions at nodes with <= k - margin vertices  // use the copy-per-child queue solver instead of DfsEngine
 extern int64_t g_compress_threshold;  // bytes; .bin files above this size are compressed mid-run

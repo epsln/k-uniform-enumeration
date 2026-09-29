@@ -134,11 +134,19 @@ class WLPruner : public SolutionPruner {
 public:
     explicit WLPruner(const std::string& output_dir, int num_workers = 1,
                       FinalOutputFormat format = FinalOutputFormat::Tes);
-    void run(const std::vector<std::string>& listfile_paths);
+    // Prunes raw solution files plus the solution databases `dbs` (disk mode).
+    void run(const std::vector<std::string>& listfile_paths,
+             const std::vector<std::string>& dbs = {});
 
 private:
-    void process_file_wl(const std::string& path, const std::string& combo_code,
-                         std::ostream& pruned_out, const std::function<void()>& maybe_compress);
+    struct Input {
+        std::string combo;
+        std::string label;                  // file path, or "db:<combo>"
+        bool is_bin;
+        std::function<std::unique_ptr<std::istream>()> open;
+    };
+    void process_file_wl(const Input& input, std::ostream& pruned_out,
+                         const std::function<void()>& maybe_compress);
     std::map<std::string, std::vector<PackedState>> solutions_by_hash_;
     // Per-combo exact dedup table of 128-bit canonical-code hashes. Combos
     // (k + polygon-size set) are isomorphism invariants, so dedup state never

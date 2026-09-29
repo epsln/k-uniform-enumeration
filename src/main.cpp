@@ -1,5 +1,6 @@
 #include "solver.h"
 #include "disk_solver.h"
+#include "solution_db.h"
 #include "pruner.h"
 #include "vertex_catalog.h"
 #include "metrics.h"
@@ -313,7 +314,7 @@ static std::map<int,int> run_pruner(const std::string& output_dir, int num_worke
 		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-shm");
 		if (format == FinalOutputFormat::Raw) fs::remove(pruned_dir + "/tilings.sqlite3");
 		WLPruner pruner(pruned_dir, num_workers, format);
-		pruner.run(solution_files);
+		pruner.run(solution_files, list_solution_dbs(output_dir));
 		int total = 0;
 		for (const auto& [k, count] : pruner.solutions_per_k()) {
 			std::cout << "  k=" << k << " -> " << count << " unique tiling"
@@ -392,6 +393,7 @@ int main(int argc, char** argv) {
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
 		else if (arg == "--legacy-solver") { g_legacy_solver = true; }
+		else if (arg == "--solution-files") { g_solution_files = true; }
 		else if (arg == "--tt-mb" && i + 1 < argc) tt_mb = std::stoll(argv[++i]);
 		else if (arg == "--tt-margin" && i + 1 < argc) g_tt_margin = std::stoi(argv[++i]);
 		else if (arg == "--no-tt") { tt_mb = 0; }
@@ -435,6 +437,7 @@ int main(int argc, char** argv) {
 				<< "  --wl-iters N       WL iteration cap (default: 0 = iterate to convergence)\n"
 				<< "  --dedup canon|wl|bfl pruner dedup: exact canonical form (default), WL hash, or BFL word\n"
 				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
+				<< "  --solution-files    disk mode: write per-combo files instead of solution databases\n"
 				<< "  --prune-only        prune existing eusolver_* files in --output\n"
 				<< "  --keep-pruner-inputs preserve raw solution files after pruning\n"
 				<< "  --profile-pruner     report per-file pruner stage timings\n"
@@ -731,6 +734,7 @@ int main(int argc, char** argv) {
 					fs::remove_all(entry.path());
 			}
 			fs::remove(done_path);
+			for (const auto& db : list_solution_dbs(output_dir)) remove_solution_db(db);
 			// Phase 1: BFS fan-out
 			std::cout << "Phase 1: BFS fan-out to " << fanout_target << " frontier states...\n";
 			std::vector<State> early_solutions;
@@ -747,6 +751,11 @@ int main(int argc, char** argv) {
 				std::map<std::string,int> rt;
 				std::map<std::string,std::string> sf;
 				HistogramMap vc;
+				if (!g_solution_files && !g_legacy_solver) {
+					SolutionDbWriter early(output_dir + "/solutions_fanout.sqlite3");
+					for (auto& s : early_solutions) early.add(s);
+					early.close();
+				} else
 				for (auto& s : early_solutions)
 					EuclideanSolver::write_solution_static(s, output_dir, mu, rt, sf, vc);
 				EuclideanSolver::close_solution_streams();
@@ -770,6 +779,7 @@ int main(int argc, char** argv) {
 			std::cout << "Resuming from " << output_dir << "...\n";
 			auto all_chunks = list_chunk_files(output_dir);
 			auto done = read_done_chunks(done_path);
+			for (const auto& c : read_done_chunks_db(output_dir)) done.insert(c);
 			for (const auto& cp : all_chunks)
 				if (!done.count(fs::path(cp).filename().string())) chunk_paths.push_back(cp);
 			n_chunks = (int)chunk_paths.size();
@@ -808,7 +818,8 @@ int main(int argc, char** argv) {
 			g_disk_spilled[w].store(0);
 		}
 		g_disk_running.store(true);
-		WorkPool pool(chunk_paths, done_path, num_workers);
+		WorkPool pool(chunk_paths,
+			(g_solution_files || g_legacy_solver) ? done_path : std::string(), num_workers);
 		if (tt_mb > 0 && !g_legacy_solver) pool.enable_transpositions((size_t)tt_mb);
 		std::atomic<int>& next_chunk = pool.next_chunk();
 

@@ -15,6 +15,8 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <chrono>
+#include "solution_db.h"
 #include <stdexcept>
 #include <unordered_set>
 #include <zstd.h>
@@ -161,6 +163,7 @@ std::atomic<int64_t> g_disk_queue[MAX_WORKERS];
 std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];
 std::atomic<bool> g_disk_running{false};
 bool g_compress_solutions = false;
+bool g_solution_files = false;
 bool g_legacy_solver = false;
 int g_tt_margin = 3;
 int64_t g_compress_threshold = 256LL * 1024 * 1024;
@@ -341,12 +344,14 @@ void WorkPool::donate(PackedState&& st, int chunk) {
     cv_.notify_one();
 }
 
-void WorkPool::finish(int chunk) {
-    if (outstanding_[chunk].fetch_sub(1) != 1 || !done_file_) return;
+bool WorkPool::finish(int chunk) {
+    if (outstanding_[chunk].fetch_sub(1) != 1) return false;
+    if (!done_file_) return true;
     std::lock_guard<std::mutex> lk(done_mu_);
     std::fprintf(done_file_, "%s\n", fs::path(paths_[chunk]).filename().string().c_str());
     std::fflush(done_file_);
     ::fsync(fileno(done_file_));
+    return true;
 }
 
 // Truncate a solution file after its last complete record. A process killed
@@ -497,6 +502,12 @@ DiskSolverStats disk_solver_worker(
         // Leaf filter: drop non-minimal (covering) representations -- the
         // pruner discards them anyway -- and exact-dedup the rest on the
         // 128-bit hash of their canonical code within a capped window.
+        // Solution database of this worker (default), or per-combo files.
+        std::unique_ptr<SolutionDbWriter> sdb;
+        if (!g_solution_files)
+            sdb = std::make_unique<SolutionDbWriter>(
+                (fs::path(out_dir).parent_path() / ("solutions_w" + std::to_string(worker_id)
+                                                    + ".sqlite3")).string());
         std::unordered_set<std::array<uint64_t, 2>, Hash128> seen;
         int64_t seen_cap = std::max<int64_t>(1, sol_dedup_cap);
         auto emit = [&](const State& sol) {
@@ -506,7 +517,8 @@ DiskSolverStats disk_solver_worker(
             if ((int64_t)seen.size() >= seen_cap) seen.clear();
             if (!seen.insert(cf.hash).second) return;
             ++stats.solutions_found;
-            EuclideanSolver::write_solution_static(sol, out_dir, mu,
+            if (sdb) sdb->add(sol);
+            else EuclideanSolver::write_solution_static(sol, out_dir, mu,
                 run_totals, solution_files, vertex_combos);
         };
         int64_t roots_left = 0;
@@ -538,7 +550,8 @@ DiskSolverStats disk_solver_worker(
             if ((int64_t)seen.size() >= seen_cap) seen.clear();
             if (!seen.insert(cf.hash).second) return;
             ++stats.solutions_found;
-            EuclideanSolver::write_solution_static(e.to_state(), out_dir, mu,
+            if (sdb) sdb->add(e.to_state());
+            else EuclideanSolver::write_solution_static(e.to_state(), out_dir, mu,
                 run_totals, solution_files, vertex_combos);
         };
         int current_chunk = -1;
@@ -546,7 +559,7 @@ DiskSolverStats disk_solver_worker(
         engine.donate = [&](PackedState&& p) { pool.donate(std::move(p), current_chunk); };
         int compress_counter = 0;
         auto maybe_compress = [&] {
-            if (!g_compress_solutions || ++compress_counter < 64) return;
+            if (sdb || !g_compress_solutions || ++compress_counter < 64) return;
             compress_counter = 0;
             EuclideanSolver::close_solution_streams();
             for (const auto& entry : fs::directory_iterator(out_dir)) {
@@ -554,6 +567,19 @@ DiskSolverStats disk_solver_worker(
                     && (int64_t)entry.file_size() >= g_compress_threshold)
                     append_compress(entry.path().string());
             }
+        };
+        std::vector<int> pending_finish;
+        auto last_commit = std::chrono::steady_clock::now();
+        constexpr size_t COMMIT_BYTES = 16u << 20;
+        constexpr auto COMMIT_INTERVAL = std::chrono::seconds(5);
+        auto commit_and_finish = [&] {
+            sdb->commit();
+            std::vector<std::string> done;
+            for (int c : pending_finish)
+                if (pool.finish(c)) done.push_back(fs::path(chunk_paths[c]).filename().string());
+            pending_finish.clear();
+            sdb->mark_done(done);
+            last_commit = std::chrono::steady_clock::now();
         };
         WorkPool::Work work;
         while (pool.acquire(work)) {
@@ -572,9 +598,19 @@ DiskSolverStats disk_solver_worker(
                 maybe_compress();
             }
             // Solutions must be on disk before the chunk can be marked done.
-            EuclideanSolver::flush_solution_streams();
-            pool.finish(work.chunk);
+            if (!sdb) {
+                EuclideanSolver::flush_solution_streams();
+                pool.finish(work.chunk);
+                continue;
+            }
+            // Database: pieces are finished at the next commit, which batches
+            // many (possibly tiny donated) tasks into one transaction.
+            pending_finish.push_back(work.chunk);
+            auto now = std::chrono::steady_clock::now();
+            if (sdb->buffered_bytes() >= COMMIT_BYTES || now - last_commit >= COMMIT_INTERVAL)
+                commit_and_finish();
         }
+        if (sdb) { commit_and_finish(); sdb->close(); }
     } else {
     // Legacy path: copy-per-child FIFO queue with disk spill.
     pull_chunk();

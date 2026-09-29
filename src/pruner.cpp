@@ -1,4 +1,5 @@
 #include "pruner.h"
+#include "solution_db.h"
 #include "canonical.h"
 #include "disk_solver.h"
 #include "solver.h"
@@ -1014,24 +1015,42 @@ bool WLPruner::HashSet128::insert(std::array<uint64_t, 2> h) {
     }
 }
 
-void WLPruner::run(const std::vector<std::string>& listfile_paths) {
+void WLPruner::run(const std::vector<std::string>& listfile_paths,
+                   const std::vector<std::string>& dbs) {
     fs::create_directories(output_dir_);
     // Several inputs can share a combo (e.g. .txt and .bin, or outputs of
     // different runs). They must share one pruned writer -- a writer per file
     // truncated the previous file's output -- and one dedup scope.
-    std::vector<std::pair<std::string, std::string>> inputs;
-    for (const auto& p : listfile_paths) inputs.push_back({combo_of_input(p), p});
+    std::vector<Input> inputs;
+    for (const auto& p : listfile_paths) {
+        std::string base = p;
+        if (has_zst_suffix(base)) base.resize(base.size() - 4);
+        if (has_zst_suffix(base))
+            throw std::runtime_error("doubly suffixed solution file name: " + p);
+        bool is_bin = base.size() > 4 && base.substr(base.size() - 4) == ".bin";
+        inputs.push_back({combo_of_input(p), p, is_bin, [p] {
+            if (!fs::exists(p)) throw std::runtime_error("solution input disappeared: " + p);
+            auto in = open_solution_istream(p);
+            if (!in) throw std::runtime_error("cannot open solution input: " + p);
+            return in;
+        }});
+    }
+    for (const auto& [combo, count] : solution_db_combos(dbs)) {
+        (void)count;
+        std::string c = combo;
+        inputs.push_back({c, "db:" + c, true, [dbs, c] { return open_solution_db_stream(dbs, c); }});
+    }
     std::stable_sort(inputs.begin(), inputs.end(),
-                     [](const auto& a, const auto& b) { return a.first < b.first; });
+                     [](const Input& a, const Input& b) { return a.combo < b.combo; });
     int n = (int)inputs.size();
     for (int i = 0; i < n;) {
-        const std::string combo = inputs[i].first;
+        const std::string combo = inputs[i].combo;
         std::string out_dir = output_dir_ + "/" + combo;
         fs::create_directories(out_dir);
         RollingCompressedWriter pruned_out(out_dir + "/eupruned.txt");
         canon_seen_.clear();
         solutions_by_hash_.clear();
-        for (; i < n && inputs[i].first == combo; ++i) {
+        for (; i < n && inputs[i].combo == combo; ++i) {
             if (n > 5 && i % std::max(1, n/10) == 0) {
                 std::cerr << "\r  pruner: " << (i+1) << "/" << n << " files  [";
                 bool first = true;
@@ -1042,7 +1061,7 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
                 }
                 std::cerr << "]" << std::flush;
             }
-            process_file_wl(inputs[i].second, combo, pruned_out.stream(),
+            process_file_wl(inputs[i], pruned_out.stream(),
                             [&] { pruned_out.maybe_compress(); });
         }
     }
@@ -1063,6 +1082,7 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
             if (ec) std::cerr << "  warning: could not remove pruned input " << path
                               << ": " << ec.message() << "\n";
         }
+        for (const auto& db : dbs) remove_solution_db(db);
     }
     if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
     if (g_dedup_canon) {
@@ -1117,24 +1137,17 @@ WLPruner::CanonicalResult WLPruner::compute_canonical_and_wl(const State& st) co
     return r;
 }
 
-void WLPruner::process_file_wl(const std::string& path, const std::string& combo_code,
-                               std::ostream& pruned_out,
+void WLPruner::process_file_wl(const Input& input, std::ostream& pruned_out,
                                const std::function<void()>& maybe_compress) {
-    if (!fs::exists(path)) throw std::runtime_error("solution input disappeared: " + path);
-
+    const std::string& combo_code = input.combo;
     static constexpr int BATCH = 16384;
     std::vector<SolutionRecord> batch;
     batch.reserve(BATCH);
     std::vector<CanonicalResult> results;
     results.reserve(BATCH);
 
-    std::string base = path;
-    if (has_zst_suffix(base)) base.resize(base.size() - 4);
-    if (has_zst_suffix(base))
-        throw std::runtime_error("doubly suffixed solution file name: " + path);
-    bool is_bin = (base.size() > 4 && base.substr(base.size() - 4) == ".bin");
-    auto in = open_solution_istream(path);
-    if (!in) throw std::runtime_error("cannot open solution input: " + path);
+    const bool is_bin = input.is_bin;
+    auto in = input.open();
     std::istream& in_ref = *in;
     int sol_idx = 0;
     using Clock = std::chrono::steady_clock;

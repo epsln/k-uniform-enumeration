@@ -37,6 +37,7 @@ C++ sources live in `src/`.
 | `src/disk_solver.h/cpp` | Disk mode: BFS fan-out, binary serialization, `WorkPool` (chunks, work sharing, `done_chunks.txt`), workers; legacy spill queue behind `--legacy-solver` |
 | `src/mortier_geometry.h/cpp` | Exact Z4 affine development and translation-lattice derivation |
 | `src/mortier_store.h/cpp` | Versioned Mortier codec, compressed SQLite storage, JSON conversion |
+| `src/solution_db.h/cpp` | Disk-mode raw output: per-writer SQLite DB (`solutions_w<N>.sqlite3`, `solutions_fanout.sqlite3`) of zstd-compressed per-combo batches plus `done_chunks`; streamed directly by the pruner |
 | `src/tes_store.h/cpp` | Compressed SQLite storage and safe extraction for TES documents |
 | `src/zstd_stream.h` | Streaming zstd-decompressing `std::istream` + `compress_to_zst` helper |
 | `src/main.cpp` | CLI, `SharedQueue`, progress display, mode dispatch |
@@ -52,7 +53,7 @@ C++ sources live in `src/`.
 - **Partial filtering**: forced closure of zero-slack rings, plus unique-partner propagation at k vertices. `DfsEngine` checks only chains touched by a glue (chain violations are monotone).
 - **Leaf filter**: non-minimal (covering) solutions have bisimilar darts (non-discrete refinement) and are dropped at the source; the rest are deduplicated per worker on their canonical hash.
 - **Transpositions**: the tilings below a node depend only on the type-preserving isomorphism class of its partial state, so nodes with <= k - `--tt-margin` vertices whose (discrete) canonical form was already seen are skipped.
-- **Resume**: a chunk is appended to `done_chunks.txt` only after it and all subtrees donated from it finished and were flushed. `--resume` skips done chunks, repairs partial trailing records, appends to worker files and merges every `_worker_*` dir.
+- **Resume**: a chunk is recorded done only after it and all subtrees donated from it finished and their solutions were committed. By default workers write per-worker solution databases (commits batched every 16 MB / 5 s, `done_chunks` table in the same DB; crash-safe via SQLite WAL). `--solution-files` restores per-combo `eusolver_*` files with `done_chunks.txt`; `--resume` then repairs partial trailing records and merges every `_worker_*` dir.
 - **Pruner pipeline**: dedup is scoped to one combo (k + polygon-size set, an isomorphism invariant); `--dedup canon` (default) uses the exact canonical form, `wl`/`bfl` remain available.
 
 ## Operations
