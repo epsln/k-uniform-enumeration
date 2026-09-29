@@ -1,6 +1,13 @@
 #pragma once
 #include "state.h"
+#include <array>
 #include <atomic>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <set>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -90,11 +97,69 @@ struct DiskSolverStats {
     int64_t partials_checked = 0;
     int64_t solutions_found = 0;
     int64_t partials_deduped = 0;
+    int64_t raw_leaves = 0;        // leaves reached before canonical filtering
 };
 
+struct Hash128 {
+    size_t operator()(const std::array<uint64_t, 2>& a) const { return (size_t)(a[0] ^ (a[1] * 0x9e3779b97f4a7c15ULL)); }
+};
+
+// Shared work pool for disk-mode workers: frontier chunks plus subtrees
+// donated by busy workers to idle ones.  Tracks, per chunk, how many pieces of
+// work (the chunk itself plus donations from it) are unfinished; when that
+// reaches zero every solution of the chunk has been flushed and the chunk is
+// recorded in done_path, so --resume can skip it.
+class TranspositionTable;
+
+class WorkPool {
+public:
+    struct Task { PackedState state; int chunk; };
+    struct Work { bool is_chunk = false; int chunk = -1; PackedState state; };
+
+    WorkPool(std::vector<std::string> chunk_paths, std::string done_path, int num_workers);
+    ~WorkPool();
+
+    // Blocks until work is available; returns false when everything is done.
+    bool acquire(Work& out);
+    // Called by the owner of `chunk` after finishing a chunk or task (after
+    // flushing its solution files).
+    void finish(int chunk);
+    bool hungry() const {
+        return hungry_.load(std::memory_order_relaxed) > queued_.load(std::memory_order_relaxed);
+    }
+    void donate(PackedState&& st, int chunk);
+
+    const std::vector<std::string>& chunk_paths() const { return paths_; }
+    std::atomic<int>& next_chunk() { return next_chunk_; }
+    int64_t donated() const { return donated_.load(); }
+    void enable_transpositions(size_t megabytes);
+    TranspositionTable* transpositions() { return tt_.get(); }
+
+private:
+    std::vector<std::string> paths_;
+    std::string done_path_;
+    std::atomic<int> next_chunk_{0};
+    std::atomic<int> hungry_{0};
+    std::atomic<int> queued_{0};
+    std::atomic<int64_t> donated_{0};
+    std::vector<std::atomic<int>> outstanding_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<Task> tasks_;
+    int active_;
+    bool finished_ = false;
+    std::mutex done_mu_;
+    FILE* done_file_ = nullptr;
+    std::unique_ptr<TranspositionTable> tt_;
+};
+
+// Chunk bookkeeping for --resume.
+int64_t repair_solution_file(const std::string& path);
+std::vector<std::string> list_chunk_files(const std::string& output_dir);
+std::set<std::string> read_done_chunks(const std::string& done_path);
+
 DiskSolverStats disk_solver_worker(
-    const std::vector<std::string>& chunk_paths,
-    std::atomic<int>& next_chunk,
+    WorkPool& pool,
     const std::string& out_dir,
     int max_polygons,
     int spill_threshold = 50000,
@@ -114,4 +179,6 @@ extern std::atomic<int64_t> g_disk_queue[MAX_WORKERS];        // in-RAM queue si
 extern std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];      // states spilled to disk
 extern std::atomic<bool> g_disk_running;
 extern bool g_compress_solutions;
+extern bool g_legacy_solver;
+extern int g_tt_margin;        // probe transpositions at nodes with <= k - margin vertices  // use the copy-per-child queue solver instead of DfsEngine
 extern int64_t g_compress_threshold;  // bytes; .bin files above this size are compressed mid-run

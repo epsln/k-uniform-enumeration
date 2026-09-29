@@ -5,9 +5,14 @@
 
 #include <cassert>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <unistd.h>
 #include <vector>
 
 bool g_propagate = true;
@@ -122,6 +127,40 @@ static void test_invalid_packed_state() {
     assert(rejected);
 }
 
+static void test_solution_stream_eviction() {
+    namespace fs = std::filesystem;
+    fs::path dir = fs::temp_directory_path() / ("eusolver_streams_" + std::to_string(::getpid()));
+    fs::create_directory(dir);
+    g_binary_solutions = true;
+    g_append_solutions = false;
+    std::mutex mu;
+    std::map<std::string, int> totals;
+    std::map<std::string, std::string> files;
+    HistogramMap hist;
+    for (int k = 1; k <= 40; ++k) {
+        State state = EuclideanSolver::rebuild_from_vertype_glue(
+            std::vector<int>(k, 0), std::vector<int>(k * left_neighbors[0].size(), -1));
+        EuclideanSolver::write_solution_static(state, dir.string(), mu, totals, files, hist);
+    }
+    // Revisit the first file after it has been evicted from the cache.
+    State first = EuclideanSolver::make_initial(0);
+    EuclideanSolver::write_solution_static(first, dir.string(), mu, totals, files, hist);
+    EuclideanSolver::close_solution_streams();
+    for (int k = 1; k <= 40; ++k) {
+        std::ifstream in(dir / ("eusolver_" + pad2(k) + "_" + fine_name(first).substr(3) + ".bin"),
+                         std::ios::binary);
+        assert(in);
+        int records = 0;
+        while (in.peek() != EOF) {
+            assert(read_state_bin(in).vertype.size() == (size_t)k);
+            ++records;
+        }
+        assert(records == (k == 1 ? 2 : 1));
+    }
+    fs::remove_all(dir);
+    g_binary_solutions = false;
+}
+
 int main() {
     test_a2_attachment_orbits();
     test_large_canonical_refinement();
@@ -130,6 +169,7 @@ int main() {
     test_truncated_v2_header();
     test_legacy_round_trip();
     test_invalid_packed_state();
+    test_solution_stream_eviction();
     std::cout << "high-k safety tests passed\n";
     return 0;
 }

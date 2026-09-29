@@ -1,4 +1,9 @@
 #include "disk_solver.h"
+#include "dfs_engine.h"
+#include "canonical.h"
+#include "transposition.h"
+#include "zstd_stream.h"
+#include <array>
 #include "solver.h"
 #include "pruner.h"
 #include "vertex_catalog.h"
@@ -13,6 +18,7 @@
 #include <stdexcept>
 #include <unordered_set>
 #include <zstd.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 using namespace catalog;
@@ -155,6 +161,8 @@ std::atomic<int64_t> g_disk_queue[MAX_WORKERS];
 std::atomic<int64_t> g_disk_spilled[MAX_WORKERS];
 std::atomic<bool> g_disk_running{false};
 bool g_compress_solutions = false;
+bool g_legacy_solver = false;
+int g_tt_margin = 3;
 int64_t g_compress_threshold = 256LL * 1024 * 1024;
 // Append-compress a .bin file: compress the current tail into a zstd frame and
 // concatenate it onto X.bin.zst (zstd streams concatenate, so zstd -d yields the
@@ -271,9 +279,150 @@ std::vector<PackedState> bfs_fanout(int target, int max_polygons,
 // =============================================================================
 // DFS worker (disk-based)
 // =============================================================================
+WorkPool::WorkPool(std::vector<std::string> chunk_paths, std::string done_path, int num_workers)
+    : paths_(std::move(chunk_paths)), done_path_(std::move(done_path)),
+      outstanding_(paths_.size()), active_(num_workers) {
+    for (auto& o : outstanding_) o.store(0);
+    if (!done_path_.empty()) {
+        done_file_ = std::fopen(done_path_.c_str(), "a");
+        if (!done_file_) throw std::runtime_error("cannot open " + done_path_);
+    }
+}
+
+void WorkPool::enable_transpositions(size_t megabytes) {
+    tt_ = std::make_unique<TranspositionTable>(megabytes);
+}
+
+WorkPool::~WorkPool() {
+    if (done_file_) std::fclose(done_file_);
+}
+
+bool WorkPool::acquire(Work& out) {
+    std::unique_lock<std::mutex> lk(mu_);
+    while (true) {
+        if (!tasks_.empty()) {
+            out.is_chunk = false;
+            out.chunk = tasks_.front().chunk;
+            out.state = std::move(tasks_.front().state);
+            tasks_.pop_front();
+            queued_.fetch_sub(1, std::memory_order_relaxed);
+            return true;
+        }
+        int ci = next_chunk_.fetch_add(1);
+        if (ci < (int)paths_.size()) {
+            outstanding_[ci].store(1);
+            out.is_chunk = true;
+            out.chunk = ci;
+            return true;
+        }
+        next_chunk_.store((int)paths_.size());
+        if (finished_) return false;
+        if (--active_ == 0) {          // nobody holds work: nothing can be donated
+            finished_ = true;
+            cv_.notify_all();
+            return false;
+        }
+        hungry_.fetch_add(1, std::memory_order_relaxed);
+        cv_.wait(lk, [&] { return finished_ || !tasks_.empty(); });
+        hungry_.fetch_sub(1, std::memory_order_relaxed);
+        if (finished_) return false;
+        ++active_;
+    }
+}
+
+void WorkPool::donate(PackedState&& st, int chunk) {
+    outstanding_[chunk].fetch_add(1);
+    donated_.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        tasks_.push_back({std::move(st), chunk});
+        queued_.fetch_add(1, std::memory_order_relaxed);
+    }
+    cv_.notify_one();
+}
+
+void WorkPool::finish(int chunk) {
+    if (outstanding_[chunk].fetch_sub(1) != 1 || !done_file_) return;
+    std::lock_guard<std::mutex> lk(done_mu_);
+    std::fprintf(done_file_, "%s\n", fs::path(paths_[chunk]).filename().string().c_str());
+    std::fflush(done_file_);
+    ::fsync(fileno(done_file_));
+}
+
+// Truncate a solution file after its last complete record. A process killed
+// mid-flush leaves a partial record at the tail; appending after it (resume)
+// would corrupt the file mid-stream.
+int64_t repair_solution_file(const std::string& path) {
+    std::error_code ec;
+    int64_t size = (int64_t)fs::file_size(path, ec);
+    if (ec) return 0;
+    int64_t good = 0;
+    std::string name = fs::path(path).filename().string();
+    if (has_zst_suffix(name)) {
+        std::ifstream in(path, std::ios::binary);
+        ZSTD_DCtx* dctx = ZSTD_createDCtx();
+        std::vector<char> ibuf(ZSTD_DStreamInSize()), obuf(ZSTD_DStreamOutSize());
+        int64_t consumed = 0;
+        bool broken = false;
+        while (!broken) {
+            in.read(ibuf.data(), (std::streamsize)ibuf.size());
+            size_t got = (size_t)in.gcount();
+            if (got == 0) break;
+            ZSTD_inBuffer input{ibuf.data(), got, 0};
+            while (input.pos < input.size) {
+                ZSTD_outBuffer output{obuf.data(), obuf.size(), 0};
+                size_t ret = ZSTD_decompressStream(dctx, &output, &input);
+                if (ZSTD_isError(ret)) { broken = true; break; }
+                if (ret == 0) good = consumed + (int64_t)input.pos;   // frame complete
+            }
+            consumed += (int64_t)got;
+        }
+        ZSTD_freeDCtx(dctx);
+    } else if (name.size() > 4 && name.substr(name.size() - 4) == ".bin") {
+        std::ifstream in(path, std::ios::binary);
+        while (in.peek() != EOF) {
+            try { read_packed_state_bin(in); } catch (const std::exception&) { break; }
+            if (!in) break;
+            good = (int64_t)in.tellg();
+        }
+    } else {
+        std::ifstream in(path, std::ios::binary);
+        std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        size_t end = data.rfind("\n\n");
+        good = end == std::string::npos ? 0 : (int64_t)end + 2;
+    }
+    if (good < size) fs::resize_file(path, (uintmax_t)good);
+    return size - good;
+}
+
+std::vector<std::string> list_chunk_files(const std::string& output_dir) {
+    std::vector<std::pair<long, std::string>> found;
+    for (const auto& entry : fs::directory_iterator(output_dir)) {
+        if (!entry.is_regular_file()) continue;
+        std::string name = entry.path().filename().string();
+        if (name.rfind("chunk_", 0) != 0 || name.size() < 11
+                || name.substr(name.size() - 4) != ".bin") continue;
+        std::string num = name.substr(6, name.size() - 10);
+        if (num.empty() || num.find_first_not_of("0123456789") != std::string::npos) continue;
+        found.push_back({std::stol(num), entry.path().string()});
+    }
+    std::sort(found.begin(), found.end());
+    std::vector<std::string> out;
+    for (auto& f : found) out.push_back(f.second);
+    return out;
+}
+
+std::set<std::string> read_done_chunks(const std::string& done_path) {
+    std::set<std::string> done;
+    std::ifstream in(done_path);
+    std::string line;
+    while (std::getline(in, line))
+        if (!line.empty()) done.insert(line);
+    return done;
+}
+
 DiskSolverStats disk_solver_worker(
-    const std::vector<std::string>& chunk_paths,
-    std::atomic<int>& next_chunk,
+    WorkPool& pool,
     const std::string& out_dir,
     int max_polygons,
     int spill_threshold,
@@ -284,6 +433,8 @@ DiskSolverStats disk_solver_worker(
         throw std::invalid_argument("worker_id exceeds MAX_WORKERS");
     fs::create_directories(out_dir);
     DiskSolverStats stats;
+    const std::vector<std::string>& chunk_paths = pool.chunk_paths();
+    std::atomic<int>& next_chunk = pool.next_chunk();
 
     std::deque<PackedState> queue;
 
@@ -340,7 +491,92 @@ DiskSolverStats disk_solver_worker(
         return true;
     };
 
-    // Pre-load first chunk
+    if (!g_legacy_solver) {
+        // In-place DFS: each chunk root is explored depth-first to completion,
+        // so memory is bounded by search depth and no spilling is needed.
+        // Leaf filter: drop non-minimal (covering) representations -- the
+        // pruner discards them anyway -- and exact-dedup the rest on the
+        // 128-bit hash of their canonical code within a capped window.
+        std::unordered_set<std::array<uint64_t, 2>, Hash128> seen;
+        int64_t seen_cap = std::max<int64_t>(1, sol_dedup_cap);
+        auto emit = [&](const State& sol) {
+            ++stats.raw_leaves;
+            auto cf = canon::canonical_form(sol);
+            if (!cf.minimal) return;
+            if ((int64_t)seen.size() >= seen_cap) seen.clear();
+            if (!seen.insert(cf.hash).second) return;
+            ++stats.solutions_found;
+            EuclideanSolver::write_solution_static(sol, out_dir, mu,
+                run_totals, solution_files, vertex_combos);
+        };
+        int64_t roots_left = 0;
+        auto on_node = [&]() {
+            ++stats.partials_checked;
+            if (++report_counter >= 256) {
+                report_counter = 0;
+                g_disk_partials[worker_id].store(stats.partials_checked, std::memory_order_relaxed);
+                g_disk_solutions[worker_id].store(stats.solutions_found, std::memory_order_relaxed);
+                g_disk_queue[worker_id].store(roots_left, std::memory_order_relaxed);
+            }
+        };
+        DfsEngine engine(max_polygons, emit, on_node);
+        if (TranspositionTable* tt = pool.transpositions()) {
+            int max_probe_vertices = max_polygons - g_tt_margin;
+            engine.prune_node = [tt, max_probe_vertices](const DfsEngine& e) {
+                if (e.num_vertices() > max_probe_vertices) return false;
+                auto v = e.view();
+                auto cf = canon::canonical_form(
+                    canon::DartView{v.n, v.R, v.L, v.M, v.G, v.P, true, v.T});
+                return cf.minimal && tt->seen_or_insert(cf.hash);
+            };
+        }
+        engine.on_leaf = [&](const DfsEngine& e) {
+            ++stats.raw_leaves;
+            auto v = e.view();
+            auto cf = canon::canonical_form(canon::DartView{v.n, v.R, v.L, v.M, v.G, v.P});
+            if (!cf.minimal) return;
+            if ((int64_t)seen.size() >= seen_cap) seen.clear();
+            if (!seen.insert(cf.hash).second) return;
+            ++stats.solutions_found;
+            EuclideanSolver::write_solution_static(e.to_state(), out_dir, mu,
+                run_totals, solution_files, vertex_combos);
+        };
+        int current_chunk = -1;
+        engine.should_donate = [&] { return pool.hungry(); };
+        engine.donate = [&](PackedState&& p) { pool.donate(std::move(p), current_chunk); };
+        int compress_counter = 0;
+        auto maybe_compress = [&] {
+            if (!g_compress_solutions || ++compress_counter < 64) return;
+            compress_counter = 0;
+            EuclideanSolver::close_solution_streams();
+            for (const auto& entry : fs::directory_iterator(out_dir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".bin"
+                    && (int64_t)entry.file_size() >= g_compress_threshold)
+                    append_compress(entry.path().string());
+            }
+        };
+        WorkPool::Work work;
+        while (pool.acquire(work)) {
+            current_chunk = work.chunk;
+            if (work.is_chunk) {
+                auto roots = read_packed_states_bin(chunk_paths[work.chunk]);
+                roots_left = (int64_t)roots.size();
+                for (auto& p : roots) {
+                    engine.run(EuclideanSolver::unpack_state(p));
+                    --roots_left;
+                    maybe_compress();
+                }
+            } else {
+                roots_left = 0;
+                engine.run(EuclideanSolver::unpack_state(work.state));
+                maybe_compress();
+            }
+            // Solutions must be on disk before the chunk can be marked done.
+            EuclideanSolver::flush_solution_streams();
+            pool.finish(work.chunk);
+        }
+    } else {
+    // Legacy path: copy-per-child FIFO queue with disk spill.
     pull_chunk();
 
     int spill_check_counter = 0;
@@ -389,6 +625,7 @@ DiskSolverStats disk_solver_worker(
         // overwrites X.bin.zst, so earlier solutions are preserved.
         if (g_compress_solutions && (++compress_check_counter >= 500)) {
             compress_check_counter = 0;
+            EuclideanSolver::close_solution_streams();
             for (const auto& entry : fs::directory_iterator(out_dir)) {
                 if (entry.is_regular_file() && entry.path().extension() == ".bin"
                     && (int64_t)entry.file_size() >= g_compress_threshold)
@@ -405,7 +642,10 @@ DiskSolverStats disk_solver_worker(
         }
     }
 
+    }  // legacy path
+
     if (spill_has_data) fs::remove(spill_path);
+    EuclideanSolver::close_solution_streams();
 
     // Compress any remaining uncompressed tails once the worker has finished writing.
     if (g_compress_solutions) {

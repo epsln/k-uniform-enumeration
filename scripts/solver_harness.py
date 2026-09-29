@@ -136,6 +136,32 @@ def canonical_solutions(output_dir: pathlib.Path) -> dict[int, frozenset[str]]:
     return {k: frozenset(values) for k, values in solutions.items()}
 
 
+def isomorphism_classes(tool: str, output_dir: pathlib.Path) -> dict[int, frozenset[str]]:
+    """Canonical-code hashes of every pruned solution in a --format raw run.
+
+    Unlike canonical_solutions (byte-identical TES documents), this identifies
+    tilings up to isomorphism, so runs that keep different labelled
+    representatives of the same tiling compare equal.
+    """
+    wl = output_dir / "wl"
+    if not wl.is_dir():
+        raise RuntimeError(f"raw pruner output is missing: {wl}")
+    completed = subprocess.run((executable_path(tool), "--canonical-hashes", str(wl)),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(f"canonical hashing failed: {completed.stderr}")
+    solutions: dict[int, set[str]] = collections.defaultdict(set)
+    for line in completed.stdout.splitlines():
+        k, minimal, digest = line.split()
+        if minimal != "1":
+            raise RuntimeError(f"pruned solution is not a minimal representation: {line}")
+        if digest in solutions[int(k)]:
+            raise RuntimeError(f"duplicate tiling in pruned output for k={k}: {digest}")
+        solutions[int(k)].add(digest)
+    return {k: frozenset(values) for k, values in solutions.items()}
+
+
 def select_solutions(solutions: dict[int, frozenset[str]], max_k: int) -> set[tuple[int, str]]:
     return {(k, digest) for k, values in solutions.items() if k <= max_k for digest in values}
 

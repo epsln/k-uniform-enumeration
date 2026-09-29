@@ -26,6 +26,8 @@ constexpr int64_t HISTOGRAM_CAP = 1000000;
 
 extern bool g_propagate;
 extern bool g_binary_solutions;
+// Never truncate existing solution files (disk mode: resumable worker output).
+extern bool g_append_solutions;
 
 inline std::string rebuild_label(int slot, const std::vector<int>& vertype) {
     int offset = 0;
@@ -222,6 +224,10 @@ public:
                                         std::map<std::string,int>& run_totals,
                                         std::map<std::string,std::string>& solution_files,
                                         HistogramMap& vertex_combos);
+    // Flush and close this thread's cached solution files. Must be called
+    // before anything else reads, moves or compresses them.
+    static void close_solution_streams();
+    static void flush_solution_streams();
 
 private:
     int max_polygons_;

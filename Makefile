@@ -1,9 +1,11 @@
 CXX := g++
-CXXFLAGS := -O3 -std=c++17 -Wall -Wextra -march=native -fno-strict-aliasing -pthread -Isrc
-LDLIBS := -lzstd -lsqlite3
+CXXFLAGS := -O3 -std=c++17 -Wall -Wextra -march=native -fno-strict-aliasing -pthread -Isrc $(EXTRA_CXXFLAGS)
+LDLIBS := $(EXTRA_LDFLAGS) -lzstd -lsqlite3
 TARGET := eusolver
 SAFETY_TEST := tests/high_k_safety
 MORTIER_TEST := tests/mortier_export
+ENGINE_TEST := tests/dfs_engine_equiv
+CANON_TEST := tests/canonical_equiv
 
 SRCDIR := src
 SRCS := $(wildcard $(SRCDIR)/*.cpp)
@@ -15,10 +17,10 @@ $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
 
 $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) -MMD -MP -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET) eusolver_dbg $(SAFETY_TEST) $(MORTIER_TEST)
+	rm -f $(OBJS) $(OBJS:.o=.d) $(TARGET) eusolver_dbg $(SAFETY_TEST) $(MORTIER_TEST) $(ENGINE_TEST) $(CANON_TEST)
 
 debug:
 	$(CXX) -g -O0 -std=c++17 -Wall -Wextra -pthread -Isrc -o eusolver_dbg $(SRCS) $(LDLIBS)
@@ -34,9 +36,18 @@ $(SAFETY_TEST): tests/high_k_safety.cpp $(filter-out $(SRCDIR)/main.o,$(OBJS))
 $(MORTIER_TEST): tests/mortier_export.cpp $(filter-out $(SRCDIR)/main.o,$(OBJS))
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
 
-test: $(TARGET) $(SAFETY_TEST) $(MORTIER_TEST)
+$(ENGINE_TEST): tests/dfs_engine_equiv.cpp $(filter-out $(SRCDIR)/main.o,$(OBJS))
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
+
+$(CANON_TEST): tests/canonical_equiv.cpp $(filter-out $(SRCDIR)/main.o,$(OBJS))
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
+
+test: $(TARGET) $(SAFETY_TEST) $(MORTIER_TEST) $(ENGINE_TEST) $(CANON_TEST)
 	./$(SAFETY_TEST)
 	./$(MORTIER_TEST)
+	./$(ENGINE_TEST) 7 200000
+	./$(CANON_TEST) 7
+	sh tests/compressed_merge.sh ./$(TARGET)
 	python3 -m unittest discover -s tests -v
 	python3 scripts/regression.py --candidate "./$(TARGET)" --max-k $(or $(TEST_MAX_K),1) $(if $(BASELINE),--baseline "$(BASELINE)",)
 
@@ -45,5 +56,7 @@ test: $(TARGET) $(SAFETY_TEST) $(MORTIER_TEST)
 benchmark:
 	@test -n "$(BASELINE)" || { printf '%s\n' 'usage: make benchmark BASELINE=/path/to/baseline [CANDIDATE=./eusolver]'; exit 2; }
 	python3 scripts/benchmark.py --baseline "$(BASELINE)" --candidate "$(or $(CANDIDATE),./$(TARGET))" --max-k $(or $(BENCHMARK_MAX_K),2) --repeats $(or $(BENCHMARK_REPEATS),3) $(if $(BENCHMARK_MAX_SLOWDOWN),--max-slowdown $(BENCHMARK_MAX_SLOWDOWN),)
+
+-include $(OBJS:.o=.d)
 
 .PHONY: all clean run debug test benchmark

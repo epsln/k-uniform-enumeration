@@ -9,13 +9,14 @@ import sys
 import tempfile
 
 from solver_harness import (REFERENCE_COUNTS, canonical_solutions, describe_difference,
-                            parse_k_spec, run_solver, select_solutions)
+                            isomorphism_classes, parse_k_spec, run_solver,
+                            select_solutions)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", default="./eusolver")
-    parser.add_argument("--baseline", help="executable whose exact canonical set is expected")
+    parser.add_argument("--baseline", help="executable whose set of tilings (up to isomorphism) is expected")
     parser.add_argument("--max-k", type=int, default=1,
                         help="enumeration limit; 1 is fast, verified counts are stored through 16")
     parser.add_argument("--reference-k",
@@ -58,19 +59,20 @@ def main() -> int:
             print(f"PASS reference count k={k}: {actual}")
 
         if args.baseline:
-            if args.workers == args.exact_workers:
-                exact_candidate = candidate
-            else:
-                exact_run = run_solver(args.candidate, root / "candidate-exact",
-                                       args.max_k, args.exact_workers)
-                exact_candidate = canonical_solutions(exact_run.output_dir)
+            # Traversal-order changes legitimately keep different labelled
+            # representatives, so compare tilings up to isomorphism using the
+            # candidate's canonical-code tool on raw pruner output.
+            exact_run = run_solver(args.candidate, root / "candidate-exact",
+                                   args.max_k, args.exact_workers, extra_args=("--format", "raw"))
             baseline_run = run_solver(args.baseline, root / "baseline-memory",
-                                      args.max_k, args.exact_workers)
-            baseline = select_solutions(canonical_solutions(baseline_run.output_dir), args.max_k)
-            candidate_set = select_solutions(exact_candidate, args.max_k)
+                                      args.max_k, args.exact_workers, extra_args=("--format", "raw"))
+            baseline = select_solutions(isomorphism_classes(args.candidate, baseline_run.output_dir),
+                                        args.max_k)
+            candidate_set = select_solutions(isomorphism_classes(args.candidate, exact_run.output_dir),
+                                             args.max_k)
             if candidate_set != baseline:
                 raise AssertionError(describe_difference(baseline, candidate_set))
-            print(f"PASS baseline exact canonical set: {len(candidate_set)} solutions")
+            print(f"PASS baseline isomorphism-class set: {len(candidate_set)} solutions")
         else:
             print("SKIP baseline exact-set comparison (pass --baseline EXE to enable)")
 

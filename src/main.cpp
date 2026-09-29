@@ -5,6 +5,8 @@
 #include "metrics.h"
 #include "zstd_stream.h"
 #include "tes_store.h"
+#include "canonical.h"
+#include "transposition.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -256,19 +258,22 @@ static void merge_worker_outputs(const std::string& output_dir,
 			if (!entry.is_regular_file()) continue;
 			std::string fname = entry.path().filename().string();
 			if (fname.rfind("eusolver_", 0) != 0) continue;
-			std::string base = fname;
-			if (has_zst_suffix(base)) base.resize(base.size() - 4);
-			per_combo[base].push_back(entry.path().string());
+			// Group by exact name: compressed and plain files of one combo can
+			// coexist (e.g. after an interrupted run) and must not be mixed.
+			// Plain merged files are compressed onto X.zst afterwards.
+			per_combo[fname].push_back(entry.path().string());
 		}
 	}
 	for (const auto& [base, paths] : per_combo) {
-		// zstd frames concatenate, so .zst sources are byte-copied as-is;
-		// plain sources are concatenated and compressed right after this call.
-		bool zst = !paths.empty() && has_zst_suffix(paths.front());
-		std::string dest = output_dir + "/" + base + (zst ? ".zst" : "");
+		// `base` is the exact source name, suffix included: .zst sources are
+		// byte-copied onto X.zst (zstd frames concatenate); plain sources are
+		// concatenated onto X and compressed onto X.zst right after this call.
+		std::string dest = output_dir + "/" + base;
 		std::ofstream out(dest, std::ios::binary | std::ios::app);
 		if (!out) throw std::runtime_error("cannot open merged output " + dest);
 		for (const auto& p : paths) {
+			// Streaming an empty file sets failbit on `out`; nothing to copy.
+			if (fs::file_size(p) == 0) continue;
 			std::ifstream in(p, std::ios::binary);
 			if (!in) throw std::runtime_error("cannot open worker output " + p);
 			out << in.rdbuf();
@@ -341,11 +346,13 @@ int main(int argc, char** argv) {
 	int fanout_target = 0;    // 0 = auto-scale
 	int spill_threshold = 0;  // 0 = auto-scale
 	int chunks_user = 0;      // 0 = auto (num_workers * 32)
-	std::string dedup_mode  = "wl";
+	std::string dedup_mode  = "canon";
 	int64_t sol_dedup_cap_user = 0;  // 0 = auto-scale
 	int max_ram_gb = 0;  // 0 = auto (k-based formula)
 	bool resume = false;
+	int64_t tt_mb = 1024;
 	std::string extract_database, extract_output;
+	std::string canonical_hashes_dir;
 	std::string export_mortier_database, export_mortier_json_path, mortier_stable_id;
 	std::string import_mortier_json_path, import_mortier_database;
 	std::string convert_tes_database, conversion_errors = "fail";
@@ -373,8 +380,10 @@ int main(int argc, char** argv) {
 		else if (arg == "--wl-iters" && i + 1 < argc) g_wl_iters = std::stoi(argv[++i]);
 		else if (arg == "--dedup" && i + 1 < argc) {
 			std::string v = argv[++i];
-			if (v == "bfl") { dedup_mode = "bfl"; g_use_bfl = true; }
-			else { dedup_mode = "wl"; g_use_bfl = false; }
+			if (v == "bfl") { dedup_mode = "bfl"; g_use_bfl = true; g_dedup_canon = false; }
+			else if (v == "wl") { dedup_mode = "wl"; g_use_bfl = false; g_dedup_canon = false; }
+			else if (v == "canon") { dedup_mode = "canon"; g_use_bfl = false; g_dedup_canon = true; }
+			else { std::cerr << "--dedup must be canon, wl, or bfl\n"; return 1; }
 		}
 		else if (arg == "--no-iso-check") { g_no_iso_check = true; }
 		else if (arg == "--prune-only") { prune_only = true; }
@@ -382,12 +391,17 @@ int main(int argc, char** argv) {
 		else if (arg == "--profile-pruner") { g_profile_pruner = true; }
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
+		else if (arg == "--legacy-solver") { g_legacy_solver = true; }
+		else if (arg == "--tt-mb" && i + 1 < argc) tt_mb = std::stoll(argv[++i]);
+		else if (arg == "--tt-margin" && i + 1 < argc) g_tt_margin = std::stoi(argv[++i]);
+		else if (arg == "--no-tt") { tt_mb = 0; }
 		else if (arg == "--fanout" && i + 1 < argc) fanout_target = std::stoi(argv[++i]);
 		else if (arg == "--spill" && i + 1 < argc) spill_threshold = std::stoi(argv[++i]);
 		else if (arg == "--chunks" && i + 1 < argc) chunks_user = std::stoi(argv[++i]);
 		else if (arg == "--sol-dedup-cap" && i + 1 < argc) sol_dedup_cap_user = std::stoll(argv[++i]);
 		else if (arg == "--max-ram-gb" && i + 1 < argc) max_ram_gb = std::stoi(argv[++i]);
 		else if (arg == "--resume") { resume = true; }
+		else if (arg == "--canonical-hashes" && i + 1 < argc) canonical_hashes_dir = argv[++i];
 		else if (arg == "--extract-tes" && i + 1 < argc) extract_database = argv[++i];
 		else if (arg == "--extract-output" && i + 1 < argc) extract_output = argv[++i];
 		else if (arg == "--tes-id" && i + 1 < argc) extract_id = std::stoll(argv[++i]);
@@ -419,7 +433,7 @@ int main(int argc, char** argv) {
 				<< "  --format raw|tes|mortier  final output format (default: tes)\n"
 				<< "  --wl-dim 1|2       WL hash dimension (default: 1)\n"
 				<< "  --wl-iters N       WL iteration cap (default: 0 = iterate to convergence)\n"
-				<< "  --dedup wl|bfl       online solver dedup mode (default: wl)\n"
+				<< "  --dedup canon|wl|bfl pruner dedup: exact canonical form (default), WL hash, or BFL word\n"
 				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
 				<< "  --prune-only        prune existing eusolver_* files in --output\n"
 				<< "  --keep-pruner-inputs preserve raw solution files after pruning\n"
@@ -431,8 +445,13 @@ int main(int argc, char** argv) {
 				<< "  --max-ram-gb N     RAM budget for queue spill/dedup auto-scaling (0=auto: 70% of free RAM)\n"
 				<< "  --binary-solutions write solutions as binary .bin files\n"
 				<< "  --no-spill          keep all partial states in RAM (no disk spill)\n"
+				<< "  --legacy-solver     disk mode: use the old copy-per-child queue solver\n"
+				<< "  --tt-mb N           transposition table size in MB (default 1024)\n"
+				<< "  --tt-margin N       probe partial states with <= k-N vertices (default 3)\n"
+				<< "  --no-tt             disable the transposition table\n"
 				<< "  --compress-solutions  compress worker .bin output with zstd\n"
 				<< "  --compress-threshold-mb N  mid-run compression threshold (default 256)\n"
+				<< "  --canonical-hashes DIR  print 'k hash' per solution in raw eupruned/eusolver text files\n"
 				<< "  --extract-tes DB   extract .tes records from a pruner SQLite database\n"
 				<< "  --extract-output DIR  extraction directory (required with --extract-tes)\n"
 				<< "  --tes-id N         extract only this database entry id (default: all)\n"
@@ -476,6 +495,46 @@ int main(int argc, char** argv) {
 			|| (!convert_operation && conversion_errors != "fail")) {
 		std::cerr << "invalid or conflicting extraction/conversion options\n";
 		return 1;
+	}
+	if (!canonical_hashes_dir.empty()) {
+		// Isomorphism-invariant identity of every solution in text solution
+		// files, for comparing runs whose kept representatives differ.
+		try {
+			for (const auto& entry : fs::recursive_directory_iterator(canonical_hashes_dir)) {
+				if (!entry.is_regular_file()) continue;
+				std::string name = entry.path().filename().string();
+				if (name.rfind("eupruned.txt", 0) != 0 && name.rfind("eusolver_", 0) != 0) continue;
+				if (name.find(".txt") == std::string::npos) continue;
+				auto in = open_solution_istream(entry.path().string());
+				auto emit = [](const State& st) {
+					auto cf = canon::canonical_form(st);
+					std::printf("%zu %d %016llx%016llx\n", st.vertype.size(), cf.minimal ? 1 : 0,
+					            (unsigned long long)cf.hash[0], (unsigned long long)cf.hash[1]);
+				};
+				if (name.rfind("eusolver_", 0) == 0) {
+					SolutionPruner::SolutionRecord rec;
+					while (read_next_solution(*in, rec)) emit(rec.state);
+					continue;
+				}
+				// Pruned record: vertex, signature, "Count type", TES, Conway,
+				// cycle lines, "---", assembled Conway, blank.
+				std::string line;
+				while (std::getline(*in, line)) {
+					if (line.empty()) continue;
+					std::string vertex_line = line, skip, conway_line;
+					if (!std::getline(*in, skip) || !std::getline(*in, skip) || !std::getline(*in, skip)
+							|| !std::getline(*in, conway_line))
+						throw std::runtime_error("truncated pruned record in " + entry.path().string());
+					while (std::getline(*in, skip) && skip != "---") {}
+					std::getline(*in, skip);
+					emit(SolutionPruner::decode_solution(vertex_line, conway_line));
+				}
+			}
+			return 0;
+		} catch (const std::exception& e) {
+			std::cerr << "canonical hashing failed: " << e.what() << "\n";
+			return 1;
+		}
 	}
 	if (!extract_database.empty()) {
 		if (extract_output.empty()) {
@@ -659,12 +718,19 @@ int main(int argc, char** argv) {
 		int n_chunks = chunks_user > 0 ? chunks_user : num_workers * 32;
 		auto t1 = std::chrono::steady_clock::now();
 
+		const std::string done_path = output_dir + "/done_chunks.txt";
+		g_append_solutions = true;   // worker output survives interruption and --resume
 		if (!resume) {
-			// Clear old solver output files
+			// Clear old solver output, chunk files, worker dirs and progress.
 			for (const auto& entry : fs::directory_iterator(output_dir)) {
-				if (entry.is_regular_file() && entry.path().filename().string().rfind("eusolver_",0)==0)
+				std::string name = entry.path().filename().string();
+				if (entry.is_regular_file() && (name.rfind("eusolver_", 0) == 0
+						|| (name.rfind("chunk_", 0) == 0 && entry.path().extension() == ".bin")))
 					fs::remove(entry.path());
+				else if (entry.is_directory() && name.rfind("_worker_", 0) == 0)
+					fs::remove_all(entry.path());
 			}
+			fs::remove(done_path);
 			// Phase 1: BFS fan-out
 			std::cout << "Phase 1: BFS fan-out to " << fanout_target << " frontier states...\n";
 			std::vector<State> early_solutions;
@@ -683,6 +749,7 @@ int main(int argc, char** argv) {
 				HistogramMap vc;
 				for (auto& s : early_solutions)
 					EuclideanSolver::write_solution_static(s, output_dir, mu, rt, sf, vc);
+				EuclideanSolver::close_solution_streams();
 			}
 			std::cout << "  Early solutions written.\n";
 
@@ -699,14 +766,32 @@ int main(int argc, char** argv) {
 				chunk_paths.push_back(cp);
 			}
 		} else {
-			// Resume: reuse existing chunk files
+			// Resume: reuse existing chunk files, skipping completed ones.
 			std::cout << "Resuming from " << output_dir << "...\n";
-			for (int ci = 0; ci < n_chunks; ++ci) {
-				std::string cp = output_dir + "/chunk_" + std::to_string(ci) + ".bin";
-				if (fs::exists(cp)) chunk_paths.push_back(cp);
+			auto all_chunks = list_chunk_files(output_dir);
+			auto done = read_done_chunks(done_path);
+			for (const auto& cp : all_chunks)
+				if (!done.count(fs::path(cp).filename().string())) chunk_paths.push_back(cp);
+			n_chunks = (int)chunk_paths.size();
+			// Drop partial records left at the tail of solution files by an
+			// interrupted run before appending to them.
+			int64_t repaired = 0, repaired_files = 0;
+			for (const auto& entry : fs::recursive_directory_iterator(output_dir)) {
+				if (!entry.is_regular_file()) continue;
+				std::string rel = fs::relative(entry.path(), output_dir).string();
+				if (rel.rfind("_worker_", 0) != 0 && rel.find('/') != std::string::npos) continue;
+				if (entry.path().filename().string().rfind("eusolver_", 0) != 0) continue;
+				int64_t cut = repair_solution_file(entry.path().string());
+				if (cut > 0) { repaired += cut; ++repaired_files; }
 			}
-			std::cout << "  Found " << chunk_paths.size() << " chunk files\n";
+			if (repaired_files)
+				std::cout << "  Repaired " << repaired_files << " solution file(s): dropped "
+				          << repaired << " bytes of partial trailing records\n";
+			std::cout << "  Found " << all_chunks.size() << " chunk files, "
+			          << (all_chunks.size() - chunk_paths.size()) << " already done, "
+			          << chunk_paths.size() << " to run\n";
 		}
+		n_chunks = (int)chunk_paths.size();
 
 		// Phase 2: parallel disk workers (shared atomic chunk pool)
 		std::cout << "Phase 2: " << n_chunks << " chunks, " << num_workers
@@ -723,7 +808,9 @@ int main(int argc, char** argv) {
 			g_disk_spilled[w].store(0);
 		}
 		g_disk_running.store(true);
-		std::atomic<int> next_chunk{0};
+		WorkPool pool(chunk_paths, done_path, num_workers);
+		if (tt_mb > 0 && !g_legacy_solver) pool.enable_transpositions((size_t)tt_mb);
+		std::atomic<int>& next_chunk = pool.next_chunk();
 
 		const std::string status_path = output_dir + "/status.json";
 		const bool is_tty = isatty(STDERR_FILENO);
@@ -870,10 +957,11 @@ int main(int argc, char** argv) {
 		});
 
 		std::vector<std::thread> threads;
+		std::vector<DiskSolverStats> worker_stats(num_workers);
 		for (int w = 0; w < num_workers; ++w) {
 			bool nospill = g_no_spill;
 			threads.emplace_back([&, w, nospill]() {
-				disk_solver_worker(chunk_paths, next_chunk,
+				worker_stats[w] = disk_solver_worker(pool,
 					worker_dirs[w], max_polygons,
 					nospill ? 0x7fffffff : spill_threshold,
 					sol_dedup_cap_user, w);
@@ -882,7 +970,7 @@ int main(int argc, char** argv) {
 		for (auto& t : threads) t.join();
 		g_disk_running.store(false);
 		disk_progress.join();
-		for (const auto& cp : chunk_paths) fs::remove(cp);
+		for (const auto& cp : list_chunk_files(output_dir)) fs::remove(cp);
 
 		auto t2 = std::chrono::steady_clock::now();
 		int64_t disk_partials = 0;
@@ -891,9 +979,26 @@ int main(int argc, char** argv) {
 		std::cout << "Solver phase: " << std::fixed << std::setprecision(1)
 		          << std::chrono::duration<double>(t2 - t1).count() << "s ("
 		          << disk_partials << " partials)\n";
+		{
+			int64_t leaves = 0, written = 0;
+			for (const auto& ws : worker_stats) { leaves += ws.raw_leaves; written += ws.solutions_found; }
+			std::cout << "  leaves: " << leaves << " raw, " << written << " written after canonical filter\n";
+		}
 
-		merge_worker_outputs(output_dir, worker_dirs);
-		for (const auto& wd : worker_dirs) fs::remove_all(wd);
+		std::cout << "  work sharing: " << pool.donated() << " subtrees donated to idle workers\n";
+		if (auto* tt = pool.transpositions())
+			std::cout << "  transpositions: " << tt->hits() << " subtrees skipped of "
+			          << tt->probes() << " probes (" << tt->capacity() << " slots)\n";
+		// Merge every worker dir present: a resumed run may use fewer workers
+		// than the run that produced some of the output.
+		std::vector<std::string> all_worker_dirs;
+		for (const auto& entry : fs::directory_iterator(output_dir))
+			if (entry.is_directory() && entry.path().filename().string().rfind("_worker_", 0) == 0)
+				all_worker_dirs.push_back(entry.path().string());
+		std::sort(all_worker_dirs.begin(), all_worker_dirs.end());
+		merge_worker_outputs(output_dir, all_worker_dirs);
+		for (const auto& wd : all_worker_dirs) fs::remove_all(wd);
+		fs::remove(done_path);
 		compress_merged_solutions(output_dir);
 
 		std::cout << "Pruner phase starting...\n";

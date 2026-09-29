@@ -4,11 +4,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <list>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <mutex>
@@ -20,6 +23,7 @@ using namespace catalog;
 // =============================================================================
 // Global counters
 // =============================================================================
+bool g_append_solutions = false;
 static std::mutex g_mutex;
 static std::map<int, int> g_per_k_counts;
 static std::array<std::atomic<int64_t>, 24> g_raw_per_k;  // lock-free for progress
@@ -361,7 +365,10 @@ bool EuclideanSolver::propagate_forced(std::vector<Dart>& darts) {
                 int nxt = G(r);
                 if (nxt == -1) { free_r = r; break; }
                 ++segs;
-                if (nxt == start) { free_r = -2; break; }
+                // Closed iff we return to the chain start `beg`. (Comparing
+                // against `start` misclassified open chains entered mid-way
+                // as closed and silently skipped their forced closure.)
+                if (nxt == beg) { free_r = -2; break; }
                 if (segs > sz || segs > n) return false;
                 cur = nxt;
             }
@@ -492,6 +499,68 @@ void EuclideanSolver::write_solution(const State& st) {
 // =============================================================================
 // Summary output
 // =============================================================================
+// Per-thread cache of open solution files. Keep hot combos open without holding
+// a descriptor for every combo encountered during a long enumeration.
+namespace {
+struct SolutionStreams {
+    static constexpr size_t max_open = 8;  // <= 512 streams even with 64 workers
+    struct Entry {
+        std::unique_ptr<std::ofstream> stream;
+        std::list<std::string>::iterator recent;
+    };
+    std::map<std::string, Entry> open;
+    std::list<std::string> recent;  // most recently used at the front
+    ~SolutionStreams() { close_all(); }
+    void close_all() {
+        for (auto& [path, entry] : open) {
+            entry.stream->close();
+            if (!*entry.stream) std::cerr << "\nERROR: failed writing solution file " << path << "\n";
+        }
+        open.clear();
+        recent.clear();
+    }
+};
+thread_local SolutionStreams g_solution_streams;
+
+std::ofstream& solution_stream(const std::string& path, bool truncate, bool binary) {
+    auto& cache = g_solution_streams;
+    auto it = cache.open.find(path);
+    if (it != cache.open.end()) {
+        cache.recent.splice(cache.recent.begin(), cache.recent, it->second.recent);
+        return *it->second.stream;
+    }
+    if (cache.open.size() == SolutionStreams::max_open) {
+        auto old = cache.open.find(cache.recent.back());
+        old->second.stream->close();
+        if (!*old->second.stream)
+            throw std::runtime_error("failed writing solution file " + old->first);
+        cache.open.erase(old);
+        cache.recent.pop_back();
+    }
+    auto mode = (truncate ? std::ios::out : std::ios::app);
+    if (binary) mode |= std::ios::binary;
+    errno = 0;
+    auto f = std::make_unique<std::ofstream>(path, mode);
+    if (!*f) {
+        int error = errno;
+        throw std::runtime_error("cannot open solution file " + path +
+            (error ? ": " + std::string(std::strerror(error)) : ": unknown I/O error"));
+    }
+    cache.recent.push_front(path);
+    return *cache.open.emplace(path, SolutionStreams::Entry{std::move(f), cache.recent.begin()})
+                .first->second.stream;
+}
+} // namespace
+
+void EuclideanSolver::close_solution_streams() { g_solution_streams.close_all(); }
+
+void EuclideanSolver::flush_solution_streams() {
+    for (auto& [path, entry] : g_solution_streams.open) {
+        entry.stream->flush();
+        if (!*entry.stream) throw std::runtime_error("failed writing solution file " + path);
+    }
+}
+
 void EuclideanSolver::write_solution_static(const State& st, const std::string& output_dir,
                                               std::mutex& mu,
                                               std::map<std::string,int>& run_totals,
@@ -500,7 +569,7 @@ void EuclideanSolver::write_solution_static(const State& st, const std::string& 
     std::string combo = fine_name(st);
     std::string ext = g_binary_solutions ? ".bin" : ".txt";
     std::string path = output_dir + "/eusolver_" + combo + ext;
-    bool is_new = (run_totals.find(combo) == run_totals.end());
+    bool is_new = !g_append_solutions && (run_totals.find(combo) == run_totals.end());
     run_totals[combo] = (is_new ? 1 : run_totals[combo] + 1);
     solution_files[combo] = path;
 
@@ -525,12 +594,12 @@ void EuclideanSolver::write_solution_static(const State& st, const std::string& 
         g_raw_per_k[st.vertype.size()].fetch_add(1);
 
     if (g_binary_solutions) {
-        std::ofstream bout(path, std::ios::binary | (is_new ? std::ios::out : std::ios::app));
+        std::ofstream& bout = solution_stream(path, is_new, true);
         write_state_bin(bout, st);
         return;
     }
 
-    std::ofstream out(path, is_new ? std::ios::out : std::ios::app);
+    std::ofstream& out = solution_stream(path, is_new, false);
     out << "Number of polygons: " << st.vertype.size() << "\n";
     out << verbal_vertices(st.vertype) << "\n";
     out << sig << "\n";
@@ -632,5 +701,6 @@ void EuclideanSolver::run() {
     std::cerr << "\r  [" << output_dir_ << "] done: " << partials_checked_
               << " partials, " << solutions_found_ << " sols                            \n";
     if (log_.is_open()) log_.close();
+    close_solution_streams();
     write_summary();
 }
