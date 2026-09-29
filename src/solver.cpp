@@ -4,11 +4,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <list>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -497,39 +499,65 @@ void EuclideanSolver::write_solution(const State& st) {
 // =============================================================================
 // Summary output
 // =============================================================================
-// Per-thread cache of open solution files. Every output path is written by a
-// single thread, so reopening the file for each solution was pure overhead.
+// Per-thread cache of open solution files. Keep hot combos open without holding
+// a descriptor for every combo encountered during a long enumeration.
 namespace {
 struct SolutionStreams {
-    std::map<std::string, std::unique_ptr<std::ofstream>> open;
+    static constexpr size_t max_open = 8;  // <= 512 streams even with 64 workers
+    struct Entry {
+        std::unique_ptr<std::ofstream> stream;
+        std::list<std::string>::iterator recent;
+    };
+    std::map<std::string, Entry> open;
+    std::list<std::string> recent;  // most recently used at the front
     ~SolutionStreams() { close_all(); }
     void close_all() {
-        for (auto& [path, f] : open) {
-            f->close();
-            if (!*f) std::cerr << "\nERROR: failed writing solution file " << path << "\n";
+        for (auto& [path, entry] : open) {
+            entry.stream->close();
+            if (!*entry.stream) std::cerr << "\nERROR: failed writing solution file " << path << "\n";
         }
         open.clear();
+        recent.clear();
     }
 };
 thread_local SolutionStreams g_solution_streams;
 
 std::ofstream& solution_stream(const std::string& path, bool truncate, bool binary) {
-    auto it = g_solution_streams.open.find(path);
-    if (it != g_solution_streams.open.end()) return *it->second;
+    auto& cache = g_solution_streams;
+    auto it = cache.open.find(path);
+    if (it != cache.open.end()) {
+        cache.recent.splice(cache.recent.begin(), cache.recent, it->second.recent);
+        return *it->second.stream;
+    }
+    if (cache.open.size() == SolutionStreams::max_open) {
+        auto old = cache.open.find(cache.recent.back());
+        old->second.stream->close();
+        if (!*old->second.stream)
+            throw std::runtime_error("failed writing solution file " + old->first);
+        cache.open.erase(old);
+        cache.recent.pop_back();
+    }
     auto mode = (truncate ? std::ios::out : std::ios::app);
     if (binary) mode |= std::ios::binary;
+    errno = 0;
     auto f = std::make_unique<std::ofstream>(path, mode);
-    if (!*f) throw std::runtime_error("cannot open solution file " + path);
-    return *g_solution_streams.open.emplace(path, std::move(f)).first->second;
+    if (!*f) {
+        int error = errno;
+        throw std::runtime_error("cannot open solution file " + path +
+            (error ? ": " + std::string(std::strerror(error)) : ": unknown I/O error"));
+    }
+    cache.recent.push_front(path);
+    return *cache.open.emplace(path, SolutionStreams::Entry{std::move(f), cache.recent.begin()})
+                .first->second.stream;
 }
 } // namespace
 
 void EuclideanSolver::close_solution_streams() { g_solution_streams.close_all(); }
 
 void EuclideanSolver::flush_solution_streams() {
-    for (auto& [path, f] : g_solution_streams.open) {
-        f->flush();
-        if (!*f) throw std::runtime_error("failed writing solution file " + path);
+    for (auto& [path, entry] : g_solution_streams.open) {
+        entry.stream->flush();
+        if (!*entry.stream) throw std::runtime_error("failed writing solution file " + path);
     }
 }
 
