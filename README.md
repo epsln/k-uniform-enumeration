@@ -157,6 +157,21 @@ database predates the correction and is not an authoritative source for
 | 16 | 933,637 |
 | **Total** | **1,792,287** |
 
+## Result Analysis
+
+The canonical database can be summarized without loading all entries into memory:
+
+```sh
+python3 scripts/analyze_results.py tilings_k20.sqlite3 \
+  --csv /tmp/k20_m_distribution.csv
+```
+
+The report includes the distribution by $m$-Archimedean class, vertex-configuration
+multiplicity profiles, frequent base configurations, polygon-size signatures, and
+growth ratios between successive values of $k$. The $m$ value is computed by
+collapsing catalogue variants such as `(3,12,12)A` and `(3,12,12)F` to their base
+configuration `(3,12,12)`.
+
 # Regression Tests And Benchmarks
 
 The quick test suite checks the repository's expected k=1 count (10 because the
