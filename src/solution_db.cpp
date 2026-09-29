@@ -136,10 +136,9 @@ std::vector<std::string> list_solution_dbs(const std::string& dir) {
     std::vector<std::string> out;
     if (!fs::exists(dir)) return out;
     for (const auto& e : fs::directory_iterator(dir)) {
-        std::string name = e.path().filename().string();
-        if (e.is_regular_file() && name.rfind("solutions_", 0) == 0
-                && name.size() > 8 && name.compare(name.size() - 8, 8, ".sqlite3") == 0)
-            out.push_back(e.path().string());
+        if (!e.is_directory() || e.path().filename().string().rfind("_worker_", 0) != 0) continue;
+        fs::path db = e.path() / "solutions.sqlite3";
+        if (fs::is_regular_file(db)) out.push_back(db.string());
     }
     std::sort(out.begin(), out.end());
     return out;

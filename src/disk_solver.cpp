@@ -402,7 +402,9 @@ int64_t repair_solution_file(const std::string& path) {
 
 std::vector<std::string> list_chunk_files(const std::string& output_dir) {
     std::vector<std::pair<long, std::string>> found;
-    for (const auto& entry : fs::directory_iterator(output_dir)) {
+    fs::path dir = fs::path(output_dir) / "chunks";
+    if (!fs::exists(dir)) return {};
+    for (const auto& entry : fs::directory_iterator(dir)) {
         if (!entry.is_regular_file()) continue;
         std::string name = entry.path().filename().string();
         if (name.rfind("chunk_", 0) != 0 || name.size() < 11
@@ -506,8 +508,7 @@ DiskSolverStats disk_solver_worker(
         std::unique_ptr<SolutionDbWriter> sdb;
         if (!g_solution_files)
             sdb = std::make_unique<SolutionDbWriter>(
-                (fs::path(out_dir).parent_path() / ("solutions_w" + std::to_string(worker_id)
-                                                    + ".sqlite3")).string());
+                (fs::path(out_dir) / "solutions.sqlite3").string());
         std::unordered_set<std::array<uint64_t, 2>, Hash128> seen;
         int64_t seen_cap = std::max<int64_t>(1, sol_dedup_cap);
         auto emit = [&](const State& sol) {

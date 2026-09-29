@@ -2,7 +2,7 @@
 // Raw solver output in SQLite (disk mode).
 //
 // Every writer (disk worker, fan-out) owns one database file
-// OUTPUT/solutions_<name>.sqlite3, so writers never contend for a lock and
+// OUTPUT/_worker_<name>/solutions.sqlite3, so writers never contend for a lock and
 // each holds a single descriptor regardless of how many combos it produces.
 // Solutions are buffered per combo and stored as zstd-compressed batches of
 // binary records (the .bin record format), keeping ~30 bytes per solution.
@@ -49,7 +49,7 @@ private:
     bool in_txn_ = false;
 };
 
-// Paths of all solution databases in `dir` (sorted).
+// Paths of all solution databases in `dir`/_worker_*/ (sorted).
 std::vector<std::string> list_solution_dbs(const std::string& dir);
 // Union of finished chunk names over all solution databases in `dir`.
 std::set<std::string> read_done_chunks_db(const std::string& dir);

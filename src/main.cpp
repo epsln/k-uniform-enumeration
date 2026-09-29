@@ -730,7 +730,7 @@ int main(int argc, char** argv) {
 				if (entry.is_regular_file() && (name.rfind("eusolver_", 0) == 0
 						|| (name.rfind("chunk_", 0) == 0 && entry.path().extension() == ".bin")))
 					fs::remove(entry.path());
-				else if (entry.is_directory() && name.rfind("_worker_", 0) == 0)
+				else if (entry.is_directory() && (name.rfind("_worker_", 0) == 0 || name == "chunks"))
 					fs::remove_all(entry.path());
 			}
 			fs::remove(done_path);
@@ -752,7 +752,8 @@ int main(int argc, char** argv) {
 				std::map<std::string,std::string> sf;
 				HistogramMap vc;
 				if (!g_solution_files && !g_legacy_solver) {
-					SolutionDbWriter early(output_dir + "/solutions_fanout.sqlite3");
+					fs::create_directories(output_dir + "/_worker_fanout");
+					SolutionDbWriter early(output_dir + "/_worker_fanout/solutions.sqlite3");
 					for (auto& s : early_solutions) early.add(s);
 					early.close();
 				} else
@@ -770,7 +771,8 @@ int main(int argc, char** argv) {
 
 			for (int ci = 0; ci < n_chunks; ++ci) {
 				if (chunks[ci].empty()) continue;
-				std::string cp = output_dir + "/chunk_" + std::to_string(ci) + ".bin";
+				fs::create_directories(output_dir + "/chunks");
+				std::string cp = output_dir + "/chunks/chunk_" + std::to_string(ci) + ".bin";
 				write_packed_states_bin(cp, chunks[ci]);
 				chunk_paths.push_back(cp);
 			}
@@ -981,7 +983,7 @@ int main(int argc, char** argv) {
 		for (auto& t : threads) t.join();
 		g_disk_running.store(false);
 		disk_progress.join();
-		for (const auto& cp : list_chunk_files(output_dir)) fs::remove(cp);
+		fs::remove_all(output_dir + "/chunks");
 
 		auto t2 = std::chrono::steady_clock::now();
 		int64_t disk_partials = 0;
@@ -1008,12 +1010,17 @@ int main(int argc, char** argv) {
 				all_worker_dirs.push_back(entry.path().string());
 		std::sort(all_worker_dirs.begin(), all_worker_dirs.end());
 		merge_worker_outputs(output_dir, all_worker_dirs);
-		for (const auto& wd : all_worker_dirs) fs::remove_all(wd);
+		// Worker dirs still hold the solution databases the pruner reads.
+		for (const auto& wd : all_worker_dirs)
+			for (const auto& e : fs::directory_iterator(wd))
+				if (e.path().filename().string().rfind("eusolver_", 0) == 0) fs::remove(e.path());
 		fs::remove(done_path);
 		compress_merged_solutions(output_dir);
 
 		std::cout << "Pruner phase starting...\n";
 		auto counts = run_pruner(output_dir, num_workers, output_format);
+		if (!g_keep_pruner_inputs)
+			for (const auto& wd : all_worker_dirs) fs::remove_all(wd);
 		std::cout << "\nPruner phase:  " << std::fixed << std::setprecision(1)
 		          << std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count() << "s\n";
 		finish_notify(counts, output_dir, telegram_token, telegram_chat);

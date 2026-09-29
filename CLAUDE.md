@@ -37,7 +37,7 @@ C++ sources live in `src/`.
 | `src/disk_solver.h/cpp` | Disk mode: BFS fan-out, binary serialization, `WorkPool` (chunks, work sharing, `done_chunks.txt`), workers; legacy spill queue behind `--legacy-solver` |
 | `src/mortier_geometry.h/cpp` | Exact Z4 affine development and translation-lattice derivation |
 | `src/mortier_store.h/cpp` | Versioned Mortier codec, compressed SQLite storage, JSON conversion |
-| `src/solution_db.h/cpp` | Disk-mode raw output: per-writer SQLite DB (`solutions_w<N>.sqlite3`, `solutions_fanout.sqlite3`) of zstd-compressed per-combo batches plus `done_chunks`; streamed directly by the pruner |
+| `src/solution_db.h/cpp` | Disk-mode raw output: per-writer SQLite DB (`_worker_<N>/solutions.sqlite3`, `_worker_fanout/solutions.sqlite3`); frontier chunks live in `chunks/` of zstd-compressed per-combo batches plus `done_chunks`; streamed directly by the pruner |
 | `src/tes_store.h/cpp` | Compressed SQLite storage and safe extraction for TES documents |
 | `src/zstd_stream.h` | Streaming zstd-decompressing `std::istream` + `compress_to_zst` helper |
 | `src/main.cpp` | CLI, `SharedQueue`, progress display, mode dispatch |
