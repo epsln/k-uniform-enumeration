@@ -47,6 +47,7 @@ test: $(TARGET) $(SAFETY_TEST) $(MORTIER_TEST) $(ENGINE_TEST) $(CANON_TEST)
 	./$(MORTIER_TEST)
 	./$(ENGINE_TEST) 7 200000
 	./$(CANON_TEST) 7
+	sh tests/compressed_merge.sh ./$(TARGET)
 	python3 -m unittest discover -s tests -v
 	python3 scripts/regression.py --candidate "./$(TARGET)" --max-k $(or $(TEST_MAX_K),1) $(if $(BASELINE),--baseline "$(BASELINE)",)
 

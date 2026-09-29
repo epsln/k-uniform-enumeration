@@ -265,10 +265,10 @@ static void merge_worker_outputs(const std::string& output_dir,
 		}
 	}
 	for (const auto& [base, paths] : per_combo) {
-		// zstd frames concatenate, so .zst sources are byte-copied as-is;
-		// plain sources are concatenated and compressed right after this call.
-		bool zst = !paths.empty() && has_zst_suffix(paths.front());
-		std::string dest = output_dir + "/" + base + (zst ? ".zst" : "");
+		// `base` is the exact source name, suffix included: .zst sources are
+		// byte-copied onto X.zst (zstd frames concatenate); plain sources are
+		// concatenated onto X and compressed onto X.zst right after this call.
+		std::string dest = output_dir + "/" + base;
 		std::ofstream out(dest, std::ios::binary | std::ios::app);
 		if (!out) throw std::runtime_error("cannot open merged output " + dest);
 		for (const auto& p : paths) {

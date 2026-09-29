@@ -1130,6 +1130,8 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
 
     std::string base = path;
     if (has_zst_suffix(base)) base.resize(base.size() - 4);
+    if (has_zst_suffix(base))
+        throw std::runtime_error("doubly suffixed solution file name: " + path);
     bool is_bin = (base.size() > 4 && base.substr(base.size() - 4) == ".bin");
     auto in = open_solution_istream(path);
     if (!in) throw std::runtime_error("cannot open solution input: " + path);
