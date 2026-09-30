@@ -1291,7 +1291,11 @@ void WLPruner::process_file_wl(const Input& input, std::ostream& pruned_out,
                     f.tes_doc = tes_document(output, f.sig_raw);
                 }
             } catch (const std::exception& e) {
-                f.error = e.what();
+                // Name the record so the failure can be replayed in isolation.
+                f.error = std::string(e.what()) + " [combo " + combo_code + ", record "
+                        + std::to_string(rec2.solution_index) + ": "
+                        + verbal_vertices(rec2.state.vertype) + " | "
+                        + write_conway(rec2.state) + "]";
             }
         });
 
