@@ -163,6 +163,7 @@ private:
     std::unique_ptr<MortierStore> mortier_store_;
     int num_workers_;
     FinalOutputFormat format_;
+    int64_t transient_format_failures_ = 0;
 
     struct CanonicalResult {
         bool is_canonical;

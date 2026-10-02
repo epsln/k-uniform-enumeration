@@ -351,8 +351,12 @@ CanonicalTilingOutput build_canonical_tiling_output(const State& st) {
         }
     }
     output.conway = conway_str;
-    output.geometry = mortier_geometry::make_tiling_description(
-        poly_size_list, work_reps, conway_str);
+    try {
+        output.geometry = mortier_geometry::make_tiling_description(
+            poly_size_list, work_reps, conway_str);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string(e.what()) + " {assembled: " + conway_str + "}");
+    }
     return output;
 }
 
@@ -1085,6 +1089,10 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths,
         for (const auto& db : dbs) remove_solution_db(db);
     }
     if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
+    if (transient_format_failures_)
+        std::cerr << "  WARNING: " << transient_format_failures_
+                  << " transient formatting failure(s) recovered by retry; identical input"
+                     " formatted differently, check CPU/RAM stability\n";
     if (g_dedup_canon) {
         // exact canonical-form dedup: no diagnostics needed
     } else if (g_use_bfl) {
@@ -1255,9 +1263,10 @@ void WLPruner::process_file_wl(const Input& input, std::ostream& pruned_out,
         };
         std::vector<Formatted> formatted(unique_idx.size());
         auto format_start = Clock::now();
-        parallel_for((int)unique_idx.size(), [&](int u) {
+        auto format_one = [&](int u) {
             auto& rec2 = batch[unique_idx[u]];
             auto& f = formatted[u];
+            f = Formatted{};
             try {
                 materialize_output_fields(rec2);
                 std::string old_rel = rec2.tes_line.substr(rec2.tes_line.find("eu"));
@@ -1297,7 +1306,28 @@ void WLPruner::process_file_wl(const Input& input, std::ostream& pruned_out,
                         + verbal_vertices(rec2.state.vertype) + " | "
                         + write_conway(rec2.state) + "]";
             }
-        });
+        };
+        parallel_for((int)unique_idx.size(), format_one);
+        // Formatting is a pure function of (vertex types, glue). A failure
+        // that disappears when the state is rebuilt from exactly those is not
+        // a property of the record (it has been seen to come and go between
+        // runs on identical input); retry once, report it, and keep going.
+        for (size_t u = 0; u < unique_idx.size(); ++u) {
+            if (formatted[u].error.empty()) continue;
+            auto& rec2 = batch[unique_idx[u]];
+            std::string first = formatted[u].error;
+            rec2.state = EuclideanSolver::unpack_state(EuclideanSolver::pack_state(rec2.state));
+            rec2.vertex_line.clear();
+            format_one((int)u);
+            if (!formatted[u].error.empty()) {
+                formatted[u].error = "persistent formatting failure: " + first;
+                continue;
+            }
+            ++transient_format_failures_;
+            std::cerr << "\n  warning: transient formatting failure, retry succeeded: "
+                      << first << "\n";
+        }
+
 
         format_time += Clock::now() - format_start;
         // Stage 4 (sequential): write in input order.
