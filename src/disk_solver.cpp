@@ -518,7 +518,7 @@ DiskSolverStats disk_solver_worker(
             if ((int64_t)seen.size() >= seen_cap) seen.clear();
             if (!seen.insert(cf.hash).second) return;
             ++stats.solutions_found;
-            if (sdb) sdb->add(sol);
+            if (sdb) sdb->add(sol, cf.hash);
             else EuclideanSolver::write_solution_static(sol, out_dir, mu,
                 run_totals, solution_files, vertex_combos);
         };
@@ -551,7 +551,7 @@ DiskSolverStats disk_solver_worker(
             if ((int64_t)seen.size() >= seen_cap) seen.clear();
             if (!seen.insert(cf.hash).second) return;
             ++stats.solutions_found;
-            if (sdb) sdb->add(e.to_state());
+            if (sdb) sdb->add(e.to_state(), cf.hash);
             else EuclideanSolver::write_solution_static(e.to_state(), out_dir, mu,
                 run_totals, solution_files, vertex_combos);
         };
