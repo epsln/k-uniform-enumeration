@@ -34,7 +34,7 @@ class SolutionPruner {
 public:
     explicit SolutionPruner(const std::string& output_dir);
 
-    const std::map<int, int>& solutions_per_k() const { return solutions_per_k_; }
+    const std::map<int, int64_t>& solutions_per_k() const { return solutions_per_k_; }
 
     static std::pair<bool, std::string> is_canonical_labeling(const State& s);
     static std::pair<bool, std::string> solutions_match(const State& a, const State& b);
@@ -52,7 +52,7 @@ public:
 
 protected:
     std::string output_dir_;
-    std::map<int, int> solutions_per_k_;
+    std::map<int, int64_t> solutions_per_k_;
 
     static std::vector<int> make_glue(const std::string& conway,
                                        const std::vector<Dart>& darts,
@@ -130,40 +130,73 @@ inline std::string wl_hash_dispatch(const State& st, int iters = 0) {
     return g_wl_dim == 2 ? wl_hash_2(st, i) : wl_hash(st, i);
 }
 
+struct PrunerOptions {
+    int num_workers = 1;
+    FinalOutputFormat format = FinalOutputFormat::Tes;
+    // Bound on the dedup table; the unit plan keeps every table within it.
+    int64_t table_bytes = 18LL << 30;
+    // Split every combo into at least this many hash ranges (testing aid).
+    int min_ranges = 1;
+    // Continue an interrupted run from its tilings.sqlite3.tmp / progress files.
+    bool resume = false;
+    // Abort (resumably) when free space on the output disk drops below this.
+    int64_t min_free_bytes = 2LL << 30;
+};
+
+// The pruner dedups one unit at a time: a combo (k + polygon-size set, an
+// isomorphism invariant) restricted to a range of the top 32 bits of the
+// canonical hash. Dedup state never spans units, so the hash table is sized
+// per unit, and each finished unit is committed together with its output,
+// which makes an interrupted run resumable.
 class WLPruner : public SolutionPruner {
 public:
-    explicit WLPruner(const std::string& output_dir, int num_workers = 1,
-                      FinalOutputFormat format = FinalOutputFormat::Tes);
+    WLPruner(const std::string& output_dir, const PrunerOptions& options);
+    ~WLPruner();
     // Prunes raw solution files plus the solution databases `dbs` (disk mode).
     void run(const std::vector<std::string>& listfile_paths,
              const std::vector<std::string>& dbs = {});
 
+    struct Unit {
+        std::string combo;
+        uint64_t lo = 0, hi = 1ULL << 32;   // hash prefix range [lo, hi)
+        int64_t estimate = 0;               // upper bound on its records
+        std::string name() const;
+        bool whole() const { return lo == 0 && hi == (1ULL << 32); }
+    };
+    class RecordSource;
+    // Splits combos into units of at most `capacity` estimated records.
+    // `buckets[b]` estimates the records of hash bucket b (SOLUTION_BUCKETS).
+    static std::vector<Unit> plan_combo(const std::string& combo,
+                                        const std::vector<double>& buckets,
+                                        int64_t capacity, int min_ranges);
+
 private:
     struct Input {
         std::string combo;
-        std::string label;                  // file path, or "db:<combo>"
-        bool is_bin;
-        std::function<std::unique_ptr<std::istream>()> open;
+        std::string path;                   // empty for the solution databases
+        bool is_bin = false;
     };
-    void process_file_wl(const Input& input, std::ostream& pruned_out,
-                         const std::function<void()>& maybe_compress);
+    class Sink;
+    std::unique_ptr<RecordSource> open_source(const Input& input, const Unit& unit) const;
+    int64_t process_input(const Input& input, const Unit& unit, std::ostream* pruned_out,
+                          const std::function<void()>& maybe_compress);
     std::map<std::string, std::vector<PackedState>> solutions_by_hash_;
-    // Per-combo exact dedup table of 128-bit canonical-code hashes. Combos
-    // (k + polygon-size set) are isomorphism invariants, so dedup state never
-    // needs to span combos; memory is bounded by the largest combo.
+    // Exact dedup table of 128-bit canonical-code hashes for one unit.
+    // Indexed by hash[1] (hash[0]'s top bits are fixed within a unit).
     struct HashSet128 {
         std::vector<std::array<uint64_t, 2>> slots;
         size_t used = 0;
+        void reset(size_t expected);
         bool insert(std::array<uint64_t, 2> h);
         void clear() { std::vector<std::array<uint64_t, 2>>().swap(slots); used = 0; }
     };
     HashSet128 canon_seen_;
     DiskWordIndex solutions_words_;  // used when g_use_bfl
-    std::unique_ptr<TesStore> tes_store_;
-    std::unique_ptr<MortierStore> mortier_store_;
-    int num_workers_;
-    FinalOutputFormat format_;
+    std::unique_ptr<Sink> sink_;
+    std::vector<std::string> dbs_;
+    PrunerOptions options_;
     int64_t transient_format_failures_ = 0;
+    bool grow_warned_ = false;
 
     struct CanonicalResult {
         bool is_canonical;
