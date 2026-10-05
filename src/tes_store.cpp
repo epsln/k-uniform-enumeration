@@ -178,6 +178,162 @@ void hash_id(Sha256& hash, int64_t id) {
     hash_field(hash, encoded, sizeof(encoded));
 }
 
+void put_varint(std::string& out, uint64_t value) {
+    while (value >= 0x80) {
+        out.push_back(static_cast<char>((value & 0x7f) | 0x80));
+        value >>= 7;
+    }
+    out.push_back(static_cast<char>(value));
+}
+
+uint64_t get_varint(const char* data, size_t size, size_t& pos) {
+    uint64_t value = 0;
+    for (int shift = 0; shift < 64; shift += 7) {
+        if (pos >= size) throw std::runtime_error("truncated TES chunk record");
+        uint8_t byte = static_cast<uint8_t>(data[pos++]);
+        value |= static_cast<uint64_t>(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) return value;
+    }
+    throw std::runtime_error("invalid varint in TES chunk");
+}
+
+std::string get_field(const char* data, size_t size, size_t& pos) {
+    uint64_t length = get_varint(data, size, pos);
+    if (length > size - pos) throw std::runtime_error("invalid TES entry bounds");
+    std::string out(data + pos, static_cast<size_t>(length));
+    pos += static_cast<size_t>(length);
+    return out;
+}
+
+int schema_version(sqlite3* db) {
+    Statement version(db, "SELECT value FROM metadata WHERE key='schema_version';");
+    if (sqlite3_step(version.get()) != SQLITE_ROW)
+        throw std::runtime_error("unsupported TES database schema");
+    const std::string value = column_text(version.get(), 0);
+    if (value == "1") return 1;
+    if (value == "2") return 2;
+    throw std::runtime_error("unsupported TES database schema");
+}
+
+void decompress_chunk(sqlite3_stmt* stmt, int raw_column, int blob_column,
+                      std::vector<char>& out) {
+    int64_t raw_size = sqlite3_column_int64(stmt, raw_column);
+    if (raw_size < 0 || static_cast<uint64_t>(raw_size) > MAX_TES_CHUNK_SIZE)
+        throw std::runtime_error("invalid TES chunk size");
+    out.resize(static_cast<size_t>(raw_size));
+    const void* blob = sqlite3_column_blob(stmt, blob_column);
+    size_t blob_size = static_cast<size_t>(sqlite3_column_bytes(stmt, blob_column));
+    size_t actual = ZSTD_decompress(out.data(), out.size(), blob, blob_size);
+    if (ZSTD_isError(actual) || actual != out.size())
+        throw std::runtime_error("invalid compressed TES chunk");
+}
+
+// Visits entries with id > after_id in id order, or only entry `only_id`.
+void visit_v1(sqlite3* db, int64_t after_id, int64_t only_id,
+              const std::function<void(const TesEntry&)>& visitor) {
+    Statement rows(db, only_id
+        ? "SELECT e.id,e.combo,e.signature,e.legacy_filename,e.chunk_id,e.ordinal,"
+          "e.byte_offset,e.byte_length,c.record_count,c.uncompressed_size,"
+          "c.compressed_size,c.data FROM entries e JOIN chunks c ON c.id=e.chunk_id "
+          "WHERE e.id=?;"
+        : "SELECT e.id,e.combo,e.signature,e.legacy_filename,e.chunk_id,e.ordinal,"
+          "e.byte_offset,e.byte_length,c.record_count,c.uncompressed_size,"
+          "c.compressed_size,c.data FROM entries e JOIN chunks c ON c.id=e.chunk_id "
+          "WHERE e.id>? ORDER BY e.id;");
+    check_sqlite(sqlite3_bind_int64(rows.get(), 1, only_id ? only_id : after_id),
+                 db, "bind TES id");
+    int64_t previous_id = only_id ? 0 : after_id;
+    int64_t loaded_chunk = -1;
+    std::vector<char> decompressed;
+    int rc;
+    while ((rc = sqlite3_step(rows.get())) == SQLITE_ROW) {
+        for (int column = 0; column < 12; ++column) {
+            if (sqlite3_column_type(rows.get(), column) == SQLITE_NULL)
+                throw std::runtime_error("null in required TES entry field");
+        }
+        TesEntry entry;
+        entry.id = sqlite3_column_int64(rows.get(), 0);
+        if (entry.id <= previous_id)
+            throw std::runtime_error("TES entry ids are not strictly ascending");
+        previous_id = entry.id;
+        entry.combo = column_text(rows.get(), 1);
+        entry.signature = column_text(rows.get(), 2);
+        entry.legacy_filename = column_text(rows.get(), 3);
+
+        int64_t chunk_id = sqlite3_column_int64(rows.get(), 4);
+        int64_t ordinal = sqlite3_column_int64(rows.get(), 5);
+        int64_t record_count = sqlite3_column_int64(rows.get(), 8);
+        int64_t raw_size = sqlite3_column_int64(rows.get(), 9);
+        int64_t compressed_size = sqlite3_column_int64(rows.get(), 10);
+        int blob_size = sqlite3_column_bytes(rows.get(), 11);
+        if (chunk_id <= 0 || ordinal < 0 || ordinal >= record_count || record_count <= 0
+                || compressed_size < 0 || compressed_size != blob_size)
+            throw std::runtime_error("invalid TES chunk metadata");
+        if (chunk_id != loaded_chunk) {
+            decompress_chunk(rows.get(), 9, 11, decompressed);
+            loaded_chunk = chunk_id;
+        }
+        int64_t offset = sqlite3_column_int64(rows.get(), 6);
+        int64_t length = sqlite3_column_int64(rows.get(), 7);
+        if (offset < 0 || length < 0 || offset > raw_size || length > raw_size - offset)
+            throw std::runtime_error("invalid TES entry bounds");
+        entry.document.assign(decompressed.data() + static_cast<size_t>(offset),
+                              static_cast<size_t>(length));
+        visitor(entry);
+    }
+    if (rc != SQLITE_DONE) check_sqlite(rc, db, "read TES entries");
+}
+
+void visit_v2(sqlite3* db, int64_t after_id, int64_t only_id,
+              const std::function<void(const TesEntry&)>& visitor) {
+    Statement rows(db, only_id
+        ? "SELECT c.first_entry,c.record_count,c.uncompressed_size,c.compressed_size,"
+          "c.data,m.name FROM chunks c JOIN combos m ON m.id=c.combo_id "
+          "WHERE c.first_entry<=?1 ORDER BY c.first_entry DESC LIMIT 1;"
+        : "SELECT c.first_entry,c.record_count,c.uncompressed_size,c.compressed_size,"
+          "c.data,m.name FROM chunks c JOIN combos m ON m.id=c.combo_id "
+          "WHERE c.first_entry+c.record_count>?1 ORDER BY c.first_entry;");
+    check_sqlite(sqlite3_bind_int64(rows.get(), 1, only_id ? only_id : after_id),
+                 db, "bind TES id");
+    int64_t previous_id = only_id ? 0 : after_id;
+    std::vector<char> raw;
+    int rc;
+    while ((rc = sqlite3_step(rows.get())) == SQLITE_ROW) {
+        for (int column = 0; column < 6; ++column) {
+            if (sqlite3_column_type(rows.get(), column) == SQLITE_NULL)
+                throw std::runtime_error("null in required TES chunk field");
+        }
+        int64_t first = sqlite3_column_int64(rows.get(), 0);
+        int64_t count = sqlite3_column_int64(rows.get(), 1);
+        if (first <= 0 || count <= 0
+                || sqlite3_column_int64(rows.get(), 3) != sqlite3_column_bytes(rows.get(), 4))
+            throw std::runtime_error("invalid TES chunk metadata");
+        decompress_chunk(rows.get(), 2, 4, raw);
+        TesEntry entry;
+        entry.combo = column_text(rows.get(), 5);
+        size_t pos = 0;
+        for (int64_t i = 0; i < count; ++i) {
+            entry.id = first + i;
+            entry.signature = get_field(raw.data(), raw.size(), pos);
+            entry.legacy_filename = get_field(raw.data(), raw.size(), pos);
+            entry.document = get_field(raw.data(), raw.size(), pos);
+            if (only_id ? entry.id != only_id : entry.id <= after_id) continue;
+            if (entry.id <= previous_id)
+                throw std::runtime_error("TES entry ids are not strictly ascending");
+            previous_id = entry.id;
+            visitor(entry);
+        }
+        if (pos != raw.size()) throw std::runtime_error("trailing bytes in TES chunk");
+    }
+    if (rc != SQLITE_DONE) check_sqlite(rc, db, "read TES entries");
+}
+
+void visit_entries(sqlite3* db, int version, int64_t after_id, int64_t only_id,
+                   const std::function<void(const TesEntry&)>& visitor) {
+    if (version == 1) visit_v1(db, after_id, only_id, visitor);
+    else visit_v2(db, after_id, only_id, visitor);
+}
+
 } // namespace
 
 TesReader::TesReader(const std::string& path) {
@@ -200,10 +356,7 @@ TesReader::TesReader(const std::string& path) {
     }
     try {
         exec(db_, "BEGIN;");
-        Statement version(db_, "SELECT value FROM metadata WHERE key='schema_version';");
-        if (sqlite3_step(version.get()) != SQLITE_ROW || column_text(version.get(), 0) != "1")
-            throw std::runtime_error("unsupported TES database schema");
-        identity_.schema_version = 1;
+        identity_.schema_version = schema_version(db_);
         Statement compression(db_, "SELECT value FROM metadata WHERE key='compression';");
         if (sqlite3_step(compression.get()) != SQLITE_ROW)
             throw std::runtime_error("unsupported TES database compression");
@@ -213,9 +366,11 @@ TesReader::TesReader(const std::string& path) {
 
         Sha256 fingerprint;
         // Every logical field is framed by an unsigned 64-bit big-endian length;
-        // IDs are fixed-width big-endian values inside the same framing.
+        // IDs are fixed-width big-endian values inside the same framing. The
+        // fingerprint covers the logical content only, so it is the same for
+        // every storage schema ("1" names the logical record format).
         hash_field(fingerprint, std::string("tes-source-fingerprint-v2"));
-        hash_field(fingerprint, std::to_string(identity_.schema_version));
+        hash_field(fingerprint, std::string("1"));
         hash_field(fingerprint, compression_name);
         int64_t scanned_count = 0;
         for_each_after(0, [&](const TesEntry& entry) {
@@ -227,7 +382,9 @@ TesReader::TesReader(const std::string& path) {
             ++scanned_count;
             identity_.max_id = entry.id;
         });
-        Statement totals(db_, "SELECT COUNT(*) FROM entries;");
+        Statement totals(db_, identity_.schema_version == 1
+            ? "SELECT COUNT(*) FROM entries;"
+            : "SELECT COALESCE(SUM(record_count),0) FROM chunks;");
         check_sqlite(sqlite3_step(totals.get()), db_, "read TES entry count");
         identity_.entry_count = sqlite3_column_int64(totals.get(), 0);
         if (identity_.entry_count != scanned_count)
@@ -248,66 +405,13 @@ void TesReader::for_each_after(
         int64_t start_id, const std::function<void(const TesEntry&)>& visitor) const {
     if (start_id < 0) throw std::invalid_argument("TES start id is negative");
     if (!visitor) throw std::invalid_argument("TES visitor is empty");
-    Statement rows(db_,
-        "SELECT e.id,e.combo,e.signature,e.legacy_filename,e.chunk_id,e.ordinal,"
-        "e.byte_offset,e.byte_length,c.record_count,c.uncompressed_size,"
-        "c.compressed_size,c.data FROM entries e JOIN chunks c ON c.id=e.chunk_id "
-        "WHERE e.id>? ORDER BY e.id;");
-    check_sqlite(sqlite3_bind_int64(rows.get(), 1, start_id), db_, "bind TES start id");
-
-    int64_t previous_id = start_id;
-    int64_t loaded_chunk = -1;
-    int64_t raw_size = 0;
-    std::vector<char> decompressed;
-    int rc;
-    while ((rc = sqlite3_step(rows.get())) == SQLITE_ROW) {
-        for (int column = 0; column < 12; ++column) {
-            if (sqlite3_column_type(rows.get(), column) == SQLITE_NULL)
-                throw std::runtime_error("null in required TES entry field");
-        }
-        TesEntry entry;
-        entry.id = sqlite3_column_int64(rows.get(), 0);
-        if (entry.id <= previous_id)
-            throw std::runtime_error("TES entry ids are not strictly ascending");
-        previous_id = entry.id;
-        entry.combo = column_text(rows.get(), 1);
-        entry.signature = column_text(rows.get(), 2);
-        entry.legacy_filename = column_text(rows.get(), 3);
-
-        int64_t chunk_id = sqlite3_column_int64(rows.get(), 4);
-        int64_t ordinal = sqlite3_column_int64(rows.get(), 5);
-        int64_t record_count = sqlite3_column_int64(rows.get(), 8);
-        raw_size = sqlite3_column_int64(rows.get(), 9);
-        int64_t compressed_size = sqlite3_column_int64(rows.get(), 10);
-        int blob_size = sqlite3_column_bytes(rows.get(), 11);
-        if (chunk_id <= 0 || ordinal < 0 || ordinal >= record_count || record_count <= 0
-                || raw_size < 0
-                || static_cast<uint64_t>(raw_size) > MAX_TES_CHUNK_SIZE
-                || compressed_size < 0 || compressed_size != blob_size)
-            throw std::runtime_error("invalid TES chunk metadata");
-        if (chunk_id != loaded_chunk) {
-            decompressed.resize(static_cast<size_t>(raw_size));
-            const void* blob = sqlite3_column_blob(rows.get(), 11);
-            size_t actual = ZSTD_decompress(decompressed.data(), decompressed.size(),
-                                            blob, static_cast<size_t>(blob_size));
-            if (ZSTD_isError(actual) || actual != decompressed.size())
-                throw std::runtime_error("invalid compressed TES chunk");
-            loaded_chunk = chunk_id;
-        }
-        int64_t offset = sqlite3_column_int64(rows.get(), 6);
-        int64_t length = sqlite3_column_int64(rows.get(), 7);
-        if (offset < 0 || length < 0 || offset > raw_size || length > raw_size - offset)
-            throw std::runtime_error("invalid TES entry bounds");
-        entry.document.assign(decompressed.data() + static_cast<size_t>(offset),
-                              static_cast<size_t>(length));
-        visitor(entry);
-    }
-    if (rc != SQLITE_DONE) check_sqlite(rc, db_, "read TES entries");
+    visit_entries(db_, identity_.schema_version, start_id, 0, visitor);
 }
 
-TesStore::TesStore(const std::string& path, size_t chunk_target)
+TesStore::TesStore(const std::string& path, size_t chunk_target, bool resume)
     : chunk_target_(chunk_target) {
-    if (fs::exists(path))
+    const bool existing = resume && fs::exists(path);
+    if (!resume && fs::exists(path))
         throw std::runtime_error("TES database already exists: " + path);
     fs::path parent = fs::path(path).parent_path();
     if (!parent.empty()) fs::create_directories(parent);
@@ -325,105 +429,163 @@ TesStore::TesStore(const std::string& path, size_t chunk_target)
         exec(db_, "PRAGMA journal_mode=DELETE;");
         exec(db_, "PRAGMA synchronous=NORMAL;");
         exec(db_, "PRAGMA foreign_keys=ON;");
-        exec(db_,
-             "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
-             "INSERT INTO metadata VALUES('schema_version', '1');"
-             "INSERT INTO metadata VALUES('compression', 'zstd');"
-             "CREATE TABLE chunks("
-             " id INTEGER PRIMARY KEY,"
-             " record_count INTEGER NOT NULL,"
-             " uncompressed_size INTEGER NOT NULL,"
-             " compressed_size INTEGER NOT NULL,"
-             " data BLOB NOT NULL);"
-             "CREATE TABLE entries("
-             " id INTEGER PRIMARY KEY,"
-             " chunk_id INTEGER NOT NULL REFERENCES chunks(id),"
-             " ordinal INTEGER NOT NULL,"
-             " byte_offset INTEGER NOT NULL,"
-             " byte_length INTEGER NOT NULL,"
-             " combo TEXT NOT NULL,"
-             " signature TEXT NOT NULL,"
-             " legacy_filename TEXT NOT NULL);"
-             "CREATE INDEX entries_combo ON entries(combo);");
+        if (existing) {
+            if (schema_version(db_) != SCHEMA_VERSION)
+                throw std::runtime_error("cannot resume a TES database of another schema: " + path);
+            Statement next(db_, "SELECT COALESCE(MAX(first_entry+record_count),1) FROM chunks;");
+            check_sqlite(sqlite3_step(next.get()), db_, "read next TES entry id");
+            next_entry_ = sqlite3_column_int64(next.get(), 0);
+            Statement combos(db_, "SELECT id,name FROM combos;");
+            while (sqlite3_step(combos.get()) == SQLITE_ROW)
+                combo_ids_[column_text(combos.get(), 1)] = sqlite3_column_int64(combos.get(), 0);
+        } else {
+            exec(db_,
+                 "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+                 "INSERT INTO metadata VALUES('schema_version', '2');"
+                 "INSERT INTO metadata VALUES('compression', 'zstd');"
+                 "CREATE TABLE combos(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);"
+                 "CREATE TABLE chunks("
+                 " id INTEGER PRIMARY KEY,"
+                 " combo_id INTEGER NOT NULL REFERENCES combos(id),"
+                 " first_entry INTEGER NOT NULL UNIQUE,"
+                 " record_count INTEGER NOT NULL,"
+                 " uncompressed_size INTEGER NOT NULL,"
+                 " compressed_size INTEGER NOT NULL,"
+                 " data BLOB NOT NULL);"
+                 "CREATE INDEX chunks_combo ON chunks(combo_id);"
+                 "CREATE TABLE pruner_progress(unit TEXT PRIMARY KEY, value TEXT NOT NULL);");
+        }
     } catch (...) {
         sqlite3_close(db_);
         db_ = nullptr;
-        fs::remove(path);
+        if (!existing) fs::remove(path);
         throw;
     }
 }
 
 TesStore::~TesStore() {
-    if (db_) sqlite3_close(db_);
+    // An open unit transaction is rolled back by closing the connection.
+    if (db_) sqlite3_close_v2(db_);
 }
 
 void TesStore::add(const std::string& combo, const std::string& signature,
                    const std::string& legacy_filename, const std::string& document) {
     if (finished_) throw std::runtime_error("cannot add to a finished TES store");
-    if (!entries_.empty() && chunk_.size() + document.size() > chunk_target_) flush();
-    entries_.push_back({combo, signature, legacy_filename,
-                        static_cast<int64_t>(chunk_.size()),
-                        static_cast<int64_t>(document.size())});
+    if (chunk_records_ && (combo != chunk_combo_
+            || chunk_.size() + document.size() > chunk_target_))
+        flush();
+    chunk_combo_ = combo;
+    put_varint(chunk_, signature.size());
+    chunk_.append(signature);
+    put_varint(chunk_, legacy_filename.size());
+    chunk_.append(legacy_filename);
+    put_varint(chunk_, document.size());
     chunk_.append(document);
+    ++chunk_records_;
+}
+
+int64_t TesStore::combo_id(const std::string& combo) {
+    auto it = combo_ids_.find(combo);
+    if (it != combo_ids_.end()) return it->second;
+    Statement insert(db_, "INSERT INTO combos(name) VALUES(?);");
+    bind_text(db_, insert.get(), 1, combo);
+    check_sqlite(sqlite3_step(insert.get()), db_, "insert TES combo");
+    int64_t id = sqlite3_last_insert_rowid(db_);
+    combo_ids_[combo] = id;
+    return id;
 }
 
 void TesStore::flush() {
-    if (entries_.empty()) return;
+    if (!chunk_records_) return;
+    if (chunk_.size() > MAX_TES_CHUNK_SIZE)
+        throw std::runtime_error("TES chunk exceeds the maximum chunk size");
 
     size_t bound = ZSTD_compressBound(chunk_.size());
     std::vector<char> compressed(bound);
     size_t compressed_size = ZSTD_compress(compressed.data(), compressed.size(),
-                                           chunk_.data(), chunk_.size(), 3);
+                                           chunk_.data(), chunk_.size(), 9);
     if (ZSTD_isError(compressed_size))
         throw std::runtime_error(std::string("compress TES chunk: ")
                                  + ZSTD_getErrorName(compressed_size));
     if (compressed_size > static_cast<size_t>(std::numeric_limits<int>::max()))
         throw std::runtime_error("compressed TES chunk exceeds SQLite blob limit");
 
-    exec(db_, "BEGIN IMMEDIATE;");
+    const bool own_txn = !in_unit_;
+    if (own_txn) exec(db_, "BEGIN IMMEDIATE;");
+    auto combos_before = combo_ids_;
     try {
+        int64_t cid = combo_id(chunk_combo_);
         Statement chunk_stmt(db_,
-            "INSERT INTO chunks(record_count, uncompressed_size, compressed_size, data)"
-            " VALUES(?, ?, ?, ?);");
+            "INSERT INTO chunks(combo_id, first_entry, record_count, uncompressed_size,"
+            " compressed_size, data) VALUES(?, ?, ?, ?, ?, ?);");
         sqlite3_stmt* cs = chunk_stmt.get();
-        check_sqlite(sqlite3_bind_int64(cs, 1, entries_.size()), db_, "bind record count");
-        check_sqlite(sqlite3_bind_int64(cs, 2, chunk_.size()), db_, "bind raw size");
-        check_sqlite(sqlite3_bind_int64(cs, 3, compressed_size), db_, "bind compressed size");
-        check_sqlite(sqlite3_bind_blob(cs, 4, compressed.data(),
+        check_sqlite(sqlite3_bind_int64(cs, 1, cid), db_, "bind combo id");
+        check_sqlite(sqlite3_bind_int64(cs, 2, next_entry_), db_, "bind first entry");
+        check_sqlite(sqlite3_bind_int64(cs, 3, chunk_records_), db_, "bind record count");
+        check_sqlite(sqlite3_bind_int64(cs, 4, chunk_.size()), db_, "bind raw size");
+        check_sqlite(sqlite3_bind_int64(cs, 5, compressed_size), db_, "bind compressed size");
+        check_sqlite(sqlite3_bind_blob(cs, 6, compressed.data(),
                                       static_cast<int>(compressed_size), SQLITE_TRANSIENT),
                      db_, "bind compressed data");
         check_sqlite(sqlite3_step(cs), db_, "insert TES chunk");
-        sqlite3_int64 chunk_id = sqlite3_last_insert_rowid(db_);
-
-        Statement entry_stmt(db_,
-            "INSERT INTO entries(chunk_id, ordinal, byte_offset, byte_length, combo, signature, legacy_filename)"
-            " VALUES(?, ?, ?, ?, ?, ?, ?);");
-        sqlite3_stmt* es = entry_stmt.get();
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            const auto& entry = entries_[i];
-            check_sqlite(sqlite3_bind_int64(es, 1, chunk_id), db_, "bind chunk id");
-            check_sqlite(sqlite3_bind_int64(es, 2, i), db_, "bind ordinal");
-            check_sqlite(sqlite3_bind_int64(es, 3, entry.offset), db_, "bind offset");
-            check_sqlite(sqlite3_bind_int64(es, 4, entry.length), db_, "bind length");
-            bind_text(db_, es, 5, entry.combo);
-            bind_text(db_, es, 6, entry.signature);
-            bind_text(db_, es, 7, entry.legacy_filename);
-            check_sqlite(sqlite3_step(es), db_, "insert TES entry");
-            check_sqlite(sqlite3_reset(es), db_, "reset TES entry insert");
-            check_sqlite(sqlite3_clear_bindings(es), db_, "clear TES entry bindings");
-        }
-        exec(db_, "COMMIT;");
+        if (own_txn) exec(db_, "COMMIT;");
     } catch (...) {
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        if (own_txn) {
+            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+            combo_ids_ = combos_before;
+        }
         throw;
     }
 
+    next_entry_ += chunk_records_;
     chunk_.clear();
-    entries_.clear();
+    chunk_records_ = 0;
+}
+
+void TesStore::begin_unit() {
+    if (finished_) throw std::runtime_error("cannot add to a finished TES store");
+    if (in_unit_) throw std::runtime_error("TES unit already open");
+    flush();
+    exec(db_, "BEGIN IMMEDIATE;");
+    in_unit_ = true;
+}
+
+void TesStore::commit_unit(const std::string& unit, const std::string& value) {
+    if (!in_unit_) throw std::runtime_error("no open TES unit");
+    flush();
+    Statement st(db_, "INSERT OR REPLACE INTO pruner_progress(unit, value) VALUES(?, ?);");
+    bind_text(db_, st.get(), 1, unit);
+    bind_text(db_, st.get(), 2, value);
+    check_sqlite(sqlite3_step(st.get()), db_, "record pruner progress");
+    exec(db_, "COMMIT;");
+    in_unit_ = false;
+}
+
+std::map<std::string, std::string> TesStore::progress() const {
+    std::map<std::string, std::string> out;
+    Statement st(db_, "SELECT unit, value FROM pruner_progress;");
+    while (sqlite3_step(st.get()) == SQLITE_ROW)
+        out[column_text(st.get(), 0)] = column_text(st.get(), 1);
+    return out;
+}
+
+std::optional<std::string> TesStore::metadata(const std::string& key) const {
+    Statement st(db_, "SELECT value FROM metadata WHERE key=?;");
+    bind_text(db_, st.get(), 1, key);
+    if (sqlite3_step(st.get()) != SQLITE_ROW) return std::nullopt;
+    return column_text(st.get(), 0);
+}
+
+void TesStore::set_metadata(const std::string& key, const std::string& value) {
+    Statement st(db_, "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?);");
+    bind_text(db_, st.get(), 1, key);
+    bind_text(db_, st.get(), 2, value);
+    check_sqlite(sqlite3_step(st.get()), db_, "write TES metadata");
 }
 
 void TesStore::finish() {
     if (finished_) return;
+    if (in_unit_) throw std::runtime_error("cannot finish a TES store inside a unit");
     flush();
     exec(db_, "PRAGMA optimize;");
     check_sqlite(sqlite3_close(db_), db_, "close TES database");
@@ -447,47 +609,14 @@ int64_t extract_tes_database(const std::string& database_path,
     }
 
     try {
-        Statement version(db, "SELECT value FROM metadata WHERE key='schema_version';");
-        if (sqlite3_step(version.get()) != SQLITE_ROW || column_text(version.get(), 0) != "1")
-            throw std::runtime_error("unsupported TES database schema");
-
-        const char* sql = id == 0
-            ? "SELECT c.id, e.id, e.combo, e.legacy_filename, e.byte_offset, e.byte_length, c.data, c.uncompressed_size"
-              " FROM entries e JOIN chunks c ON c.id=e.chunk_id ORDER BY e.id;"
-            : "SELECT c.id, e.id, e.combo, e.legacy_filename, e.byte_offset, e.byte_length, c.data, c.uncompressed_size"
-              " FROM entries e JOIN chunks c ON c.id=e.chunk_id WHERE e.id=?;";
-        Statement rows(db, sql);
-        if (id != 0)
-            check_sqlite(sqlite3_bind_int64(rows.get(), 1, id), db, "bind TES id");
-
+        int version = schema_version(db);
         fs::create_directories(output_dir);
         fs::path output_root = fs::weakly_canonical(output_dir);
-        sqlite3_int64 loaded_chunk = -1;
-        std::vector<char> decompressed;
         std::unordered_set<std::string> written_paths;
         int64_t count = 0;
-        while ((rc = sqlite3_step(rows.get())) == SQLITE_ROW) {
-            sqlite3_int64 chunk_id = sqlite3_column_int64(rows.get(), 0);
-            sqlite3_int64 entry_id = sqlite3_column_int64(rows.get(), 1);
-            const void* blob = sqlite3_column_blob(rows.get(), 6);
-            int blob_size = sqlite3_column_bytes(rows.get(), 6);
-            int64_t raw_size = sqlite3_column_int64(rows.get(), 7);
-            if (raw_size < 0 || static_cast<uint64_t>(raw_size) > MAX_TES_CHUNK_SIZE)
-                throw std::runtime_error("invalid TES chunk size");
-            if (chunk_id != loaded_chunk) {
-                decompressed.resize(static_cast<size_t>(raw_size));
-                size_t actual = ZSTD_decompress(decompressed.data(), decompressed.size(), blob, blob_size);
-                if (ZSTD_isError(actual) || actual != decompressed.size())
-                    throw std::runtime_error("invalid compressed TES chunk");
-                loaded_chunk = chunk_id;
-            }
-            int64_t offset = sqlite3_column_int64(rows.get(), 4);
-            int64_t length = sqlite3_column_int64(rows.get(), 5);
-            if (offset < 0 || length < 0 || offset > raw_size || length > raw_size - offset)
-                throw std::runtime_error("invalid TES entry bounds");
-
-            std::string combo = column_text(rows.get(), 2);
-            std::string filename = column_text(rows.get(), 3);
+        visit_entries(db, version, 0, id, [&](const TesEntry& entry) {
+            const std::string& combo = entry.combo;
+            const std::string& filename = entry.legacy_filename;
             if (combo.empty() || filename.empty()
                     || fs::path(combo).filename() != fs::path(combo)
                     || fs::path(filename).filename() != fs::path(filename))
@@ -506,19 +635,18 @@ int64_t extract_tes_database(const std::string& database_path,
             if (fs::exists(path_status)) {
                 if (!written_paths.count(path.string()))
                     throw std::runtime_error("extracted TES file already exists: " + path.string());
-                path = parent / (path.stem().string() + " [" + std::to_string(entry_id)
+                path = parent / (path.stem().string() + " [" + std::to_string(entry.id)
                                  + "]" + path.extension().string());
                 path_status = fs::symlink_status(path, status_error);
                 if (fs::is_symlink(path_status) || fs::exists(path_status))
                     throw std::runtime_error("extracted TES file already exists: " + path.string());
             }
             std::ofstream out(path, std::ios::binary | std::ios::trunc);
-            out.write(decompressed.data() + offset, length);
+            out.write(entry.document.data(), static_cast<std::streamsize>(entry.document.size()));
             if (!out) throw std::runtime_error("write extracted TES file: " + path.string());
             written_paths.insert(path.string());
             ++count;
-        }
-        if (rc != SQLITE_DONE) check_sqlite(rc, db, "read TES entries");
+        });
         if (id != 0 && count == 0) throw std::runtime_error("TES entry id not found");
         sqlite3_close_v2(db);
         return count;

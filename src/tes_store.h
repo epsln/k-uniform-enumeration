@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,9 +45,19 @@ private:
     TesSourceIdentity identity_;
 };
 
+// Schema 2 (written): one zstd chunk per run of entries of a single combo.
+// The chunk payload is, per entry, three varint-length-prefixed strings
+// (signature, legacy filename, TES document); entry ids are implicit
+// (chunks.first_entry + ordinal), so the only per-entry storage is inside the
+// compressed chunk. Schema 1 (separate `entries` rows) is still readable.
 class TesStore {
 public:
-    explicit TesStore(const std::string& path, size_t chunk_target = 8 * 1024 * 1024);
+    static constexpr int SCHEMA_VERSION = 2;
+
+    // With `resume`, opens an existing unfinished store and appends to it;
+    // otherwise `path` must not exist.
+    explicit TesStore(const std::string& path, size_t chunk_target = 8 * 1024 * 1024,
+                      bool resume = false);
     ~TesStore();
 
     TesStore(const TesStore&) = delete;
@@ -56,21 +68,27 @@ public:
     void checkpoint();
     void finish();
 
-private:
-    struct PendingEntry {
-        std::string combo;
-        std::string signature;
-        std::string legacy_filename;
-        int64_t offset;
-        int64_t length;
-    };
+    // Unit transactions: entries added between begin_unit and commit_unit are
+    // committed atomically with the progress row (unit, value). A crash
+    // inside a unit leaves the store as it was before begin_unit.
+    void begin_unit();
+    void commit_unit(const std::string& unit, const std::string& value);
+    std::map<std::string, std::string> progress() const;
+    std::optional<std::string> metadata(const std::string& key) const;
+    void set_metadata(const std::string& key, const std::string& value);
 
+private:
     void flush();
+    int64_t combo_id(const std::string& combo);
 
     sqlite3* db_ = nullptr;
     size_t chunk_target_;
     std::string chunk_;
-    std::vector<PendingEntry> entries_;
+    std::string chunk_combo_;
+    int64_t chunk_records_ = 0;
+    int64_t next_entry_ = 1;
+    std::map<std::string, int64_t> combo_ids_;
+    bool in_unit_ = false;
     bool finished_ = false;
 };
 

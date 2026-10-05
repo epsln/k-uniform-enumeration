@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -48,6 +49,9 @@ public:
                           size_t chunk_target = DEFAULT_CHUNK_TARGET);
     MortierStore(const std::string& path, const std::string& z4_basis,
                  size_t chunk_target = DEFAULT_CHUNK_TARGET);
+    // Reopens an unfinished store to append to it.
+    struct Resume {};
+    MortierStore(const std::string& path, Resume, size_t chunk_target = DEFAULT_CHUNK_TARGET);
     ~MortierStore();
 
     MortierStore(const MortierStore&) = delete;
@@ -60,6 +64,13 @@ public:
     void checkpoint();
     void finish();
     void finish_incomplete();
+
+    // Unit transactions (see TesStore::begin_unit).
+    void begin_unit();
+    void commit_unit(const std::string& unit, const std::string& value);
+    std::map<std::string, std::string> progress() const;
+    std::optional<std::string> metadata(const std::string& key) const;
+    void set_metadata(const std::string& key, const std::string& value);
 
     // Readers accept both checkpointed and finished databases. Call
     // is_complete() when publication completeness is required.
@@ -90,6 +101,7 @@ private:
     std::vector<uint8_t> chunk_;
     std::vector<PendingEntry> entries_;
     bool finished_ = false;
+    bool in_unit_ = false;
 };
 
 // Writes a Mortier-compatible JSON object. With neither selector, exports all.
