@@ -1,4 +1,5 @@
 #include "pruner.h"
+#include "solution_db.h"
 #include "canonical.h"
 #include "disk_solver.h"
 #include "solver.h"
@@ -17,6 +18,11 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 using namespace catalog;
@@ -350,8 +356,12 @@ CanonicalTilingOutput build_canonical_tiling_output(const State& st) {
         }
     }
     output.conway = conway_str;
-    output.geometry = mortier_geometry::make_tiling_description(
-        poly_size_list, work_reps, conway_str);
+    try {
+        output.geometry = mortier_geometry::make_tiling_description(
+            poly_size_list, work_reps, conway_str);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string(e.what()) + " {assembled: " + conway_str + "}");
+    }
     return output;
 }
 
@@ -977,17 +987,23 @@ bool DiskWordIndex::contains(const std::vector<int>& w) {
 // =============================================================================
 // WLPruner
 // =============================================================================
-WLPruner::WLPruner(const std::string& output_dir, int num_workers,
-                   FinalOutputFormat format)
-    : SolutionPruner(output_dir), solutions_words_(output_dir + "/words.bin"),
-      num_workers_(num_workers), format_(format) {
-    if (format_ == FinalOutputFormat::Tes)
-        tes_store_ = std::make_unique<TesStore>(output_dir + "/tilings.sqlite3.tmp");
-    else if (format_ == FinalOutputFormat::Mortier)
-        mortier_store_ = std::make_unique<MortierStore>(output_dir + "/tilings.sqlite3.tmp");
+namespace {
+
+constexpr uint64_t PREFIX_SPACE = 1ULL << 32;
+constexpr int PREFIX_BUCKET_SHIFT = 32 - SOLUTION_BUCKET_BITS;
+
+std::string hex8(uint64_t v) {
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%08llx", (unsigned long long)v);
+    return buf;
 }
 
-static std::string combo_of_input(const std::string& path) {
+int combo_k(const std::string& combo) {
+    try { return std::stoi(combo.substr(0, combo.find('_'))); }
+    catch (const std::exception&) { throw std::runtime_error("invalid combo name: " + combo); }
+}
+
+std::string combo_of_input(const std::string& path) {
     std::string combo_code = fs::path(path).filename().string();
     if (combo_code.find("eusolver_") == 0) combo_code = combo_code.substr(9);
     if (has_zst_suffix(combo_code)) combo_code = combo_code.substr(0, combo_code.size() - 4);
@@ -996,66 +1012,442 @@ static std::string combo_of_input(const std::string& path) {
     return combo_code;
 }
 
+// Upper-bound record estimate for a raw solution file (records cannot be
+// counted without decoding the whole file).
+double estimate_file_records(const std::string& path, const std::string& combo, bool is_bin) {
+    std::error_code ec;
+    double bytes = (double)fs::file_size(path, ec);
+    if (ec) return 0;
+    if (has_zst_suffix(path)) bytes *= 6;           // typical zstd ratio of records
+    int k = std::max(1, combo_k(combo));
+    // A binary record is >= 4 + k + 2 * 3k bytes; a text record far more.
+    return bytes / (is_bin ? 7.0 * k + 4 : 20.0 * k);
+}
+
+void fsync_path(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "ab");
+    if (!f) throw std::runtime_error("cannot open " + path);
+    std::fflush(f);
+    ::fsync(fileno(f));
+    std::fclose(f);
+}
+
+void write_file_atomic(const std::string& path, const std::string& content) {
+    std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out << content;
+        if (!out) throw std::runtime_error("cannot write " + tmp);
+    }
+    fsync_path(tmp);
+    fs::rename(tmp, path);
+}
+
+std::string serialize_plan(const std::vector<WLPruner::Unit>& plan) {
+    std::ostringstream out;
+    for (const auto& u : plan) out << u.combo << ' ' << u.lo << ' ' << u.hi << ' ' << u.estimate << '\n';
+    return out.str();
+}
+
+std::vector<WLPruner::Unit> parse_plan(const std::string& text) {
+    std::vector<WLPruner::Unit> plan;
+    std::istringstream in(text);
+    WLPruner::Unit u;
+    while (in >> u.combo >> u.lo >> u.hi >> u.estimate) plan.push_back(u);
+    if (!in.eof()) throw std::runtime_error("corrupt pruner plan");
+    return plan;
+}
+
+}  // namespace
+
+std::string WLPruner::Unit::name() const {
+    return combo + "/" + hex8(lo) + "-" + hex8(hi);
+}
+
+std::vector<WLPruner::Unit> WLPruner::plan_combo(const std::string& combo,
+                                                 const std::vector<double>& buckets,
+                                                 int64_t capacity, int min_ranges) {
+    double total = 0;
+    for (double c : buckets) total += c;
+    double cap = (double)std::max<int64_t>(1, capacity);
+    if (min_ranges > 1) cap = std::min(cap, std::max(1.0, std::ceil(total / min_ranges)));
+    std::vector<Unit> out;
+    Unit cur{combo, 0, 0, 0};
+    double sum = 0;
+    auto close = [&](uint64_t end) {
+        if (end <= cur.lo) return;
+        cur.hi = end;
+        cur.estimate = (int64_t)std::ceil(sum);
+        out.push_back(cur);
+        cur.lo = end;
+        sum = 0;
+    };
+    const int nb = (int)buckets.size();
+    const uint64_t width = PREFIX_SPACE / nb;
+    for (int b = 0; b < nb; ++b) {
+        double c = buckets[b];
+        uint64_t start = b * width, end = start + width;
+        if (c > cap) {
+            // Too large for one table: split the bucket evenly (hash prefixes
+            // are uniform within it).
+            close(start);
+            int parts = (int)std::min<double>(std::ceil(c / cap), (double)width);
+            for (int p = 0; p < parts; ++p) {
+                sum = c / parts;
+                close(start + width * (p + 1) / parts);
+            }
+            continue;
+        }
+        if (sum > 0 && sum + c > cap) close(start);
+        sum += c;
+        if (b == nb - 1) close(end);
+    }
+    if (out.empty() || out.back().hi != PREFIX_SPACE) close(PREFIX_SPACE);
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// Output sink: TES / Mortier store (units are SQLite transactions) or raw text
+// (one file per unit, progress in a side file).
+// -----------------------------------------------------------------------------
+class WLPruner::Sink {
+public:
+    Sink(const std::string& dir, FinalOutputFormat format, bool resume)
+        : dir_(dir), format_(format) {
+        final_ = dir + "/tilings.sqlite3";
+        tmp_ = final_ + ".tmp";
+        if (!resume) {
+            // Fresh run: drop every output of an earlier pruning of this dir.
+            for (const char* f : {"/pruner_plan.txt", "/pruner_progress.txt"})
+                fs::remove(dir + f);
+            if (fs::exists(dir))
+                for (const auto& d : fs::directory_iterator(dir)) {
+                    if (!d.is_directory()) continue;
+                    for (const auto& e : fs::directory_iterator(d.path()))
+                        if (e.path().filename().string().rfind("eupruned", 0) == 0)
+                            fs::remove(e.path());
+                }
+        }
+        // Resuming a run that already finished: reopen its final database.
+        path_ = (resume && !fs::exists(tmp_) && fs::exists(final_)) ? final_ : tmp_;
+        if (format == FinalOutputFormat::Tes)
+            tes = std::make_unique<TesStore>(path_, 8 * 1024 * 1024, resume);
+        else if (format == FinalOutputFormat::Mortier) {
+            if (path_ == final_)
+                throw std::runtime_error("Mortier pruning already finished: " + final_);
+            mortier = resume && fs::exists(path_)
+                ? std::make_unique<MortierStore>(path_, MortierStore::Resume{})
+                : std::make_unique<MortierStore>(path_);
+        }
+    }
+
+    std::optional<std::string> plan() {
+        if (tes) return tes->metadata("pruner_plan");
+        if (mortier) return mortier->metadata("pruner_plan");
+        std::ifstream in(dir_ + "/pruner_plan.txt");
+        if (!in) return std::nullopt;
+        std::stringstream ss; ss << in.rdbuf();
+        return ss.str();
+    }
+
+    void save_plan(const std::string& plan) {
+        if (tes) tes->set_metadata("pruner_plan", plan);
+        else if (mortier) mortier->set_metadata("pruner_plan", plan);
+        else write_file_atomic(dir_ + "/pruner_plan.txt", plan);
+    }
+
+    std::map<std::string, std::string> progress() {
+        if (tes) return tes->progress();
+        if (mortier) return mortier->progress();
+        std::map<std::string, std::string> out;
+        std::ifstream in(dir_ + "/pruner_progress.txt");
+        std::string line;
+        while (std::getline(in, line)) {
+            size_t tab = line.find('\t');
+            if (tab == std::string::npos) continue;   // torn trailing line
+            out[line.substr(0, tab)] = line.substr(tab + 1);
+        }
+        return out;
+    }
+
+    // Returns the text stream of the unit (raw format), else null.
+    std::ostream* begin(const Unit& unit) {
+        if (tes) { tes->begin_unit(); return nullptr; }
+        if (mortier) { mortier->begin_unit(); return nullptr; }
+        std::string out_dir = dir_ + "/" + unit.combo;
+        fs::create_directories(out_dir);
+        raw_ = std::make_unique<RollingCompressedWriter>(
+            out_dir + (unit.whole() ? "/eupruned.txt" : "/eupruned_" + hex8(unit.lo) + ".txt"));
+        return &raw_->stream();
+    }
+
+    void maybe_compress() { if (raw_) raw_->maybe_compress(); }
+
+    void commit(const Unit& unit, const std::string& value) {
+        if (tes) return tes->commit_unit(unit.name(), value);
+        if (mortier) return mortier->commit_unit(unit.name(), value);
+        std::string path = raw_->path;
+        raw_->out.flush();
+        if (!raw_->out) throw std::runtime_error("write failed: " + path);
+        raw_.reset();                                  // compresses the tail
+        for (const std::string& p : {path, path + ".zst"})
+            if (fs::exists(p)) fsync_path(p);
+        std::string progress = dir_ + "/pruner_progress.txt";
+        std::ofstream out(progress, std::ios::app);
+        out << unit.name() << '\t' << value << '\n';
+        out.close();
+        if (!out) throw std::runtime_error("cannot record pruner progress in " + progress);
+        fsync_path(progress);
+    }
+
+    void finish() {
+        if (tes) tes->finish();
+        if (mortier) mortier->finish();
+        if ((tes || mortier) && path_ == tmp_) fs::rename(tmp_, final_);
+    }
+
+    std::unique_ptr<TesStore> tes;
+    std::unique_ptr<MortierStore> mortier;
+
+private:
+    std::string dir_, final_, tmp_, path_;
+    FinalOutputFormat format_;
+    std::unique_ptr<RollingCompressedWriter> raw_;
+};
+
+// -----------------------------------------------------------------------------
+// Record sources. `bucket` is the hash bucket a solver worker filed the record
+// under (-1 if unknown); bucketed database batches are read only for the
+// buckets the unit covers.
+// -----------------------------------------------------------------------------
+class WLPruner::RecordSource {
+public:
+    virtual ~RecordSource() = default;
+    virtual bool next(SolutionRecord& rec, int& bucket) = 0;
+};
+
+namespace {
+
+class FileRecordSource : public WLPruner::RecordSource {
+public:
+    FileRecordSource(const std::string& path, bool is_bin) : is_bin_(is_bin) {
+        if (!fs::exists(path)) throw std::runtime_error("solution input disappeared: " + path);
+        in_ = open_solution_istream(path);
+        if (!in_) throw std::runtime_error("cannot open solution input: " + path);
+    }
+    bool next(SolutionPruner::SolutionRecord& rec, int& bucket) override {
+        bucket = -1;
+        return is_bin_ ? read_next_solution_bin(*in_, rec, sol_idx_) : read_next_solution(*in_, rec);
+    }
+private:
+    std::unique_ptr<std::istream> in_;
+    bool is_bin_;
+    int sol_idx_ = 0;
+};
+
+class DbRecordSource : public WLPruner::RecordSource {
+public:
+    DbRecordSource(const std::vector<std::string>& dbs, const WLPruner::Unit& unit, bool filter)
+        : reader_(dbs, unit.combo),
+          blo_(filter ? (int)(unit.lo >> PREFIX_BUCKET_SHIFT) : 0),
+          bhi_(filter ? (int)((unit.hi - 1) >> PREFIX_BUCKET_SHIFT) : SOLUTION_BUCKETS - 1),
+          in_(&buf_) {
+        in_.exceptions(std::ios::badbit);
+    }
+    bool next(SolutionPruner::SolutionRecord& rec, int& bucket) override {
+        while (true) {
+            if (in_.rdbuf()->sgetc() == std::char_traits<char>::eof()) {
+                if (layout_ == 1 && idx_ != buckets_.size())
+                    throw std::runtime_error("bucketed solution batch has a wrong record count");
+                size_t at = 0;
+                if (!reader_.next(data_, layout_, buckets_, at)) return false;
+                buf_.set(data_.data() + at, data_.data() + data_.size());
+                in_.clear();
+                idx_ = 0;
+                continue;
+            }
+            bucket = -1;
+            if (layout_ == 1) {
+                if (idx_ >= buckets_.size())
+                    throw std::runtime_error("bucketed solution batch has a wrong record count");
+                bucket = (uint8_t)buckets_[idx_++];
+                if (bucket < blo_ || bucket > bhi_) {
+                    // Another unit's record: skip it without decoding.
+                    uint16_t num, ne;
+                    read_binary_record_header(in_, num, ne);
+                    std::streamsize len = (std::streamsize)num + 2 * (std::streamsize)ne;
+                    if (in_.ignore(len).gcount() != len)
+                        throw std::runtime_error("truncated solution batch");
+                    continue;
+                }
+            }
+            if (!read_next_solution_bin(in_, rec, sol_idx_))
+                throw std::runtime_error("truncated solution batch");
+            return true;
+        }
+    }
+private:
+    struct Buf : std::streambuf {
+        void set(char* a, char* b) { setg(a, a, b); }
+    };
+    SolutionDbReader reader_;
+    int blo_, bhi_, layout_ = 0;
+    std::vector<char> data_;
+    std::string buckets_;
+    size_t idx_ = 0;
+    Buf buf_;
+    std::istream in_;
+    int sol_idx_ = 0;
+};
+
+}  // namespace
+
+WLPruner::WLPruner(const std::string& output_dir, const PrunerOptions& options)
+    : SolutionPruner(output_dir), solutions_words_(output_dir + "/words.bin"),
+      options_(options) {
+    fs::create_directories(output_dir_);
+    sink_ = std::make_unique<Sink>(output_dir_, options_.format, options_.resume);
+}
+
+WLPruner::~WLPruner() = default;
+
+void WLPruner::HashSet128::reset(size_t expected) {
+    size_t n = std::max<size_t>(1024, (size_t)((double)expected / 0.7) + 1);
+    std::vector<std::array<uint64_t, 2>>().swap(slots);
+    slots.assign(n, {0, 0});
+    used = 0;
+}
+
 bool WLPruner::HashSet128::insert(std::array<uint64_t, 2> h) {
     if (h[0] == 0 && h[1] == 0) h[1] = 1;          // reserve all-zero as "empty"
-    if ((used + 1) * 10 > slots.size() * 7) {
+    if (slots.empty()) reset(0);
+    if ((used + 1) * 20 > slots.size() * 17) {     // load > 0.85: grow
         std::vector<std::array<uint64_t, 2>> old;
         old.swap(slots);
-        slots.assign(std::max<size_t>(1024, old.size() * 2), {0, 0});
+        slots.assign(old.size() * 2, {0, 0});
         used = 0;
         for (const auto& e : old)
             if (e[0] || e[1]) insert(e);
     }
-    size_t mask = slots.size() - 1;
-    for (size_t i = (size_t)(h[0] ^ (h[1] >> 7)) & mask;; i = (i + 1) & mask) {
+    const size_t n = slots.size();
+    // hash[1] is unconstrained within a unit; map it onto [0, n).
+    size_t i = (size_t)(((unsigned __int128)h[1] * n) >> 64);
+    while (true) {
         auto& e = slots[i];
         if (!e[0] && !e[1]) { e = h; ++used; return true; }
         if (e == h) return false;
+        if (++i == n) i = 0;
     }
 }
 
-void WLPruner::run(const std::vector<std::string>& listfile_paths) {
-    fs::create_directories(output_dir_);
+void WLPruner::run(const std::vector<std::string>& listfile_paths,
+                   const std::vector<std::string>& dbs) {
+    dbs_ = dbs;
     // Several inputs can share a combo (e.g. .txt and .bin, or outputs of
-    // different runs). They must share one pruned writer -- a writer per file
-    // truncated the previous file's output -- and one dedup scope.
-    std::vector<std::pair<std::string, std::string>> inputs;
-    for (const auto& p : listfile_paths) inputs.push_back({combo_of_input(p), p});
-    std::stable_sort(inputs.begin(), inputs.end(),
-                     [](const auto& a, const auto& b) { return a.first < b.first; });
-    int n = (int)inputs.size();
-    for (int i = 0; i < n;) {
-        const std::string combo = inputs[i].first;
-        std::string out_dir = output_dir_ + "/" + combo;
-        fs::create_directories(out_dir);
-        RollingCompressedWriter pruned_out(out_dir + "/eupruned.txt");
-        canon_seen_.clear();
-        solutions_by_hash_.clear();
-        for (; i < n && inputs[i].first == combo; ++i) {
-            if (n > 5 && i % std::max(1, n/10) == 0) {
-                std::cerr << "\r  pruner: " << (i+1) << "/" << n << " files  [";
-                bool first = true;
-                for (const auto& [k, cnt] : solutions_per_k_) {
-                    if (!first) std::cerr << " ";
-                    std::cerr << "k" << k << ":" << cnt;
-                    first = false;
-                }
-                std::cerr << "]" << std::flush;
+    // different runs); they share one dedup scope.
+    std::map<std::string, std::vector<Input>> inputs;
+    std::map<std::string, std::vector<double>> estimate;
+    auto buckets_of = [&](const std::string& combo) -> std::vector<double>& {
+        auto& v = estimate[combo];
+        v.resize(SOLUTION_BUCKETS, 0.0);
+        return v;
+    };
+    for (const auto& p : listfile_paths) {
+        std::string base = p;
+        if (has_zst_suffix(base)) base.resize(base.size() - 4);
+        if (has_zst_suffix(base))
+            throw std::runtime_error("doubly suffixed solution file name: " + p);
+        bool is_bin = base.size() > 4 && base.substr(base.size() - 4) == ".bin";
+        std::string combo = combo_of_input(p);
+        inputs[combo].push_back({combo, p, is_bin});
+        double n = estimate_file_records(p, combo, is_bin);
+        for (double& b : buckets_of(combo)) b += n / SOLUTION_BUCKETS;
+    }
+    if (!dbs.empty())
+        for (const auto& [combo, counts] : solution_db_bucket_counts(dbs)) {
+            inputs[combo].push_back({combo, "", true});
+            auto& b = buckets_of(combo);
+            for (const auto& [bucket, count] : counts) {
+                if (bucket < 0)
+                    for (double& x : b) x += (double)count / SOLUTION_BUCKETS;
+                else
+                    b.at(bucket) += (double)count;
             }
-            process_file_wl(inputs[i].second, combo, pruned_out.stream(),
-                            [&] { pruned_out.maybe_compress(); });
         }
+
+    const int64_t capacity = std::max<int64_t>(1024, (int64_t)(options_.table_bytes / 16 * 0.7));
+    std::vector<Unit> plan;
+    std::optional<std::string> stored;
+    if (options_.resume) stored = sink_->plan();
+    if (stored) {
+        plan = parse_plan(*stored);
+        std::set<std::string> planned;
+        for (const auto& u : plan) planned.insert(u.combo);
+        for (const auto& [combo, list] : inputs)
+            if (!planned.count(combo))
+                throw std::runtime_error("cannot resume pruning: combo " + combo
+                                         + " has inputs but is not in the stored plan");
+    } else {
+        for (const auto& [combo, buckets] : estimate) {
+            if (g_dedup_canon) {
+                for (auto& u : plan_combo(combo, buckets, capacity, options_.min_ranges))
+                    plan.push_back(u);
+            } else {
+                double total = 0;
+                for (double c : buckets) total += c;
+                plan.push_back({combo, 0, PREFIX_SPACE, (int64_t)std::ceil(total)});
+            }
+        }
+        sink_->save_plan(serialize_plan(plan));
+    }
+
+    auto done = sink_->progress();
+    size_t units_done = 0;
+    for (const auto& u : plan) {
+        auto it = done.find(u.name());
+        if (it == done.end()) continue;
+        int k = 0; int64_t count = 0;
+        std::istringstream(it->second) >> k >> count;
+        solutions_per_k_[k] += count;
+        ++units_done;
+    }
+    if (options_.resume && units_done)
+        std::cerr << "  pruner: resuming, " << units_done << "/" << plan.size()
+                  << " units already done\n";
+    if (plan.size() > (size_t)inputs.size())
+        std::cerr << "  pruner: " << plan.size() << " units over " << estimate.size()
+                  << " combos (dedup table <= " << (options_.table_bytes >> 20) << " MB)\n";
+
+    for (size_t ui = 0; ui < plan.size(); ++ui) {
+        const Unit& unit = plan[ui];
+        if (done.count(unit.name())) continue;
+        auto space = fs::space(output_dir_);
+        if ((int64_t)space.available < options_.min_free_bytes)
+            throw std::runtime_error("low disk space in " + output_dir_
+                + "; free some space and rerun with --prune-only --resume");
+        static auto last_report = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (plan.size() > 5 && now - last_report >= std::chrono::seconds(1)) {
+            last_report = now;
+            std::cerr << "\r  pruner: unit " << (ui + 1) << "/" << plan.size() << " "
+                      << unit.combo << "          " << std::flush;
+        }
+        if (g_dedup_canon)
+            canon_seen_.reset((size_t)std::min<int64_t>(unit.estimate, capacity));
+        solutions_by_hash_.clear();
+        std::ostream* text = sink_->begin(unit);
+        int64_t unique = 0;
+        auto it = inputs.find(unit.combo);
+        if (it != inputs.end())
+            for (const auto& input : it->second)
+                unique += process_input(input, unit, text, [&] { sink_->maybe_compress(); });
+        int k = combo_k(unit.combo);
+        sink_->commit(unit, std::to_string(k) + " " + std::to_string(unique));
+        solutions_per_k_[k] += unique;
     }
     canon_seen_.clear();
     solutions_by_hash_.clear();
-    if (tes_store_) {
-        tes_store_->finish();
-        fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
-    }
-    if (mortier_store_) {
-        mortier_store_->finish();
-        fs::rename(output_dir_ + "/tilings.sqlite3.tmp", output_dir_ + "/tilings.sqlite3");
-    }
+    sink_->finish();
     if (!g_keep_pruner_inputs) {
         for (const auto& path : listfile_paths) {
             std::error_code ec;
@@ -1063,8 +1455,13 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
             if (ec) std::cerr << "  warning: could not remove pruned input " << path
                               << ": " << ec.message() << "\n";
         }
+        for (const auto& db : dbs) remove_solution_db(db);
     }
-    if (n > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
+    if (plan.size() > 5) std::cerr << "\r" << std::string(60, ' ') << "\r" << std::flush;
+    if (transient_format_failures_)
+        std::cerr << "  WARNING: " << transient_format_failures_
+                  << " transient formatting failure(s) recovered by retry; identical input"
+                     " formatted differently, check CPU/RAM stability\n";
     if (g_dedup_canon) {
         // exact canonical-form dedup: no diagnostics needed
     } else if (g_use_bfl) {
@@ -1078,11 +1475,12 @@ void WLPruner::run(const std::vector<std::string>& listfile_paths) {
 }
 
 void WLPruner::parallel_for(int n, const std::function<void(int)>& fn) const {
-    if (num_workers_ <= 1 || n < 10) {
+    int workers = options_.num_workers;
+    if (workers <= 1 || n < 10) {
         for (int i = 0; i < n; ++i) fn(i);
         return;
     }
-    int nw = std::min(num_workers_, n);
+    int nw = std::min(workers, n);
     std::vector<std::thread> threads;
     std::atomic<int> idx{0};
     for (int w = 0; w < nw; ++w) {
@@ -1117,66 +1515,65 @@ WLPruner::CanonicalResult WLPruner::compute_canonical_and_wl(const State& st) co
     return r;
 }
 
-void WLPruner::process_file_wl(const std::string& path, const std::string& combo_code,
-                               std::ostream& pruned_out,
-                               const std::function<void()>& maybe_compress) {
-    if (!fs::exists(path)) throw std::runtime_error("solution input disappeared: " + path);
+std::unique_ptr<WLPruner::RecordSource> WLPruner::open_source(const Input& input,
+                                                              const Unit& unit) const {
+    if (input.path.empty())
+        return std::make_unique<DbRecordSource>(dbs_, unit, g_dedup_canon);
+    return std::make_unique<FileRecordSource>(input.path, input.is_bin);
+}
 
+int64_t WLPruner::process_input(const Input& input, const Unit& unit, std::ostream* pruned_out,
+                                const std::function<void()>& maybe_compress) {
+    const std::string& combo_code = input.combo;
     static constexpr int BATCH = 16384;
     std::vector<SolutionRecord> batch;
     batch.reserve(BATCH);
     std::vector<CanonicalResult> results;
     results.reserve(BATCH);
+    std::vector<int> buckets(BATCH);
 
-    std::string base = path;
-    if (has_zst_suffix(base)) base.resize(base.size() - 4);
-    if (has_zst_suffix(base))
-        throw std::runtime_error("doubly suffixed solution file name: " + path);
-    bool is_bin = (base.size() > 4 && base.substr(base.size() - 4) == ".bin");
-    auto in = open_solution_istream(path);
-    if (!in) throw std::runtime_error("cannot open solution input: " + path);
-    std::istream& in_ref = *in;
-    int sol_idx = 0;
+    auto source = open_source(input, unit);
     using Clock = std::chrono::steady_clock;
     std::chrono::nanoseconds decode_time{0};
     std::chrono::nanoseconds compute_time{0};
     std::chrono::nanoseconds consume_time{0};
     std::chrono::nanoseconds format_time{0}, write_time{0};
-    int64_t records = 0;
+    int64_t records = 0, unique = 0;
 
     while (true) {
         auto stage_start = Clock::now();
         batch.clear();
         results.clear();
-        SolutionRecord rec;
-        bool ok;
-        if (is_bin)
-            ok = read_next_solution_bin(in_ref, rec, sol_idx);
-        else
-            ok = read_next_solution(in_ref, rec);
-        if (!ok) break;
-        batch.push_back(std::move(rec));
-
-        // Fill rest of batch
-        for (int i = 1; i < BATCH; ++i) {
-            SolutionRecord rec2;
-            bool ok2;
-            if (is_bin)
-                ok2 = read_next_solution_bin(in_ref, rec2, sol_idx);
-            else
-                ok2 = read_next_solution(in_ref, rec2);
-            if (!ok2) break;
-            batch.push_back(std::move(rec2));
+        for (int i = 0; i < BATCH; ++i) {
+            SolutionRecord rec;
+            if (!source->next(rec, buckets[i])) break;
+            batch.push_back(std::move(rec));
         }
         if (batch.empty()) break;
         decode_time += Clock::now() - stage_start;
         records += (int64_t)batch.size();
 
+        auto space = fs::space(output_dir_);
+        if ((int64_t)space.available < options_.min_free_bytes)
+            throw std::runtime_error("low disk space in " + output_dir_
+                + "; free some space and rerun with --prune-only --resume");
+
         int n = (int)batch.size();
         results.resize(n);
 
         stage_start = Clock::now();
-        parallel_for(n, [&](int i) { results[i] = compute_canonical_and_wl(batch[i].state); });
+        std::atomic<bool> mismatch{false};
+        parallel_for(n, [&](int i) {
+            results[i] = compute_canonical_and_wl(batch[i].state);
+            // A worker filed this record under the bucket of its own hash; a
+            // different bucket here would silently break the dedup.
+            if (g_dedup_canon && buckets[i] >= 0 && results[i].is_canonical
+                    && solution_bucket(results[i].canon_hash) != buckets[i])
+                mismatch = true;
+        });
+        if (mismatch)
+            throw std::runtime_error("solution filed under the wrong hash bucket in combo "
+                                     + combo_code + " (solver and pruner canonical forms differ)");
         compute_time += Clock::now() - stage_start;
 
         stage_start = Clock::now();
@@ -1189,6 +1586,8 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
 
             bool is_dup = false;
             if (g_dedup_canon) {
+                uint64_t prefix = r.canon_hash[0] >> 32;
+                if (prefix < unit.lo || prefix >= unit.hi) continue;   // another unit's
                 is_dup = !canon_seen_.insert(r.canon_hash);
             } else if (g_use_bfl) {
                 // Exact disk-backed canonical-word dedup.  The canonical word
@@ -1209,8 +1608,8 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
                     if (g_no_iso_check) {
                         is_dup = true;   // trust the WL hash, skip isomorphism fallback
                     } else {
-                        for (const auto& stored : it->second) {
-                            State stored_st = EuclideanSolver::unpack_state(stored);
+                        for (const auto& stored_state : it->second) {
+                            State stored_st = EuclideanSolver::unpack_state(stored_state);
                             g_solutions_match_calls++;
                             if (solutions_match(rec2.state, stored_st).first) {
                                 is_dup = true;
@@ -1227,10 +1626,13 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
                 if (g_no_iso_check) solutions_by_hash_.try_emplace(r.wl_hash);  // track key only
                 else solutions_by_hash_[r.wl_hash].push_back(EuclideanSolver::pack_state(rec2.state));
             }
-            int k = (int)rec2.state.vertype.size();
-            auto kit = solutions_per_k_.find(k);
-            solutions_per_k_[k] = (kit != solutions_per_k_.end() ? kit->second + 1 : 1);
             unique_idx.push_back(i);
+        }
+        if (canon_seen_.slots.size() * 16 > (size_t)options_.table_bytes && !grow_warned_) {
+            grow_warned_ = true;
+            std::cerr << "\n  warning: dedup table of unit " << unit.name()
+                      << " outgrew its estimate (" << (canon_seen_.slots.size() * 16 >> 20)
+                      << " MB); rerun with a larger --prune-buckets if memory runs out\n";
         }
 
         // Stage 3 (parallel): format every unique tiling's outputs.
@@ -1240,11 +1642,14 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
             mortier_geometry::DevelopmentResult developed;
             std::string error;
         };
+        auto* tes_store = sink_->tes.get();
+        auto* mortier_store = sink_->mortier.get();
         std::vector<Formatted> formatted(unique_idx.size());
         auto format_start = Clock::now();
-        parallel_for((int)unique_idx.size(), [&](int u) {
+        auto format_one = [&](int u) {
             auto& rec2 = batch[unique_idx[u]];
             auto& f = formatted[u];
+            f = Formatted{};
             try {
                 materialize_output_fields(rec2);
                 std::string old_rel = rec2.tes_line.substr(rec2.tes_line.find("eu"));
@@ -1257,15 +1662,17 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
                 while (!f.sig_raw.empty() && (f.sig_raw.back() == '\n' || f.sig_raw.back() == '\r'))
                     f.sig_raw.pop_back();
 
-                std::ostringstream out;
-                out << rec2.vertex_line << "\n" << rec2.signature_line << "\n"
-                    << "Count type: " << rec2.count_signature << "\n"
-                    << rec2.tes_line << "\n" << rec2.conway_line << "\n";
                 CanonicalTilingOutput output = build_canonical_tiling_output(rec2.state);
-                for (const std::string& line : output.cycle_lines) out << line << "\n";
-                out << "---\n" << output.conway << "\n\n";
-                f.text = out.str();
-                if (mortier_store_) {
+                if (pruned_out) {
+                    std::ostringstream out;
+                    out << rec2.vertex_line << "\n" << rec2.signature_line << "\n"
+                        << "Count type: " << rec2.count_signature << "\n"
+                        << rec2.tes_line << "\n" << rec2.conway_line << "\n";
+                    for (const std::string& line : output.cycle_lines) out << line << "\n";
+                    out << "---\n" << output.conway << "\n\n";
+                    f.text = out.str();
+                }
+                if (mortier_store) {
                     try {
                         f.developed = mortier_geometry::develop_exact_geometry(output.geometry);
                     } catch (const std::exception& error) {
@@ -1274,13 +1681,37 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
                     }
                     std::string hash = bfl_canonical_hash(rec2.state);
                     f.mortier_hash.assign(hash.begin(), hash.end());
-                } else if (tes_store_) {
+                } else if (tes_store) {
                     f.tes_doc = tes_document(output, f.sig_raw);
                 }
             } catch (const std::exception& e) {
-                f.error = e.what();
+                // Name the record so the failure can be replayed in isolation.
+                f.error = std::string(e.what()) + " [combo " + combo_code + ", record "
+                        + std::to_string(rec2.solution_index) + ": "
+                        + verbal_vertices(rec2.state.vertype) + " | "
+                        + write_conway(rec2.state) + "]";
             }
-        });
+        };
+        parallel_for((int)unique_idx.size(), format_one);
+        // Formatting is a pure function of (vertex types, glue). A failure
+        // that disappears when the state is rebuilt from exactly those is not
+        // a property of the record (it has been seen to come and go between
+        // runs on identical input); retry once, report it, and keep going.
+        for (size_t u = 0; u < unique_idx.size(); ++u) {
+            if (formatted[u].error.empty()) continue;
+            auto& rec2 = batch[unique_idx[u]];
+            std::string first = formatted[u].error;
+            rec2.state = EuclideanSolver::unpack_state(EuclideanSolver::pack_state(rec2.state));
+            rec2.vertex_line.clear();
+            format_one((int)u);
+            if (!formatted[u].error.empty()) {
+                formatted[u].error = "persistent formatting failure: " + first;
+                continue;
+            }
+            ++transient_format_failures_;
+            std::cerr << "\n  warning: transient formatting failure, retry succeeded: "
+                      << first << "\n";
+        }
 
         format_time += Clock::now() - format_start;
         // Stage 4 (sequential): write in input order.
@@ -1288,17 +1719,16 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
         for (size_t u = 0; u < unique_idx.size(); ++u) {
             auto& f = formatted[u];
             if (!f.error.empty()) throw std::runtime_error(f.error);
-            pruned_out << f.text;
-            if (mortier_store_)
-                mortier_store_->add(f.mortier_hash, (int)batch[unique_idx[u]].state.vertype.size(),
-                                    f.developed.record, f.sig_raw);
-            else if (tes_store_)
-                tes_store_->add(combo_code, f.sig_raw, f.tes_filename, f.tes_doc);
+            if (pruned_out) *pruned_out << f.text;
+            if (mortier_store)
+                mortier_store->add(f.mortier_hash, (int)batch[unique_idx[u]].state.vertype.size(),
+                                   f.developed.record, f.sig_raw);
+            else if (tes_store)
+                tes_store->add(combo_code, f.sig_raw, f.tes_filename, f.tes_doc);
         }
+        unique += (int64_t)unique_idx.size();
 
         write_time += Clock::now() - write_start;
-        // Once per batch (not per line) is plenty granular given batches are
-        // up to 2000 solutions — keeps the stat()+possible zstd spawn rare.
         maybe_compress();
         consume_time += Clock::now() - stage_start;
     }
@@ -1306,11 +1736,13 @@ void WLPruner::process_file_wl(const std::string& path, const std::string& combo
         return std::chrono::duration<double, std::milli>(d).count();
     };
     if (g_profile_pruner) {
-        std::cerr << "  pruner profile " << combo_code << ": records=" << records
+        std::cerr << "  pruner profile " << unit.name() << ": records=" << records
+                  << " unique=" << unique
                   << " decode=" << millis(decode_time) << "ms"
                   << " compute=" << millis(compute_time) << "ms"
                   << " consume=" << millis(consume_time) << "ms"
                   << " format=" << millis(format_time) << "ms"
                   << " write=" << millis(write_time) << "ms\n";
     }
+    return unique;
 }

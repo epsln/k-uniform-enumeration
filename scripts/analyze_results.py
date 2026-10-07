@@ -10,6 +10,10 @@ import re
 import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from solver_harness import iter_tes_entries  # noqa: E402
 
 
 COMBO_RE = re.compile(r"^(\d+)_")
@@ -44,16 +48,11 @@ def multiplicity_profile(signature: str) -> str:
 
 
 def read_rows(database: Path):
-    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-    try:
-        query = "SELECT combo, signature FROM entries ORDER BY id"
-        for combo, signature in connection.execute(query):
-            match = COMBO_RE.match(combo)
-            if not match:
-                raise ValueError(f"cannot extract k from combo {combo!r}")
-            yield int(match.group(1)), combo, signature
-    finally:
-        connection.close()
+    for _, combo, signature, _, _ in iter_tes_entries(database, with_documents=False):
+        match = COMBO_RE.match(combo)
+        if not match:
+            raise ValueError(f"cannot extract k from combo {combo!r}")
+        yield int(match.group(1)), combo, signature
 
 
 def analyse(database: Path):

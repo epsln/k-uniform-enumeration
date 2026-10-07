@@ -843,7 +843,8 @@ MortierStore::MortierStore(const std::string& path, const std::string& z4_basis,
              " seed_count INTEGER NOT NULL CHECK(seed_count>=0),signature TEXT);"
              "CREATE INDEX entries_chunk ON entries(chunk_id,id);"
              "CREATE TABLE import_failures("
-             " name TEXT PRIMARY KEY,message TEXT NOT NULL);");
+             " name TEXT PRIMARY KEY,message TEXT NOT NULL);"
+             "CREATE TABLE pruner_progress(unit TEXT PRIMARY KEY,value TEXT NOT NULL);");
         Statement metadata(db_, "INSERT INTO metadata(key,value) VALUES(?,?);");
         const std::pair<const char*, std::string> values[] = {
             {"schema_version", std::to_string(SCHEMA_VERSION)},
@@ -866,6 +867,73 @@ MortierStore::MortierStore(const std::string& path, const std::string& z4_basis,
         fs::remove(path, ignored);
         throw;
     }
+}
+
+MortierStore::MortierStore(const std::string& path, Resume, size_t chunk_target)
+    : chunk_target_(chunk_target) {
+    if (!fs::exists(path)) throw std::runtime_error("Mortier database to resume is missing: " + path);
+    int rc = sqlite3_open_v2(path.c_str(), &db_, SQLITE_OPEN_READWRITE, nullptr);
+    if (rc != SQLITE_OK) {
+        std::string message = db_ ? sqlite3_errmsg(db_) : "cannot allocate SQLite handle";
+        if (db_) sqlite3_close(db_);
+        db_ = nullptr;
+        throw std::runtime_error("open Mortier database: " + message);
+    }
+    try {
+        exec(db_, "PRAGMA journal_mode=DELETE;");
+        exec(db_, "PRAGMA synchronous=FULL;");
+        exec(db_, "PRAGMA foreign_keys=ON;");
+        if (metadata("schema_version") != std::to_string(SCHEMA_VERSION)
+                || metadata("complete") != std::string("0"))
+            throw std::runtime_error("cannot resume Mortier database: " + path);
+        exec(db_, "CREATE TABLE IF NOT EXISTS pruner_progress("
+                  "unit TEXT PRIMARY KEY,value TEXT NOT NULL);");
+    } catch (...) {
+        sqlite3_close(db_);
+        db_ = nullptr;
+        throw;
+    }
+}
+
+void MortierStore::begin_unit() {
+    if (finished_) throw std::runtime_error("cannot add to a finished Mortier store");
+    if (in_unit_) throw std::runtime_error("Mortier unit already open");
+    flush();
+    exec(db_, "BEGIN IMMEDIATE;");
+    in_unit_ = true;
+}
+
+void MortierStore::commit_unit(const std::string& unit, const std::string& value) {
+    if (!in_unit_) throw std::runtime_error("no open Mortier unit");
+    flush();
+    Statement st(db_, "INSERT OR REPLACE INTO pruner_progress(unit,value) VALUES(?,?);");
+    bind_text(db_, st.get(), 1, unit);
+    bind_text(db_, st.get(), 2, value);
+    check_sqlite(sqlite3_step(st.get()), db_, "record pruner progress");
+    exec(db_, "COMMIT;");
+    in_unit_ = false;
+}
+
+std::map<std::string, std::string> MortierStore::progress() const {
+    std::map<std::string, std::string> out;
+    Statement st(db_, "SELECT unit,value FROM pruner_progress;");
+    while (sqlite3_step(st.get()) == SQLITE_ROW)
+        out[column_text(st.get(), 0)] = column_text(st.get(), 1);
+    return out;
+}
+
+std::optional<std::string> MortierStore::metadata(const std::string& key) const {
+    Statement st(db_, "SELECT value FROM metadata WHERE key=?;");
+    bind_text(db_, st.get(), 1, key);
+    if (sqlite3_step(st.get()) != SQLITE_ROW) return std::nullopt;
+    return column_text(st.get(), 0);
+}
+
+void MortierStore::set_metadata(const std::string& key, const std::string& value) {
+    Statement st(db_, "INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?);");
+    bind_text(db_, st.get(), 1, key);
+    bind_text(db_, st.get(), 2, value);
+    check_sqlite(sqlite3_step(st.get()), db_, "write Mortier metadata");
 }
 
 MortierStore::~MortierStore() {
@@ -907,7 +975,8 @@ void MortierStore::flush() {
                                  + ZSTD_getErrorName(compressed_size));
     compressed.resize(compressed_size);
 
-    exec(db_, "BEGIN IMMEDIATE;");
+    const bool own_txn = !in_unit_;
+    if (own_txn) exec(db_, "BEGIN IMMEDIATE;");
     try {
         Statement chunk_statement(db_,
             "INSERT INTO chunks(record_count,uncompressed_size,compressed_size,data)"
@@ -947,9 +1016,9 @@ void MortierStore::flush() {
             check_sqlite(sqlite3_clear_bindings(entry), db_,
                          "clear Mortier entry bindings");
         }
-        exec(db_, "COMMIT;");
+        if (own_txn) exec(db_, "COMMIT;");
     } catch (...) {
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        if (own_txn) sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
         throw;
     }
     chunk_.clear();
@@ -967,6 +1036,7 @@ void MortierStore::finish_incomplete() { finish_with_status(false); }
 
 void MortierStore::finish_with_status(bool complete) {
     if (finished_) return;
+    if (in_unit_) throw std::runtime_error("cannot finish a Mortier store inside a unit");
     flush();
     exec(db_, "PRAGMA optimize;");
     if (complete) {
@@ -1332,27 +1402,57 @@ TesMortierConversionResult convert_tes_to_mortier(
             bind_text(db, attach.get(), 1, source.canonical_path);
             check_sqlite(sqlite3_step(attach.get()), db, "attach TES source for reconciliation");
             try {
-                Statement missing(db,
-                    "SELECT id FROM tes_source.entries WHERE id<=? EXCEPT "
-                    "SELECT source_entry_id FROM entries WHERE source_entry_id IS NOT NULL "
-                    "EXCEPT SELECT source_entry_id FROM conversion_failures LIMIT 1;");
-                check_sqlite(sqlite3_bind_int64(missing.get(), 1, last_source_id), db,
-                             "bind conversion reconciliation watermark");
-                if (sqlite3_step(missing.get()) == SQLITE_ROW)
-                    throw std::runtime_error("Mortier conversion is missing a processed source id");
+                if (source.schema_version == 1) {
+                    Statement missing(db,
+                        "SELECT id FROM tes_source.entries WHERE id<=? EXCEPT "
+                        "SELECT source_entry_id FROM entries WHERE source_entry_id IS NOT NULL "
+                        "EXCEPT SELECT source_entry_id FROM conversion_failures LIMIT 1;");
+                    check_sqlite(sqlite3_bind_int64(missing.get(), 1, last_source_id), db,
+                                 "bind conversion reconciliation watermark");
+                    if (sqlite3_step(missing.get()) == SQLITE_ROW)
+                        throw std::runtime_error("Mortier conversion is missing a processed source id");
 
-                Statement extra(db,
-                    "SELECT id FROM ("
-                    " SELECT source_entry_id AS id FROM entries WHERE source_entry_id IS NOT NULL"
-                    " UNION ALL SELECT source_entry_id FROM conversion_failures"
-                    ") WHERE id<=? EXCEPT "
-                    "SELECT id FROM tes_source.entries WHERE id<=? LIMIT 1;");
-                check_sqlite(sqlite3_bind_int64(extra.get(), 1, last_source_id), db,
-                             "bind conversion entry watermark");
-                check_sqlite(sqlite3_bind_int64(extra.get(), 2, last_source_id), db,
-                             "bind TES reconciliation watermark");
-                if (sqlite3_step(extra.get()) == SQLITE_ROW)
-                    throw std::runtime_error("Mortier conversion contains an unknown source id");
+                    Statement extra(db,
+                        "SELECT id FROM ("
+                        " SELECT source_entry_id AS id FROM entries WHERE source_entry_id IS NOT NULL"
+                        " UNION ALL SELECT source_entry_id FROM conversion_failures"
+                        ") WHERE id<=? EXCEPT "
+                        "SELECT id FROM tes_source.entries WHERE id<=? LIMIT 1;");
+                    check_sqlite(sqlite3_bind_int64(extra.get(), 1, last_source_id), db,
+                                 "bind conversion entry watermark");
+                    check_sqlite(sqlite3_bind_int64(extra.get(), 2, last_source_id), db,
+                                 "bind TES reconciliation watermark");
+                    if (sqlite3_step(extra.get()) == SQLITE_ROW)
+                        throw std::runtime_error("Mortier conversion contains an unknown source id");
+                } else {
+                    // Schema 2: entry ids are the ranges [first_entry, first_entry+record_count).
+                    Statement extra(db,
+                        "SELECT id FROM ("
+                        " SELECT source_entry_id AS id FROM entries WHERE source_entry_id IS NOT NULL"
+                        " UNION ALL SELECT source_entry_id FROM conversion_failures"
+                        ") WHERE id<=?1 AND NOT EXISTS (SELECT 1 FROM tes_source.chunks c"
+                        " WHERE c.first_entry<=id AND id<c.first_entry+c.record_count) LIMIT 1;");
+                    check_sqlite(sqlite3_bind_int64(extra.get(), 1, last_source_id), db,
+                                 "bind conversion entry watermark");
+                    if (sqlite3_step(extra.get()) == SQLITE_ROW)
+                        throw std::runtime_error("Mortier conversion contains an unknown source id");
+                    // Every processed id is a distinct source id, so equal
+                    // counts mean none is missing.
+                    Statement expected(db,
+                        "SELECT COALESCE(SUM(MAX(0, MIN(first_entry+record_count-1, ?1)"
+                        "-first_entry+1)),0) FROM tes_source.chunks;");
+                    check_sqlite(sqlite3_bind_int64(expected.get(), 1, last_source_id), db,
+                                 "bind TES reconciliation watermark");
+                    check_sqlite(sqlite3_step(expected.get()), db, "count TES source ids");
+                    Statement actual(db,
+                        "SELECT (SELECT COUNT(*) FROM entries WHERE source_entry_id<=?1)"
+                        "+(SELECT COUNT(*) FROM conversion_failures WHERE source_entry_id<=?1);");
+                    check_sqlite(sqlite3_bind_int64(actual.get(), 1, last_source_id), db,
+                                 "bind conversion watermark");
+                    check_sqlite(sqlite3_step(actual.get()), db, "count converted ids");
+                    if (sqlite3_column_int64(expected.get(), 0) != sqlite3_column_int64(actual.get(), 0))
+                        throw std::runtime_error("Mortier conversion is missing a processed source id");
+                }
                 exec(db, "DETACH DATABASE tes_source;");
             } catch (...) {
                 sqlite3_exec(db, "DETACH DATABASE tes_source;", nullptr, nullptr, nullptr);

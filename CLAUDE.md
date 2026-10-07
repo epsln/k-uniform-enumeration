@@ -9,6 +9,7 @@ make                                    # C++17, pthreads, zstd, SQLite, Boost h
 ./eusolver --max-polygons 5 --workers 8 --output solutions
 ./eusolver --mode disk --max-polygons 10 --workers 8 --binary-solutions  # disk mode for k >= 10
 ./eusolver --mode disk --max-polygons 10 --workers 8 --binary-solutions --resume  # continue an interrupted run
+./eusolver --mode disk --prune-only --resume --output DIR  # continue an interrupted pruning
 ```
 
 Building against non-system dependency prefixes: `make EXTRA_CXXFLAGS='-isystem PREFIX/include' EXTRA_LDFLAGS='-LPREFIX/lib -Wl,-rpath,PREFIX/lib'`.
@@ -33,11 +34,12 @@ C++ sources live in `src/`.
 | `src/dfs_engine.h/cpp` | `DfsEngine`: in-place DFS with undo trail over the same tree as `extend_into`; incremental chain checks; donation and prune hooks |
 | `src/canonical.h/cpp` | Exact colour-refinement canonical form (minimality test + 128-bit code hash), also for partial states |
 | `src/transposition.h/cpp` | Shared bounded table of explored partial-state canonical hashes |
-| `src/pruner.h/cpp` | Per-combo dedup pipeline (canonical default; WL/BFL optional) and parallel TES/Mortier output formatting |
+| `src/pruner.h/cpp` | Unit-wise dedup pipeline (combo x canonical-hash range, RAM-bounded, resumable; canonical default, WL/BFL optional) and parallel TES/Mortier/raw output formatting |
 | `src/disk_solver.h/cpp` | Disk mode: BFS fan-out, binary serialization, `WorkPool` (chunks, work sharing, `done_chunks.txt`), workers; legacy spill queue behind `--legacy-solver` |
 | `src/mortier_geometry.h/cpp` | Exact Z4 affine development and translation-lattice derivation |
 | `src/mortier_store.h/cpp` | Versioned Mortier codec, compressed SQLite storage, JSON conversion |
-| `src/tes_store.h/cpp` | Compressed SQLite storage and safe extraction for TES documents |
+| `src/solution_db.h/cpp` | Disk-mode raw output: per-writer SQLite DB (`_worker_<N>/solutions.sqlite3`, `_worker_fanout/solutions.sqlite3`); frontier chunks live in `chunks/` of zstd-compressed per-combo batches (layout 1: a 1-byte canonical-hash bucket per record plus per-bucket counts) plus `done_chunks`; streamed directly by the pruner |
+| `src/tes_store.h/cpp` | TES SQLite store, schema 2: per-combo zstd chunks holding signature, filename and document of each entry (ids implicit); reads schema 1; unit transactions + `pruner_progress` for resume |
 | `src/zstd_stream.h` | Streaming zstd-decompressing `std::istream` + `compress_to_zst` helper |
 | `src/main.cpp` | CLI, `SharedQueue`, progress display, mode dispatch |
 | `euclidean_tiling.py` | Python reference implementation (1998 lines); written first |
@@ -52,8 +54,9 @@ C++ sources live in `src/`.
 - **Partial filtering**: forced closure of zero-slack rings, plus unique-partner propagation at k vertices. `DfsEngine` checks only chains touched by a glue (chain violations are monotone).
 - **Leaf filter**: non-minimal (covering) solutions have bisimilar darts (non-discrete refinement) and are dropped at the source; the rest are deduplicated per worker on their canonical hash.
 - **Transpositions**: the tilings below a node depend only on the type-preserving isomorphism class of its partial state, so nodes with <= k - `--tt-margin` vertices whose (discrete) canonical form was already seen are skipped.
-- **Resume**: a chunk is appended to `done_chunks.txt` only after it and all subtrees donated from it finished and were flushed. `--resume` skips done chunks, repairs partial trailing records, appends to worker files and merges every `_worker_*` dir.
+- **Resume**: a chunk is recorded done only after it and all subtrees donated from it finished and their solutions were committed. By default workers write per-worker solution databases (commits batched every 16 MB / 5 s, `done_chunks` table in the same DB; crash-safe via SQLite WAL). `--solution-files` restores per-combo `eusolver_*` files with `done_chunks.txt`; `--resume` then repairs partial trailing records and merges every `_worker_*` dir.
 - **Pruner pipeline**: dedup is scoped to one combo (k + polygon-size set, an isomorphism invariant); `--dedup canon` (default) uses the exact canonical form, `wl`/`bfl` remain available.
+- **Pruner units**: each combo is split into ranges of the top 32 canonical-hash bits so every unit's dedup table fits `--prune-ram-gb` (default 20, capped at 60% of available RAM); `--prune-buckets N` forces >= N ranges. Workers file each solution under its 6-bit hash bucket, so the pruner reads only the records of its unit and verifies the recomputed bucket; layout-0 databases and raw files are re-read per unit. The plan and finished units are committed with the output (`pruner_plan` metadata / `pruner_progress` table, or `wl/pruner_plan.txt` / `pruner_progress.txt` for raw), so `--prune-only --resume` continues after a crash. Pruning stops resumably below `--prune-min-free-gb` (default 2). `eupruned*.txt` files are written only with `--format raw` (one per unit).
 
 ## Operations
 
@@ -62,6 +65,7 @@ C++ sources live in `src/`.
 - `make clean` — remove objects and binaries
 - `make test` — safety, Mortier, engine-equivalence and canonical-form tests plus a k=1 regression
 - `./eusolver --help` — full option list
+- `./eusolver --mode disk --prune-only [--resume] --output DIR` — (re)run or continue pruning of an existing run
 - `./eusolver --canonical-hashes DIR` — print `k minimal hash` for every solution in raw text files (used by `scripts/regression.py` to compare runs up to isomorphism)
 - Output on tmpfs `/tmp` fills quickly from k=13; benchmark on real disk. `--binary-solutions` is ~2.5x faster end to end than text output.
 

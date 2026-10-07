@@ -97,42 +97,90 @@ class _Zstd:
         return destination.raw[:result]
 
 
+def _varint(raw: bytes, pos: int) -> tuple[int, int]:
+    value = shift = 0
+    while True:
+        if pos >= len(raw):
+            raise RuntimeError("truncated TES chunk record")
+        byte = raw[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+def iter_tes_entries(database: pathlib.Path, zstd: Optional[_Zstd] = None,
+                     with_documents: bool = True):
+    """Yield (id, combo, signature, legacy_filename, document) of a TES database.
+
+    Reads schema 1 (per-entry rows) and schema 2 (entries packed in chunks).
+    """
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        version = connection.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0]
+        if version == "1":
+            zstd = zstd or (_Zstd() if with_documents else None)
+            if not with_documents:
+                yield from ((i, c, s, f, None) for i, c, s, f in connection.execute(
+                    "SELECT id, combo, signature, legacy_filename FROM entries ORDER BY id"))
+                return
+            chunks = connection.execute(
+                "SELECT id, record_count, uncompressed_size, data FROM chunks ORDER BY id")
+            for chunk_id, record_count, raw_size, compressed in chunks:
+                raw = zstd.decompress(compressed, raw_size)
+                entries = list(connection.execute(
+                    "SELECT id, byte_offset, byte_length, combo, signature, legacy_filename "
+                    "FROM entries WHERE chunk_id=? ORDER BY ordinal", (chunk_id,)))
+                if len(entries) != record_count:
+                    raise RuntimeError(f"chunk {chunk_id} record count is inconsistent")
+                for entry_id, offset, length, combo, signature, filename in entries:
+                    if offset < 0 or length < 0 or offset + length > len(raw):
+                        raise RuntimeError(f"chunk {chunk_id} contains invalid entry bounds")
+                    yield entry_id, combo, signature, filename, raw[offset:offset + length]
+        elif version == "2":
+            zstd = zstd or _Zstd()
+            chunks = connection.execute(
+                "SELECT c.first_entry, c.record_count, c.uncompressed_size, c.data, m.name "
+                "FROM chunks c JOIN combos m ON m.id = c.combo_id ORDER BY c.first_entry")
+            for first, record_count, raw_size, compressed, combo in chunks:
+                raw = zstd.decompress(compressed, raw_size)
+                pos = 0
+                for ordinal in range(record_count):
+                    fields = []
+                    for _ in range(3):
+                        length, pos = _varint(raw, pos)
+                        if pos + length > len(raw):
+                            raise RuntimeError(f"chunk at entry {first} has invalid bounds")
+                        fields.append(raw[pos:pos + length])
+                        pos += length
+                    signature, filename, document = fields
+                    yield (first + ordinal, combo, signature.decode(), filename.decode(),
+                           document if with_documents else None)
+                if pos != len(raw):
+                    raise RuntimeError(f"chunk at entry {first} has trailing bytes")
+        else:
+            raise RuntimeError(f"unsupported TES schema {version!r}")
+    finally:
+        connection.close()
+
+
 def canonical_solutions(output_dir: pathlib.Path) -> dict[int, frozenset[str]]:
     """Return exact content hashes of every canonical TES document, grouped by k."""
     database = output_dir / "wl" / "tilings.sqlite3"
     if not database.is_file():
         raise RuntimeError(f"canonical solution database is missing: {database}")
-    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-    zstd = _Zstd()
     solutions: dict[int, set[str]] = collections.defaultdict(set)
-    entry_count = 0
-    try:
-        chunks = connection.execute(
-            "SELECT id, record_count, uncompressed_size, data FROM chunks ORDER BY id")
-        for chunk_id, record_count, raw_size, compressed in chunks:
-            raw = zstd.decompress(compressed, raw_size)
-            entries = list(connection.execute(
-                "SELECT byte_offset, byte_length, combo FROM entries "
-                "WHERE chunk_id=? ORDER BY ordinal", (chunk_id,)))
-            if len(entries) != record_count:
-                raise RuntimeError(f"chunk {chunk_id} record count is inconsistent")
-            for offset, length, combo in entries:
-                if offset < 0 or length < 0 or offset + length > len(raw):
-                    raise RuntimeError(f"chunk {chunk_id} contains invalid entry bounds")
-                try:
-                    k = int(combo.split("_", 1)[0])
-                except (ValueError, IndexError) as error:
-                    raise RuntimeError(f"invalid canonical combo {combo!r}") from error
-                digest = hashlib.sha256(raw[offset:offset + length]).hexdigest()
-                if digest in solutions[k]:
-                    raise RuntimeError(f"duplicate canonical document for k={k}: {digest}")
-                solutions[k].add(digest)
-                entry_count += 1
-        database_count = connection.execute("SELECT count(*) FROM entries").fetchone()[0]
-        if entry_count != database_count:
-            raise RuntimeError(f"read {entry_count} of {database_count} canonical entries")
-    finally:
-        connection.close()
+    for _, combo, _, _, document in iter_tes_entries(database):
+        try:
+            k = int(combo.split("_", 1)[0])
+        except (ValueError, IndexError) as error:
+            raise RuntimeError(f"invalid canonical combo {combo!r}") from error
+        digest = hashlib.sha256(document).hexdigest()
+        if digest in solutions[k]:
+            raise RuntimeError(f"duplicate canonical document for k={k}: {digest}")
+        solutions[k].add(digest)
     return {k: frozenset(values) for k, values in solutions.items()}
 
 

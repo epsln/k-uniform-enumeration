@@ -1,5 +1,6 @@
 #include "solver.h"
 #include "disk_solver.h"
+#include "solution_db.h"
 #include "pruner.h"
 #include "vertex_catalog.h"
 #include "metrics.h"
@@ -176,7 +177,7 @@ static void telegram_send(const std::string& token, const std::string& chat, con
 
 // Write the completion marker (silences the watchdog) and send the final
 // summary with per-k tiling counts.
-static void finish_notify(const std::map<int,int>& counts, const std::string& output_dir,
+static void finish_notify(const std::map<int,int64_t>& counts, const std::string& output_dir,
 		const std::string& token, const std::string& chat) {
 	{
 		std::ofstream m(output_dir + "/.finished");
@@ -184,7 +185,7 @@ static void finish_notify(const std::map<int,int>& counts, const std::string& ou
 	}
 	if (token.empty() || chat.empty()) return;
 	std::string msg = "✅ eusolver finished\n";
-	int total = 0;
+	int64_t total = 0;
 	for (const auto& [k, c] : counts) {
 		msg += "k=" + std::to_string(k) + " → " + std::to_string(c) + "\n";
 		total += c;
@@ -294,8 +295,7 @@ static void compress_merged_solutions(const std::string& output_dir) {
 	}
 }
 
-static std::map<int,int> run_pruner(const std::string& output_dir, int num_workers,
-                                    FinalOutputFormat format) {
+static std::map<int,int64_t> run_pruner(const std::string& output_dir, PrunerOptions options) {
 	std::vector<std::string> solution_files;
 	for (const auto& entry : fs::directory_iterator(output_dir)) {
 		if (!entry.is_regular_file()) continue;
@@ -304,17 +304,17 @@ static std::map<int,int> run_pruner(const std::string& output_dir, int num_worke
 			solution_files.push_back(entry.path().string());
 	}
 	std::sort(solution_files.begin(), solution_files.end());
-	std::map<int,int> counts;
+	std::map<int,int64_t> counts;
 	{
 		std::string pruned_dir = output_dir + "/wl";
-		fs::remove(pruned_dir + "/tilings.sqlite3.tmp");
-		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-journal");
-		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-wal");
-		fs::remove(pruned_dir + "/tilings.sqlite3.tmp-shm");
-		if (format == FinalOutputFormat::Raw) fs::remove(pruned_dir + "/tilings.sqlite3");
-		WLPruner pruner(pruned_dir, num_workers, format);
-		pruner.run(solution_files);
-		int total = 0;
+		if (!options.resume) {
+			for (const char* suffix : {"", "-journal", "-wal", "-shm"})
+				fs::remove(pruned_dir + "/tilings.sqlite3.tmp" + suffix);
+			if (options.format == FinalOutputFormat::Raw) fs::remove(pruned_dir + "/tilings.sqlite3");
+		}
+		WLPruner pruner(pruned_dir, options);
+		pruner.run(solution_files, list_solution_dbs(output_dir));
+		int64_t total = 0;
 		for (const auto& [k, count] : pruner.solutions_per_k()) {
 			std::cout << "  k=" << k << " -> " << count << " unique tiling"
 				<< (count != 1 ? "s" : "") << "\n";
@@ -358,6 +358,9 @@ int main(int argc, char** argv) {
 	std::string convert_tes_database, conversion_errors = "fail";
 	int64_t mortier_id = 0;
 	bool prune_only = false;
+	double prune_ram_gb = 0;       // 0 = auto: 20 GB, capped by available RAM
+	int prune_buckets = 1;
+	double prune_min_free_gb = 2;
 	int64_t extract_id = 0;
 	std::string telegram_token, telegram_chat;
 	int notify_minutes = 30;
@@ -387,11 +390,15 @@ int main(int argc, char** argv) {
 		}
 		else if (arg == "--no-iso-check") { g_no_iso_check = true; }
 		else if (arg == "--prune-only") { prune_only = true; }
+		else if (arg == "--prune-ram-gb" && i + 1 < argc) prune_ram_gb = std::stod(argv[++i]);
+		else if (arg == "--prune-buckets" && i + 1 < argc) prune_buckets = std::max(1, std::stoi(argv[++i]));
+		else if (arg == "--prune-min-free-gb" && i + 1 < argc) prune_min_free_gb = std::stod(argv[++i]);
 		else if (arg == "--keep-pruner-inputs") { g_keep_pruner_inputs = true; }
 		else if (arg == "--profile-pruner") { g_profile_pruner = true; }
 		else if (arg == "--binary-solutions") { g_binary_solutions = true; }
 		else if (arg == "--no-spill") { g_no_spill = true; }
 		else if (arg == "--legacy-solver") { g_legacy_solver = true; }
+		else if (arg == "--solution-files") { g_solution_files = true; }
 		else if (arg == "--tt-mb" && i + 1 < argc) tt_mb = std::stoll(argv[++i]);
 		else if (arg == "--tt-margin" && i + 1 < argc) g_tt_margin = std::stoi(argv[++i]);
 		else if (arg == "--no-tt") { tt_mb = 0; }
@@ -435,7 +442,13 @@ int main(int argc, char** argv) {
 				<< "  --wl-iters N       WL iteration cap (default: 0 = iterate to convergence)\n"
 				<< "  --dedup canon|wl|bfl pruner dedup: exact canonical form (default), WL hash, or BFL word\n"
 				<< "  --no-iso-check      trust the WL hash, skip the O(n^2) isomorphism fallback\n"
+				<< "  --solution-files    disk mode: write per-combo files instead of solution databases\n"
 				<< "  --prune-only        prune existing eusolver_* files in --output\n"
+				<< "                      (with --resume: continue an interrupted pruning)\n"
+				<< "  --prune-ram-gb N    pruner memory target; sizes the per-unit dedup table\n"
+				<< "                      (default: 20, at most 60% of available RAM)\n"
+				<< "  --prune-buckets N   split every combo into at least N hash ranges\n"
+				<< "  --prune-min-free-gb N  stop pruning (resumably) below N GB free (default 2)\n"
 				<< "  --keep-pruner-inputs preserve raw solution files after pruning\n"
 				<< "  --profile-pruner     report per-file pruner stage timings\n"
 				<< "  --fanout N         BFS fan-out target (0=auto, default: 40000)\n"
@@ -462,7 +475,7 @@ int main(int argc, char** argv) {
 				<< "  --import-mortier-json FILE  convert generated or legacy Mortier JSON to SQLite\n"
 				<< "  --convert-tes-to-mortier DB  convert a TES SQLite database to Mortier\n"
 				<< "  --mortier-database DB  destination for Mortier import or conversion\n"
-				<< "  --resume           retry saved failures, then resume after the watermark\n"
+				<< "  --resume           continue an interrupted solve, pruning (--prune-only) or conversion\n"
 				<< "  --conversion-errors fail|continue  TES conversion policy (default: fail)\n"
 				<< "  --telegram-token T  Telegram bot token for progress updates\n"
 				<< "  --telegram-chat C   Telegram chat id to message\n"
@@ -503,7 +516,7 @@ int main(int argc, char** argv) {
 			for (const auto& entry : fs::recursive_directory_iterator(canonical_hashes_dir)) {
 				if (!entry.is_regular_file()) continue;
 				std::string name = entry.path().filename().string();
-				if (name.rfind("eupruned.txt", 0) != 0 && name.rfind("eusolver_", 0) != 0) continue;
+				if (name.rfind("eupruned", 0) != 0 && name.rfind("eusolver_", 0) != 0) continue;
 				if (name.find(".txt") == std::string::npos) continue;
 				auto in = open_solution_istream(entry.path().string());
 				auto emit = [](const State& st) {
@@ -613,10 +626,25 @@ int main(int argc, char** argv) {
 		}
 	}
 	if (output_format == FinalOutputFormat::Raw) g_keep_pruner_inputs = true;
+	PrunerOptions prune_options;
+	prune_options.num_workers = num_workers;
+	prune_options.format = output_format;
+	prune_options.min_ranges = prune_buckets;
+	// A resumed solve may add solutions, so only --prune-only continues a pruning.
+	prune_options.resume = resume && prune_only;
+	prune_options.min_free_bytes = (int64_t)(prune_min_free_gb * (1LL << 30));
+	{
+		double ram = prune_ram_gb > 0 ? prune_ram_gb : 20.0;
+		long avail = available_ram_gb();
+		if (prune_ram_gb <= 0 && avail > 0) ram = std::min(ram, 0.6 * (double)avail);
+		// The table gets the budget minus room for batches, formatting and SQLite.
+		double table_gb = std::max(0.25, ram - std::min(2.0, ram * 0.25));
+		prune_options.table_bytes = (int64_t)(table_gb * (1LL << 30));
+	}
 	if (prune_only) {
 		try {
 			auto start = std::chrono::steady_clock::now();
-			run_pruner(output_dir, num_workers, output_format);
+			run_pruner(output_dir, prune_options);
 			auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 			std::cout << "Pruner phase:  " << std::fixed << std::setprecision(1) << elapsed << "s\n";
 			return 0;
@@ -727,10 +755,11 @@ int main(int argc, char** argv) {
 				if (entry.is_regular_file() && (name.rfind("eusolver_", 0) == 0
 						|| (name.rfind("chunk_", 0) == 0 && entry.path().extension() == ".bin")))
 					fs::remove(entry.path());
-				else if (entry.is_directory() && name.rfind("_worker_", 0) == 0)
+				else if (entry.is_directory() && (name.rfind("_worker_", 0) == 0 || name == "chunks"))
 					fs::remove_all(entry.path());
 			}
 			fs::remove(done_path);
+			for (const auto& db : list_solution_dbs(output_dir)) remove_solution_db(db);
 			// Phase 1: BFS fan-out
 			std::cout << "Phase 1: BFS fan-out to " << fanout_target << " frontier states...\n";
 			std::vector<State> early_solutions;
@@ -747,6 +776,12 @@ int main(int argc, char** argv) {
 				std::map<std::string,int> rt;
 				std::map<std::string,std::string> sf;
 				HistogramMap vc;
+				if (!g_solution_files && !g_legacy_solver) {
+					fs::create_directories(output_dir + "/_worker_fanout");
+					SolutionDbWriter early(output_dir + "/_worker_fanout/solutions.sqlite3");
+					for (auto& s : early_solutions) early.add(s);
+					early.close();
+				} else
 				for (auto& s : early_solutions)
 					EuclideanSolver::write_solution_static(s, output_dir, mu, rt, sf, vc);
 				EuclideanSolver::close_solution_streams();
@@ -761,7 +796,8 @@ int main(int argc, char** argv) {
 
 			for (int ci = 0; ci < n_chunks; ++ci) {
 				if (chunks[ci].empty()) continue;
-				std::string cp = output_dir + "/chunk_" + std::to_string(ci) + ".bin";
+				fs::create_directories(output_dir + "/chunks");
+				std::string cp = output_dir + "/chunks/chunk_" + std::to_string(ci) + ".bin";
 				write_packed_states_bin(cp, chunks[ci]);
 				chunk_paths.push_back(cp);
 			}
@@ -770,6 +806,7 @@ int main(int argc, char** argv) {
 			std::cout << "Resuming from " << output_dir << "...\n";
 			auto all_chunks = list_chunk_files(output_dir);
 			auto done = read_done_chunks(done_path);
+			for (const auto& c : read_done_chunks_db(output_dir)) done.insert(c);
 			for (const auto& cp : all_chunks)
 				if (!done.count(fs::path(cp).filename().string())) chunk_paths.push_back(cp);
 			n_chunks = (int)chunk_paths.size();
@@ -808,7 +845,8 @@ int main(int argc, char** argv) {
 			g_disk_spilled[w].store(0);
 		}
 		g_disk_running.store(true);
-		WorkPool pool(chunk_paths, done_path, num_workers);
+		WorkPool pool(chunk_paths,
+			(g_solution_files || g_legacy_solver) ? done_path : std::string(), num_workers);
 		if (tt_mb > 0 && !g_legacy_solver) pool.enable_transpositions((size_t)tt_mb);
 		std::atomic<int>& next_chunk = pool.next_chunk();
 
@@ -970,7 +1008,7 @@ int main(int argc, char** argv) {
 		for (auto& t : threads) t.join();
 		g_disk_running.store(false);
 		disk_progress.join();
-		for (const auto& cp : list_chunk_files(output_dir)) fs::remove(cp);
+		fs::remove_all(output_dir + "/chunks");
 
 		auto t2 = std::chrono::steady_clock::now();
 		int64_t disk_partials = 0;
@@ -997,12 +1035,17 @@ int main(int argc, char** argv) {
 				all_worker_dirs.push_back(entry.path().string());
 		std::sort(all_worker_dirs.begin(), all_worker_dirs.end());
 		merge_worker_outputs(output_dir, all_worker_dirs);
-		for (const auto& wd : all_worker_dirs) fs::remove_all(wd);
+		// Worker dirs still hold the solution databases the pruner reads.
+		for (const auto& wd : all_worker_dirs)
+			for (const auto& e : fs::directory_iterator(wd))
+				if (e.path().filename().string().rfind("eusolver_", 0) == 0) fs::remove(e.path());
 		fs::remove(done_path);
 		compress_merged_solutions(output_dir);
 
 		std::cout << "Pruner phase starting...\n";
-		auto counts = run_pruner(output_dir, num_workers, output_format);
+		auto counts = run_pruner(output_dir, prune_options);
+		if (!g_keep_pruner_inputs)
+			for (const auto& wd : all_worker_dirs) fs::remove_all(wd);
 		std::cout << "\nPruner phase:  " << std::fixed << std::setprecision(1)
 		          << std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count() << "s\n";
 		finish_notify(counts, output_dir, telegram_token, telegram_chat);
@@ -1111,7 +1154,8 @@ int main(int argc, char** argv) {
 			compress_merged_solutions(output_dir);
 
 			std::cout << "Pruner phase starting...\n";
-			auto counts = run_pruner(output_dir, num_workers, output_format);
+			prune_options.resume = false;
+			auto counts = run_pruner(output_dir, prune_options);
 			auto t2 = std::chrono::steady_clock::now();
 			std::cout << "\nPruner phase:  " << std::fixed << std::setprecision(1)
 				<< std::chrono::duration<double>(t2 - t1).count() << "s\n";
