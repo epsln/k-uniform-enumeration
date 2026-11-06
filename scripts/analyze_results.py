@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import re
 import sqlite3
+from concurrent.futures import ProcessPoolExecutor
 from collections import Counter, defaultdict
 from pathlib import Path
 import sys
@@ -47,15 +49,16 @@ def multiplicity_profile(signature: str) -> str:
     return "+".join(map(str, sorted(counts.values(), reverse=True)))
 
 
-def read_rows(database: Path):
-    for _, combo, signature, _, _ in iter_tes_entries(database, with_documents=False):
+def read_rows(database: Path, id_range: tuple[int, int] | None = None):
+    for _, combo, signature, _, _ in iter_tes_entries(
+            database, with_documents=False, id_range=id_range):
         match = COMBO_RE.match(combo)
         if not match:
             raise ValueError(f"cannot extract k from combo {combo!r}")
         yield int(match.group(1)), combo, signature
 
 
-def analyse(database: Path):
+def analyse_rows(rows):
     distributions: dict[int, Counter[int]] = defaultdict(Counter)
     profiles: dict[int, Counter[str]] = defaultdict(Counter)
     configuration_frequency: Counter[str] = Counter()
@@ -65,19 +68,78 @@ def analyse(database: Path):
     max_multiplicity = defaultdict(Counter)
 
     polygon_signatures: dict[int, Counter[str]] = defaultdict(Counter)
-    for k, combo, signature in read_rows(database):
-        symbols = base_symbols(signature)
+    for k, combo, signature in rows:
+        multiplicities = Counter(signature_symbols(signature))
+        symbols = multiplicities.keys()
         distributions[k][len(symbols)] += 1
-        profiles[k][multiplicity_profile(signature)] += 1
+        profiles[k]["+".join(map(str, sorted(multiplicities.values(), reverse=True)))] += 1
         configuration_frequency.update(symbols)
-        configuration_by_k[k].update(set(symbols))
+        configuration_by_k[k].update(symbols)
         polygon_signatures[k][combo.split("_", 1)[1]] += 1
-        counts = Counter(signature_symbols(signature))
-        entropy = -sum((count / k) * math.log2(count / k) for count in counts.values())
+        entropy = -sum((count / k) * math.log2(count / k)
+                       for count in multiplicities.values())
         entropy_sum[k] += entropy
-        max_multiplicity[k][max(counts.values())] += 1
+        max_multiplicity[k][max(multiplicities.values())] += 1
         total[k] += 1
 
+    return (distributions, profiles, configuration_frequency, total,
+            polygon_signatures, configuration_by_k, entropy_sum, max_multiplicity)
+
+
+def analyse_range(task):
+    database, start, end = task
+    return analyse_rows(read_rows(Path(database), (start, end)))
+
+
+def analyse(database: Path, jobs: int = 1):
+    if jobs <= 1:
+        return analyse_rows(read_rows(database))
+
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        version = connection.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0]
+        if version != "2":
+            return analyse_rows(read_rows(database))
+        first, last = connection.execute("SELECT min(id), max(id) FROM chunks").fetchone()
+    finally:
+        connection.close()
+
+    if first is None:
+        return analyse_rows(())
+    jobs = min(jobs, last - first + 1)
+    span = last - first + 1
+    tasks = [(str(database), first + span * i // jobs,
+              first + span * (i + 1) // jobs) for i in range(jobs)]
+    parts = []
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        for result in pool.map(analyse_range, tasks):
+            parts.append(result)
+
+    distributions = defaultdict(Counter)
+    profiles = defaultdict(Counter)
+    configuration_frequency = Counter()
+    total = Counter()
+    polygon_signatures = defaultdict(Counter)
+    configuration_by_k = defaultdict(Counter)
+    entropy_sum = Counter()
+    max_multiplicity = defaultdict(Counter)
+    for part in parts:
+        (part_dist, part_profiles, part_frequency, part_total,
+         part_polygons, part_configurations, part_entropy, part_maximum) = part
+        for k, counts in part_dist.items():
+            distributions[k].update(counts)
+        for k, counts in part_profiles.items():
+            profiles[k].update(counts)
+        configuration_frequency.update(part_frequency)
+        total.update(part_total)
+        for k, counts in part_polygons.items():
+            polygon_signatures[k].update(counts)
+        for k, counts in part_configurations.items():
+            configuration_by_k[k].update(counts)
+        entropy_sum.update(part_entropy)
+        for k, counts in part_maximum.items():
+            max_multiplicity[k].update(counts)
     return (distributions, profiles, configuration_frequency, total,
             polygon_signatures, configuration_by_k, entropy_sum, max_multiplicity)
 
@@ -192,10 +254,12 @@ def main():
     parser.add_argument("database", type=Path)
     parser.add_argument("--csv", type=Path, help="write the k/m table to CSV")
     parser.add_argument("--outdir", type=Path, help="write all metric CSVs here")
+    parser.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 1),
+                        help="parallel database scan workers")
     args = parser.parse_args()
 
     (distributions, profiles, frequencies, total, polygon_signatures,
-     configuration_by_k, entropy_sum, max_multiplicity) = analyse(args.database)
+     configuration_by_k, entropy_sum, max_multiplicity) = analyse(args.database, args.jobs)
     print_report(distributions, profiles, frequencies, total, polygon_signatures,
                  configuration_by_k, entropy_sum, max_multiplicity)
     if args.csv:

@@ -163,8 +163,12 @@ The canonical database can be summarized without loading all entries into memory
 
 ```sh
 python3 scripts/analyze_results.py tilings_k20.sqlite3 \
-  --csv /tmp/k20_m_distribution.csv
+  --csv /tmp/k20_m_distribution.csv --jobs 16
 ```
+
+The analyzer streams schema-v2 chunks in parallel (`--jobs N`) so large result
+catalogues can be summarized without first sorting or copying their compressed
+records into a temporary database.
 
 The report includes the distribution by $m$-Archimedean class, vertex-configuration
 multiplicity profiles, frequent base configurations, polygon-size signatures, and

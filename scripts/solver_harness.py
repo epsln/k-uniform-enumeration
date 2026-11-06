@@ -111,10 +111,12 @@ def _varint(raw: bytes, pos: int) -> tuple[int, int]:
 
 
 def iter_tes_entries(database: pathlib.Path, zstd: Optional[_Zstd] = None,
-                     with_documents: bool = True):
+                     with_documents: bool = True,
+                     id_range: Optional[tuple[int, int]] = None):
     """Yield (id, combo, signature, legacy_filename, document) of a TES database.
 
     Reads schema 1 (per-entry rows) and schema 2 (entries packed in chunks).
+    For schema 2, `id_range` optionally selects a half-open chunk-rowid range.
     """
     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     try:
@@ -141,10 +143,21 @@ def iter_tes_entries(database: pathlib.Path, zstd: Optional[_Zstd] = None,
                     yield entry_id, combo, signature, filename, raw[offset:offset + length]
         elif version == "2":
             zstd = zstd or _Zstd()
-            chunks = connection.execute(
-                "SELECT c.first_entry, c.record_count, c.uncompressed_size, c.data, m.name "
-                "FROM chunks c JOIN combos m ON m.id = c.combo_id ORDER BY c.first_entry")
-            for first, record_count, raw_size, compressed, combo in chunks:
+            # Walk the chunks table in rowid order and resolve combo names from
+            # its small lookup table. Ordering a join by first_entry forces
+            # SQLite to sort every compressed BLOB into a temp B-tree; a large
+            # catalogue can otherwise need another full-size temporary copy.
+            combo_names = dict(connection.execute("SELECT id, name FROM combos"))
+            if id_range is None:
+                chunks = connection.execute(
+                    "SELECT first_entry, record_count, uncompressed_size, data, combo_id "
+                    "FROM chunks ORDER BY id")
+            else:
+                chunks = connection.execute(
+                    "SELECT first_entry, record_count, uncompressed_size, data, combo_id "
+                    "FROM chunks WHERE id>=? AND id<? ORDER BY id", id_range)
+            for first, record_count, raw_size, compressed, combo_id in chunks:
+                combo = combo_names[combo_id]
                 raw = zstd.decompress(compressed, raw_size)
                 pos = 0
                 for ordinal in range(record_count):
